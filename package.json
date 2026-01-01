@@ -1,0 +1,10 @@
+{
+  "name": "gilsport-voicebot-realtime",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  }
+}
