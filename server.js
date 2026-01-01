@@ -1,8 +1,10 @@
 // server.js (ESM)
-// GilSport VoiceBot Realtime - Config Loader + Router (Sheet keywords + Gemini fallback)
-// Node 18+ (Render uses Node 22) - fetch is available globally.
+// GilSport VoiceBot Realtime - Config Loader + Router
+// Uses Google Sheets API with Service Account (PRIVATE sheet supported)
+// Node 18+ (Render uses Node 22). fetch is available globally.
 
 import express from "express";
+import { google } from "googleapis";
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
@@ -13,7 +15,7 @@ const PORT = process.env.PORT || 10000;
 const ENV = {
   TIME_ZONE: process.env.TIME_ZONE || "Asia/Jerusalem",
 
-  // Google Sheet config
+  // Google Sheet
   GSHEET_ID: process.env.GSHEET_ID || "",
   GSHEET_CACHE_TTL_SEC: Number(process.env.GSHEET_CACHE_TTL_SEC || "60"),
 
@@ -32,7 +34,6 @@ function log(...args) {
   if (ENV.MB_DEBUG) console.log("[DEBUG]", ...args);
 }
 
-// ===================== Helpers =====================
 function nowISO() {
   return new Date().toISOString();
 }
@@ -46,39 +47,30 @@ function safeJsonParse(str) {
 }
 
 function maybeBase64ToString(s) {
-  // detect base64-ish (no braces) and try decode
   if (!s) return s;
   const trimmed = String(s).trim();
   if (trimmed.startsWith("{")) return trimmed;
-  // Try base64 decode
   try {
-    const buf = Buffer.from(trimmed, "base64");
-    const decoded = buf.toString("utf8").trim();
+    const decoded = Buffer.from(trimmed, "base64").toString("utf8").trim();
     if (decoded.startsWith("{")) return decoded;
   } catch (_) {}
   return trimmed;
 }
 
 function normalizeText(input) {
-  // Remove niqqud + cantillation marks, punctuation, unify spaces
-  // Niqqud range: \u0591-\u05C7
-  const s = String(input || "")
+  return String(input || "")
     .normalize("NFKC")
-    .replace(/[\u0591-\u05C7]/g, "") // remove Hebrew diacritics
-    .replace(/[^\p{L}\p{N}\s]/gu, " ") // keep letters/numbers/spaces
+    .replace(/[\u0591-\u05C7]/g, "") // Hebrew diacritics (nikud + cantillation)
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
     .replace(/\s+/g, " ")
     .trim()
     .toLowerCase();
-  return s;
 }
 
 function splitKeywordsCell(cell) {
-  // Accept commas, semicolons, newlines
-  const raw = String(cell || "");
-  return raw
+  return String(cell || "")
     .split(/[,;\n]/g)
     .map((x) => normalizeText(x))
-    .map((x) => x.trim())
     .filter(Boolean);
 }
 
@@ -86,7 +78,6 @@ function routeByKeywords(text, routingRules) {
   const norm = normalizeText(text);
   if (!norm) return null;
 
-  // Highest priority first (lower number = higher priority)
   const sorted = [...routingRules].sort((a, b) => {
     const pa = Number(a.priority ?? 9999);
     const pb = Number(b.priority ?? 9999);
@@ -99,14 +90,8 @@ function routeByKeywords(text, routingRules) {
     if (!route || keywords.length === 0) continue;
 
     for (const kw of keywords) {
-      if (!kw) continue;
-      if (norm.includes(kw)) {
-        return {
-          route,
-          matched: kw,
-          confidence: 1,
-          by: "sheet_keywords",
-        };
+      if (kw && norm.includes(kw)) {
+        return { route, matched: kw, confidence: 1, by: "sheet_keywords" };
       }
     }
   }
@@ -114,44 +99,70 @@ function routeByKeywords(text, routingRules) {
   return null;
 }
 
-// ===================== Google Sheets (via gviz export) =====================
-// We avoid googleapis + OAuth complexity. Works for PUBLIC sheets or "Anyone with link" access.
-// If your sheet is private, this still works if the sheet is shared with a service account
-// AND published? Not always. Your current config-check works, so we keep same approach.
+// ===================== Google Sheets API (Service Account) =====================
+let SHEETS_CLIENT = null;
 
-async function fetchGvizSheet(sheetId, tabName) {
-  // gviz endpoint returns JS-wrapped JSON - we extract the JSON part
-  const url = `https://docs.google.com/spreadsheets/d/${encodeURIComponent(
-    sheetId
-  )}/gviz/tq?tqx=out:json&sheet=${encodeURIComponent(tabName)}`;
+function getServiceAccountCreds() {
+  const raw = ENV.GOOGLE_SERVICE_ACCOUNT_JSON;
+  if (!raw) throw new Error("GOOGLE_SERVICE_ACCOUNT_JSON is missing");
 
-  const res = await fetch(url, { method: "GET" });
-  if (!res.ok) throw new Error(`GVIZ fetch failed (${res.status}) for ${tabName}`);
-  const text = await res.text();
-
-  // Extract JSON: google.visualization.Query.setResponse(...)
-  const m = text.match(/setResponse\(([\s\S]*?)\);\s*$/);
-  if (!m) throw new Error(`GVIZ parse failed for ${tabName}`);
-  const payloadStr = m[1];
-
-  const parsed = safeJsonParse(payloadStr);
-  if (!parsed.ok) throw new Error(`GVIZ JSON parse failed for ${tabName}: ${parsed.error}`);
-
+  const decoded = maybeBase64ToString(raw);
+  const parsed = safeJsonParse(decoded);
+  if (!parsed.ok) {
+    throw new Error(
+      `GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON (and not base64 JSON): ${parsed.error}`
+    );
+  }
   return parsed.value;
 }
 
-function gvizToRows(gvizObj) {
-  const table = gvizObj?.table;
-  const cols = (table?.cols || []).map((c) => c?.label || c?.id || "");
-  const rows = (table?.rows || []).map((r) => {
-    const obj = {};
-    (r.c || []).forEach((cell, idx) => {
-      const key = cols[idx] || `col_${idx}`;
-      obj[key] = cell?.v ?? "";
-    });
-    return obj;
+async function getSheetsClient() {
+  if (SHEETS_CLIENT) return SHEETS_CLIENT;
+
+  const creds = getServiceAccountCreds();
+  const auth = new google.auth.GoogleAuth({
+    credentials: creds,
+    scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
   });
-  return { cols, rows };
+
+  const sheets = google.sheets({ version: "v4", auth });
+  SHEETS_CLIENT = sheets;
+  return sheets;
+}
+
+async function fetchSheetRange(rangeA1) {
+  if (!ENV.GSHEET_ID) throw new Error("GSHEET_ID is missing");
+  const sheets = await getSheetsClient();
+
+  const resp = await sheets.spreadsheets.values.get({
+    spreadsheetId: ENV.GSHEET_ID,
+    range: rangeA1,
+    majorDimension: "ROWS",
+  });
+
+  return resp?.data?.values || [];
+}
+
+function rowsToObjects(values) {
+  // First row = headers, rest rows = objects
+  if (!values || values.length === 0) return [];
+
+  const headers = (values[0] || []).map((h) => String(h || "").trim());
+  const out = [];
+
+  for (let i = 1; i < values.length; i++) {
+    const row = values[i] || [];
+    // skip empty row
+    if (row.every((c) => String(c || "").trim() === "")) continue;
+
+    const obj = {};
+    for (let c = 0; c < headers.length; c++) {
+      const key = headers[c] || `col_${c}`;
+      obj[key] = row[c] ?? "";
+    }
+    out.push(obj);
+  }
+  return out;
 }
 
 // ===================== Config Cache =====================
@@ -167,9 +178,6 @@ async function loadConfigFromSheet(force = false) {
     return { from_cache: true, ...CONFIG_CACHE.data, loaded_at: CONFIG_CACHE.loaded_at };
   }
 
-  if (!ENV.GSHEET_ID) throw new Error("GSHEET_ID is missing");
-
-  // Tabs we care for routing + overview
   const tabs = [
     "SETTINGS",
     "BUSINESS_INFO",
@@ -181,21 +189,22 @@ async function loadConfigFromSheet(force = false) {
     "PROMPTS",
   ];
 
-  const out = {};
+  const raw = {};
   const counts = {};
+
   for (const tab of tabs) {
-    const gviz = await fetchGvizSheet(ENV.GSHEET_ID, tab);
-    const { rows } = gvizToRows(gviz);
-    out[tab] = rows;
-    counts[`${tab}_rows`] = rows.length;
+    // Read broad range. If you add columns later, still works.
+    const values = await fetchSheetRange(`${tab}!A:Z`);
+    const objs = rowsToObjects(values);
+    raw[tab] = objs;
+    counts[`${tab}_rows`] = objs.length;
   }
 
-  // Build overview basics from SETTINGS (key/value)
-  const settingsRows = out.SETTINGS || [];
+  // SETTINGS tab expected headers: key | value (Heb/Eng doesn't matter, we handle common variants)
   const settings = {};
-  for (const r of settingsRows) {
-    const k = String(r.key || r.KEY || r.Key || "").trim();
-    const v = String(r.value || r.VALUE || r.Value || "").trim();
+  for (const r of raw.SETTINGS || []) {
+    const k = String(r.key ?? r.KEY ?? r.Key ?? "").trim();
+    const v = String(r.value ?? r.VALUE ?? r.Value ?? "").trim();
     if (k) settings[k] = v;
   }
 
@@ -217,11 +226,22 @@ async function loadConfigFromSheet(force = false) {
     counts,
   };
 
-  // minimal validation for keys you already care about
   const required = ["BUSINESS_NAME", "DEFAULT_LANGUAGE", "SUPPORTED_LANGUAGES"];
   for (const rk of required) {
     if (!settings[rk]) validation.missing_settings_keys.push(rk);
   }
+
+  const routing_rules = (raw.ROUTING_RULES || []).map((r) => ({
+    priority: r.priority ?? r.PRIORITY ?? r.Priority ?? 9999,
+    route: r.route ?? r.ROUTE ?? r.Route ?? "",
+    keywords: r.keywords ?? r.KEYWORDS ?? r.Keywords ?? "",
+    question_if_ambiguous:
+      r.question_if_ambiguous ??
+      r.QUESTION_IF_AMBIGUOUS ??
+      r.Question_if_ambiguous ??
+      "",
+    notes: r.notes ?? r.NOTES ?? r.Notes ?? "",
+  }));
 
   const data = {
     ok: true,
@@ -229,14 +249,7 @@ async function loadConfigFromSheet(force = false) {
     settings,
     overview,
     validation,
-    routing_rules: (out.ROUTING_RULES || []).map((r) => ({
-      priority: r.priority ?? r.PRIORITY ?? r.Priority ?? 9999,
-      route: r.route ?? r.ROUTE ?? r.Route ?? "",
-      keywords: r.keywords ?? r.KEYWORDS ?? r.Keywords ?? "",
-      question_if_ambiguous:
-        r.question_if_ambiguous ?? r.QUESTION_IF_AMBIGUOUS ?? r.Question_if_ambiguous ?? "",
-      notes: r.notes ?? r.NOTES ?? r.Notes ?? "",
-    })),
+    routing_rules,
   };
 
   CONFIG_CACHE = {
@@ -250,9 +263,7 @@ async function loadConfigFromSheet(force = false) {
 
 // ===================== Gemini Router Fallback =====================
 async function geminiRoute(text, allowedRoutes) {
-  if (!ENV.GEMINI_API_KEY) {
-    return null; // not enabled
-  }
+  if (!ENV.GEMINI_API_KEY) return null;
 
   const model = ENV.GEMINI_MODEL || "gemini-1.5-flash";
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
@@ -260,27 +271,18 @@ async function geminiRoute(text, allowedRoutes) {
   )}:generateContent?key=${encodeURIComponent(ENV.GEMINI_API_KEY)}`;
 
   const routesList = allowedRoutes.filter(Boolean);
-  const system = `
+  const prompt = `
 You are a routing classifier for a Hebrew retail business phone bot.
 Return ONLY strict JSON with keys: route, confidence, reason.
 route must be one of: ${routesList.join(", ")}.
 confidence is a number 0..1.
 If unclear between sales/support, choose "ambiguous" (never "unknown").
-`.trim();
-
-  const user = `
-User text:
-${text}
+User text: ${text}
 `.trim();
 
   const body = {
-    contents: [
-      { role: "user", parts: [{ text: system + "\n\n" + user }] }
-    ],
-    generationConfig: {
-      temperature: 0.2,
-      maxOutputTokens: 120,
-    },
+    contents: [{ role: "user", parts: [{ text: prompt }] }],
+    generationConfig: { temperature: 0.2, maxOutputTokens: 120 },
   };
 
   const res = await fetch(url, {
@@ -295,7 +297,6 @@ ${text}
     return null;
   }
 
-  // Extract text from response
   let data;
   try {
     data = JSON.parse(raw);
@@ -307,18 +308,11 @@ ${text}
   const outText =
     data?.candidates?.[0]?.content?.parts?.map((p) => p.text).join("") || "";
 
-  // Gemini sometimes wraps JSON in ```json ... ```
   const jsonMatch = outText.match(/\{[\s\S]*\}/);
-  if (!jsonMatch) {
-    log("Gemini output not JSON:", outText.slice(0, 200));
-    return null;
-  }
+  if (!jsonMatch) return null;
 
   const parsed = safeJsonParse(jsonMatch[0]);
-  if (!parsed.ok) {
-    log("Gemini JSON invalid:", parsed.error, jsonMatch[0].slice(0, 200));
-    return null;
-  }
+  if (!parsed.ok) return null;
 
   const route = String(parsed.value.route || "").trim();
   const conf = Number(parsed.value.confidence ?? 0);
@@ -344,13 +338,13 @@ app.get("/health", (req, res) => {
 });
 
 app.get("/config-check", async (req, res) => {
-  // Also validate GOOGLE_SERVICE_ACCOUNT_JSON if present (optional)
-  const saRaw = ENV.GOOGLE_SERVICE_ACCOUNT_JSON;
+  // Validate service account JSON presence/parse
   let saValid = null;
-  if (saRaw) {
-    const decoded = maybeBase64ToString(saRaw);
-    const parsed = safeJsonParse(decoded);
-    saValid = parsed.ok ? true : `invalid: ${parsed.error}`;
+  try {
+    getServiceAccountCreds();
+    saValid = true;
+  } catch (e) {
+    saValid = `invalid: ${e?.message || String(e)}`;
   }
 
   try {
@@ -389,7 +383,6 @@ app.post("/route", async (req, res) => {
   try {
     const cfg = await loadConfigFromSheet(false);
 
-    // 1) Sheet keyword routing
     const bySheet = routeByKeywords(text, cfg.routing_rules || []);
     if (bySheet) {
       return res.json({
@@ -404,7 +397,6 @@ app.post("/route", async (req, res) => {
       });
     }
 
-    // 2) Gemini fallback (if enabled)
     const allowedRoutes = ["sales", "support", "ambiguous"];
     const byGemini = await geminiRoute(text, allowedRoutes);
     if (byGemini) {
@@ -421,22 +413,13 @@ app.post("/route", async (req, res) => {
       });
     }
 
-    // 3) Final fallback
     return res.json({
       ok: true,
       input: { text },
-      decision: {
-        route: "unknown",
-        matched: null,
-        confidence: 0,
-        by: "none",
-      },
+      decision: { route: "unknown", matched: null, confidence: 0, by: "none" },
     });
   } catch (e) {
-    return res.status(200).json({
-      ok: false,
-      error: e?.message || String(e),
-    });
+    return res.status(200).json({ ok: false, error: e?.message || String(e) });
   }
 });
 
