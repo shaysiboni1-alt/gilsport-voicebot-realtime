@@ -5,7 +5,7 @@
 // - /config-check
 // - /route  (keywords first, Gemini fallback)
 //
-// Google Sheets access via Service Account (JWT) – NO GVIZ
+// Google Sheets access via Service Account (JWT)
 // Node 18+ (Render uses Node 22.x)
 
 import express from "express";
@@ -66,7 +66,6 @@ function getServiceAccountAuth() {
   if (parsed.ok) {
     creds = parsed.value;
   } else {
-    // base64 support
     const buf = Buffer.from(raw, "base64");
     creds = JSON.parse(buf.toString("utf8"));
   }
@@ -204,6 +203,56 @@ function routeByKeywords(text, rules) {
   return null;
 }
 
+// ===================== Gemini Fallback Router =====================
+async function routeByGemini(text) {
+  if (!ENV.GEMINI_API_KEY) return null;
+
+  const prompt = `
+You are a routing engine.
+Classify the user's intent into one of:
+sales, support, ambiguous.
+
+Return ONLY valid JSON in this format:
+{"route":"sales|support|ambiguous","confidence":0.0-1.0}
+
+User text:
+"""${text}"""
+`;
+
+  try {
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${ENV.GEMINI_MODEL}:generateContent?key=${ENV.GEMINI_API_KEY}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+        }),
+      }
+    );
+
+    const json = await res.json();
+    const raw =
+      json?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+
+    const parsed = safeJsonParse(raw);
+    if (!parsed.ok) throw new Error("Invalid Gemini JSON");
+
+    return {
+      route: parsed.value.route || "ambiguous",
+      confidence: Number(parsed.value.confidence || 0),
+      by: "gemini",
+    };
+  } catch (e) {
+    LAST_GEMINI_ROUTER_ERROR = e.message;
+    return {
+      route: "unknown",
+      confidence: 0,
+      by: "gemini_failed",
+    };
+  }
+}
+
 // ===================== Endpoints =====================
 app.get("/health", (req, res) => {
   res.json({ ok: true, time: nowIso() });
@@ -237,6 +286,11 @@ app.post("/route", async (req, res) => {
     const bySheet = routeByKeywords(text, cfg.routing_rules);
     if (bySheet) {
       return res.json({ ok: true, decision: bySheet });
+    }
+
+    const byGemini = await routeByGemini(text);
+    if (byGemini) {
+      return res.json({ ok: true, decision: byGemini });
     }
 
     return res.json({
