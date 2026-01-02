@@ -10,6 +10,7 @@
 
 import express from "express";
 import { google } from "googleapis";
+import fetch from "node-fetch";
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
@@ -24,20 +25,19 @@ const ENV = {
   TIME_ZONE: process.env.TIME_ZONE || "Asia/Jerusalem",
 
   GEMINI_API_KEY: process.env.GEMINI_API_KEY || "",
-  GEMINI_MODEL: process.env.GEMINI_MODEL || "gemini-1.5-flash",
+  GEMINI_MODEL:
+    process.env.GEMINI_MODEL || "models/gemini-2.0-flash-exp",
 
   LOG_LEVEL: (process.env.LOG_LEVEL || "info").toLowerCase(),
 };
 
-let LAST_GEMINI_ROUTER_ERROR = "";
-
 // ===================== Utils =====================
 function safeJsonParse(maybeJson) {
   try {
-    if (!maybeJson) return { ok: false, error: "empty" };
+    if (!maybeJson) return { ok: false };
     return { ok: true, value: JSON.parse(maybeJson) };
-  } catch (e) {
-    return { ok: false, error: e?.message || String(e) };
+  } catch {
+    return { ok: false };
   }
 }
 
@@ -56,19 +56,15 @@ function splitKeywords(cell) {
     .filter(Boolean);
 }
 
-// ===================== Google Sheets (Service Account) =====================
+// ===================== Google Sheets =====================
 function getServiceAccountAuth() {
   const raw = ENV.GOOGLE_SERVICE_ACCOUNT_JSON;
   if (!raw) throw new Error("GOOGLE_SERVICE_ACCOUNT_JSON missing");
 
-  let creds;
   const parsed = safeJsonParse(raw);
-  if (parsed.ok) {
-    creds = parsed.value;
-  } else {
-    const buf = Buffer.from(raw, "base64");
-    creds = JSON.parse(buf.toString("utf8"));
-  }
+  const creds = parsed.ok
+    ? parsed.value
+    : JSON.parse(Buffer.from(raw, "base64").toString("utf8"));
 
   return new google.auth.JWT({
     email: creds.client_email,
@@ -79,7 +75,6 @@ function getServiceAccountAuth() {
 
 async function fetchSheetTab(auth, sheetId, tabName) {
   const sheets = google.sheets({ version: "v4", auth });
-
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: sheetId,
     range: tabName,
@@ -98,23 +93,13 @@ async function fetchSheetTab(auth, sheetId, tabName) {
   });
 }
 
-// ===================== Config Loader + Cache =====================
-let CACHE = {
-  loaded_at: 0,
-  data: null,
-};
+// ===================== Config Cache =====================
+let CACHE = { loaded_at: 0, data: null };
 
 async function loadConfigFromSheet(force = false) {
   const ttlMs = Math.max(1, ENV.GSHEET_CACHE_TTL_SEC) * 1000;
-  const fresh = Date.now() - CACHE.loaded_at < ttlMs;
-
-  if (!force && CACHE.data && fresh) {
-    return {
-      ok: true,
-      from_cache: true,
-      loaded_at: new Date(CACHE.loaded_at).toISOString(),
-      ...CACHE.data,
-    };
+  if (!force && CACHE.data && Date.now() - CACHE.loaded_at < ttlMs) {
+    return { ok: true, from_cache: true, loaded_at: nowIso(), ...CACHE.data };
   }
 
   if (!ENV.GSHEET_ID) throw new Error("GSHEET_ID missing");
@@ -134,44 +119,31 @@ async function loadConfigFromSheet(force = false) {
   ];
 
   const results = {};
-  for (const tab of tabs) {
-    results[tab] = await fetchSheetTab(auth, ENV.GSHEET_ID, tab);
+  for (const t of tabs) {
+    results[t] = await fetchSheetTab(auth, ENV.GSHEET_ID, t);
   }
 
   const settings = {};
   for (const r of results.SETTINGS || []) {
-    const k = String(r.key || "").trim();
-    if (k) settings[k] = String(r.value ?? "").trim();
+    if (r.key) settings[r.key.trim()] = String(r.value ?? "").trim();
   }
 
   const cfg = {
     settings,
-    business_info: results.BUSINESS_INFO || [],
     routing_rules: results.ROUTING_RULES || [],
-    sales_script: results.SALES_SCRIPT || [],
-    support_script: results.SUPPORT_SCRIPT || [],
-    suppliers: results.SUPPLIERS || [],
-    make_payloads_spec: results.MAKE_PAYLOADS_SPEC || [],
-    prompts: results.PROMPTS || [],
     overview: {
       BUSINESS_NAME: settings.BUSINESS_NAME || "",
       DEFAULT_LANGUAGE: settings.DEFAULT_LANGUAGE || "he",
       SUPPORTED_LANGUAGES: settings.SUPPORTED_LANGUAGES || "he",
       SITE_BASE_URL: settings.SITE_BASE_URL || "",
-      MAIN_PHONE: settings.MAIN_PHONE || "",
-      BRANCHES: settings.BRANCHES || "",
     },
   };
 
-  CACHE = {
-    loaded_at: Date.now(),
-    data: cfg,
-  };
-
+  CACHE = { loaded_at: Date.now(), data: cfg };
   return { ok: true, from_cache: false, loaded_at: nowIso(), ...cfg };
 }
 
-// ===================== Router (Keywords) =====================
+// ===================== Router: Keywords =====================
 function routeByKeywords(text, rules) {
   const t = normalizeText(text);
   if (!t) return null;
@@ -203,54 +175,58 @@ function routeByKeywords(text, rules) {
   return null;
 }
 
-// ===================== Gemini Fallback Router =====================
+// ===================== Router: Gemini Fallback =====================
 async function routeByGemini(text) {
-  if (!ENV.GEMINI_API_KEY) return null;
+  if (!ENV.GEMINI_API_KEY) throw new Error("GEMINI_API_KEY missing");
 
-  const prompt = `
-You are a routing engine.
-Classify the user's intent into one of:
-sales, support, ambiguous.
-
-Return ONLY valid JSON in this format:
-{"route":"sales|support|ambiguous","confidence":0.0-1.0}
-
-User text:
-"""${text}"""
-`;
-
-  try {
-    const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${ENV.GEMINI_MODEL}:generateContent?key=${ENV.GEMINI_API_KEY}`,
+  const body = {
+    contents: [
       {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-        }),
-      }
-    );
+        role: "user",
+        parts: [
+          {
+            text: `
+Classify the intent into one of:
+- sales
+- support
+- ambiguous
 
-    const json = await res.json();
-    const raw =
-      json?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+Return JSON ONLY:
+{ "route": "...", "confidence": 0-1 }
 
-    const parsed = safeJsonParse(raw);
-    if (!parsed.ok) throw new Error("Invalid Gemini JSON");
+Text:
+"${text}"
+`,
+          },
+        ],
+      },
+    ],
+  };
 
-    return {
-      route: parsed.value.route || "ambiguous",
-      confidence: Number(parsed.value.confidence || 0),
-      by: "gemini",
-    };
-  } catch (e) {
-    LAST_GEMINI_ROUTER_ERROR = e.message;
-    return {
-      route: "unknown",
-      confidence: 0,
-      by: "gemini_failed",
-    };
+  const url = `https://generativelanguage.googleapis.com/v1beta/${ENV.GEMINI_MODEL}:generateContent?key=${ENV.GEMINI_API_KEY}`;
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) throw new Error(`Gemini HTTP ${res.status}`);
+
+  const json = await res.json();
+  const raw =
+    json?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+
+  const parsed = safeJsonParse(raw);
+  if (!parsed.ok || !parsed.value?.route) {
+    throw new Error("Gemini invalid JSON");
   }
+
+  return {
+    route: parsed.value.route,
+    confidence: Number(parsed.value.confidence || 0),
+    by: "gemini",
+  };
 }
 
 // ===================== Endpoints =====================
@@ -267,10 +243,7 @@ app.get("/config-check", async (req, res) => {
       loaded_at: cfg.loaded_at,
       overview: cfg.overview,
       counts: {
-        SETTINGS: Object.keys(cfg.settings).length,
         ROUTING_RULES: cfg.routing_rules.length,
-        SALES_SCRIPT: cfg.sales_script.length,
-        SUPPORT_SCRIPT: cfg.support_script.length,
       },
     });
   } catch (e) {
@@ -288,19 +261,15 @@ app.post("/route", async (req, res) => {
       return res.json({ ok: true, decision: bySheet });
     }
 
-    const byGemini = await routeByGemini(text);
-    if (byGemini) {
+    try {
+      const byGemini = await routeByGemini(text);
       return res.json({ ok: true, decision: byGemini });
+    } catch {
+      return res.json({
+        ok: true,
+        decision: { route: "unknown", confidence: 0, by: "gemini_failed" },
+      });
     }
-
-    return res.json({
-      ok: true,
-      decision: {
-        route: "unknown",
-        confidence: 0,
-        by: "none",
-      },
-    });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
