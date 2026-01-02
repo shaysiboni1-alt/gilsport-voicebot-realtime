@@ -25,11 +25,8 @@ const ENV = {
   TIME_ZONE: process.env.TIME_ZONE || "Asia/Jerusalem",
 
   GEMINI_API_KEY: process.env.GEMINI_API_KEY || "",
-  // IMPORTANT:
-  // Use a model that is supported for generateContent.
-  // Example known to work for you: models/gemini-2.0-flash-exp
+  // Example: models/gemini-2.0-flash-exp
   GEMINI_MODEL: process.env.GEMINI_MODEL || "models/gemini-2.0-flash-exp",
-
   GEMINI_TIMEOUT_MS: Number(process.env.GEMINI_TIMEOUT_MS || 9000),
 
   LOG_LEVEL: (process.env.LOG_LEVEL || "info").toLowerCase(),
@@ -65,6 +62,36 @@ function splitKeywords(cell) {
 function wantDebug(req) {
   const q = String(req.query?.debug || "").trim();
   return q === "1" || q.toLowerCase() === "true";
+}
+
+function normalizeGeminiModelName(name) {
+  const raw = String(name || "").trim();
+  if (!raw) return "";
+  if (raw.startsWith("models/")) return raw;
+  return `models/${raw}`;
+}
+
+function truncate(s, max = 600) {
+  const str = String(s || "");
+  if (str.length <= max) return str;
+  return str.slice(0, max) + `… (truncated ${str.length - max} chars)`;
+}
+
+function extractFirstJsonObject(text) {
+  // Best-effort: find first {...} block
+  const s = String(text || "");
+  const start = s.indexOf("{");
+  if (start === -1) return null;
+  let depth = 0;
+  for (let i = start; i < s.length; i++) {
+    const ch = s[i];
+    if (ch === "{") depth++;
+    if (ch === "}") depth--;
+    if (depth === 0) {
+      return s.slice(start, i + 1);
+    }
+  }
+  return null;
 }
 
 // ===================== Google Sheets (Service Account) =====================
@@ -216,20 +243,12 @@ function routeByKeywords(text, rules) {
 }
 
 // ===================== Gemini (Fallback Router) =====================
-function normalizeGeminiModelName(name) {
-  const raw = String(name || "").trim();
-  if (!raw) return "";
-  if (raw.startsWith("models/")) return raw;
-  // allow user to set: gemini-2.0-flash-exp
-  return `models/${raw}`;
-}
-
 function buildGeminiRoutingPrompt(text) {
-  // Keep it tight: we only want JSON back
+  // Hard JSON instructions + minimal
   return [
     "You are a routing classifier for a business voicebot.",
-    "Return ONLY valid JSON, no markdown, no extra text.",
-    'Schema: {"route":"sales|support|ambiguous","confidence":0-1,"reason":"short"}',
+    "Return ONLY JSON. No markdown. No explanations. No extra keys.",
+    'Schema exactly: {"route":"sales|support|ambiguous","confidence":0-1,"reason":"short"}',
     "Rules:",
     "- sales: buying, prices, products, availability, models, orders, links, WhatsApp link request.",
     "- support: problems, malfunctions, defects, delivery issues, warranty, exchanges/returns, complaints, service.",
@@ -239,7 +258,7 @@ function buildGeminiRoutingPrompt(text) {
   ].join("\n");
 }
 
-async function geminiRoute(text, timeoutMs) {
+async function geminiRoute(text, timeoutMs, debug = false) {
   LAST_GEMINI_ROUTER_ERROR = "";
 
   if (!ENV.GEMINI_API_KEY) {
@@ -260,6 +279,8 @@ async function geminiRoute(text, timeoutMs) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
+  let rawCandidate = "";
+
   try {
     const payload = {
       contents: [
@@ -269,8 +290,10 @@ async function geminiRoute(text, timeoutMs) {
         },
       ],
       generationConfig: {
-        temperature: 0.1,
-        maxOutputTokens: 200,
+        temperature: 0,
+        maxOutputTokens: 140,
+        // IMPORTANT: force JSON output when supported
+        responseMimeType: "application/json",
       },
     };
 
@@ -285,36 +308,55 @@ async function geminiRoute(text, timeoutMs) {
 
     if (!resp.ok) {
       LAST_GEMINI_ROUTER_ERROR = `Gemini HTTP ${resp.status} ${resp.statusText} | body: ${bodyText}`;
-      return {
-        ok: false,
-        error: LAST_GEMINI_ROUTER_ERROR,
-        model,
-      };
+      return { ok: false, error: LAST_GEMINI_ROUTER_ERROR, model };
     }
 
-    let json;
+    // Parse response envelope
+    let body;
     try {
-      const body = JSON.parse(bodyText);
-      const candidateText =
-        body?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
-      json = JSON.parse(String(candidateText).trim());
-    } catch (e) {
-      LAST_GEMINI_ROUTER_ERROR =
-        "Gemini parse failed (non-JSON response from model)";
+      body = JSON.parse(bodyText);
+    } catch {
+      LAST_GEMINI_ROUTER_ERROR = "Gemini envelope parse failed (invalid JSON from API)";
+      return { ok: false, error: LAST_GEMINI_ROUTER_ERROR, model };
+    }
+
+    rawCandidate = String(body?.candidates?.[0]?.content?.parts?.[0]?.text ?? "").trim();
+    if (!rawCandidate) {
+      LAST_GEMINI_ROUTER_ERROR = "Gemini returned empty candidate text";
+      return { ok: false, error: LAST_GEMINI_ROUTER_ERROR, model, raw: debug ? bodyText : undefined };
+    }
+
+    // Try strict JSON parse
+    let parsed = safeJsonParse(rawCandidate);
+    if (!parsed.ok) {
+      // fallback: extract first {..}
+      const extracted = extractFirstJsonObject(rawCandidate);
+      if (extracted) parsed = safeJsonParse(extracted);
+    }
+
+    if (!parsed.ok) {
+      LAST_GEMINI_ROUTER_ERROR = "Gemini parse failed (non-JSON response from model)";
       return {
         ok: false,
         error: LAST_GEMINI_ROUTER_ERROR,
         model,
+        raw_candidate: debug ? truncate(rawCandidate, 900) : undefined,
       };
     }
 
+    const json = parsed.value;
     const route = String(json.route || "").trim();
     const confidence = Number(json.confidence ?? 0);
     const reason = String(json.reason || "").trim();
 
     if (!["sales", "support", "ambiguous"].includes(route)) {
       LAST_GEMINI_ROUTER_ERROR = `Gemini returned invalid route: ${route}`;
-      return { ok: false, error: LAST_GEMINI_ROUTER_ERROR, model };
+      return {
+        ok: false,
+        error: LAST_GEMINI_ROUTER_ERROR,
+        model,
+        raw_candidate: debug ? truncate(rawCandidate, 900) : undefined,
+      };
     }
 
     return {
@@ -326,6 +368,7 @@ async function geminiRoute(text, timeoutMs) {
         by: "gemini",
         model,
       },
+      raw_candidate: debug ? truncate(rawCandidate, 900) : undefined,
     };
   } catch (e) {
     const msg =
@@ -333,13 +376,13 @@ async function geminiRoute(text, timeoutMs) {
         ? `Gemini timeout after ${timeoutMs}ms`
         : `Gemini request failed: ${e?.message || String(e)}`;
     LAST_GEMINI_ROUTER_ERROR = msg;
-    return { ok: false, error: msg, model: normalizeGeminiModelName(ENV.GEMINI_MODEL) };
+    return { ok: false, error: msg, model, raw_candidate: debug ? truncate(rawCandidate, 900) : undefined };
   } finally {
     clearTimeout(timer);
   }
 }
 
-// Optional helper: ListModels (useful to confirm available models for this key)
+// ===================== /models helper =====================
 app.get("/models", async (req, res) => {
   try {
     if (!ENV.GEMINI_API_KEY) {
@@ -359,7 +402,6 @@ app.get("/models", async (req, res) => {
       });
     }
     const data = JSON.parse(txt);
-    // return only minimal fields to keep response small
     const models = (data.models || []).map((m) => ({
       name: m.name,
       supportedGenerationMethods: m.supportedGenerationMethods,
@@ -409,11 +451,9 @@ app.post("/route", async (req, res) => {
     }
 
     // 2) Gemini fallback (hybrid)
-    const g = await geminiRoute(text, ENV.GEMINI_TIMEOUT_MS);
+    const g = await geminiRoute(text, ENV.GEMINI_TIMEOUT_MS, debug);
     if (g.ok) {
-      // If Gemini says ambiguous — return with question if exists in sheet (best effort)
       if (g.decision.route === "ambiguous") {
-        // take the first non-empty question_if_ambiguous from ROUTING_RULES (you can refine later)
         const q =
           (cfg.routing_rules || [])
             .map((r) => String(r.question_if_ambiguous || "").trim())
@@ -428,7 +468,7 @@ app.post("/route", async (req, res) => {
             question: q,
           },
           ...(debug
-            ? { debug: { gemini_model: g.decision.model, gemini_reason: g.decision.reason } }
+            ? { debug: { gemini_model: g.decision.model, gemini_reason: g.decision.reason, raw_candidate: g.raw_candidate } }
             : {}),
         });
       }
@@ -441,7 +481,7 @@ app.post("/route", async (req, res) => {
           by: "gemini",
         },
         ...(debug
-          ? { debug: { gemini_model: g.decision.model, gemini_reason: g.decision.reason } }
+          ? { debug: { gemini_model: g.decision.model, gemini_reason: g.decision.reason, raw_candidate: g.raw_candidate } }
           : {}),
       });
     }
@@ -460,6 +500,7 @@ app.post("/route", async (req, res) => {
               gemini_error: g.error || LAST_GEMINI_ROUTER_ERROR,
               gemini_model: g.model || normalizeGeminiModelName(ENV.GEMINI_MODEL),
               timeout_ms: ENV.GEMINI_TIMEOUT_MS,
+              raw_candidate: g.raw_candidate,
             },
           }
         : {}),
