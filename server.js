@@ -1,10 +1,17 @@
-// server.js (ESM)
-// GilSport VoiceBot Realtime - Config Loader + Router
-// Uses Google Sheets API with Service Account (PRIVATE sheet supported)
-// Node 18+ (Render uses Node 22). fetch is available globally.
+// server.js
+//
+// GilSport VoiceBot Realtime - Config + Router service
+// - /health
+// - /config-check
+// - /route  (keywords first, Gemini fallback)
+//
+// Notes:
+// - Google Sheet is the source of truth (client-controlled).
+// - Router is HYBRID: keywords -> Gemini (if enabled).
+//
+// Node 18+ (Render uses Node 22.x by default)
 
 import express from "express";
-import { google } from "googleapis";
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
@@ -13,171 +20,132 @@ const PORT = process.env.PORT || 10000;
 
 // ===================== ENV =====================
 const ENV = {
+  GOOGLE_SERVICE_ACCOUNT_JSON: process.env.GOOGLE_SERVICE_ACCOUNT_JSON || "",
+  GSHEET_ID: process.env.GSHEET_ID || "",
+  GSHEET_CACHE_TTL_SEC: Number(process.env.GSHEET_CACHE_TTL_SEC || 60),
   TIME_ZONE: process.env.TIME_ZONE || "Asia/Jerusalem",
 
-  // Google Sheet
-  GSHEET_ID: process.env.GSHEET_ID || "",
-  GSHEET_CACHE_TTL_SEC: Number(process.env.GSHEET_CACHE_TTL_SEC || "60"),
-
-  // Service account JSON: raw JSON or base64(JSON)
-  GOOGLE_SERVICE_ACCOUNT_JSON: process.env.GOOGLE_SERVICE_ACCOUNT_JSON || "",
-
-  // Router LLM (Gemini)
+  // Gemini Router (optional / hybrid)
   GEMINI_API_KEY: process.env.GEMINI_API_KEY || "",
   GEMINI_MODEL: process.env.GEMINI_MODEL || "gemini-1.5-flash",
 
-  // Debug
-  MB_DEBUG: String(process.env.MB_DEBUG || "").toLowerCase() === "true",
+  LOG_LEVEL: (process.env.LOG_LEVEL || "info").toLowerCase(),
 };
 
-function log(...args) {
-  if (ENV.MB_DEBUG) console.log("[DEBUG]", ...args);
-}
+// Debug: last Gemini router error (if any)
+let LAST_GEMINI_ROUTER_ERROR = "";
 
-function nowISO() {
-  return new Date().toISOString();
-}
-
-function safeJsonParse(str) {
+// ===================== Utils =====================
+function safeJsonParse(maybeJson) {
   try {
-    return { ok: true, value: JSON.parse(str) };
+    if (!maybeJson) return { ok: false, error: "empty" };
+    return { ok: true, value: JSON.parse(maybeJson) };
   } catch (e) {
     return { ok: false, error: e?.message || String(e) };
   }
 }
 
-function maybeBase64ToString(s) {
-  if (!s) return s;
-  const trimmed = String(s).trim();
-  if (trimmed.startsWith("{")) return trimmed;
-  try {
-    const decoded = Buffer.from(trimmed, "base64").toString("utf8").trim();
-    if (decoded.startsWith("{")) return decoded;
-  } catch (_) {}
-  return trimmed;
+function nowIso() {
+  return new Date().toISOString();
 }
 
-function normalizeText(input) {
-  return String(input || "")
-    .normalize("NFKC")
-    .replace(/[\u0591-\u05C7]/g, "") // Hebrew diacritics (nikud + cantillation)
-    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+function normalizeText(s) {
+  return String(s || "")
+    .toLowerCase()
     .replace(/\s+/g, " ")
-    .trim()
-    .toLowerCase();
+    .trim();
 }
 
-function splitKeywordsCell(cell) {
-  return String(cell || "")
-    .split(/[,;\n]/g)
-    .map((x) => normalizeText(x))
+function splitKeywords(cell) {
+  // supports: comma-separated, newline-separated
+  const raw = String(cell || "").trim();
+  if (!raw) return [];
+  return raw
+    .split(/[,|\n]/g)
+    .map((x) => x.trim())
     .filter(Boolean);
 }
 
-function routeByKeywords(text, routingRules) {
-  const norm = normalizeText(text);
-  if (!norm) return null;
-
-  const sorted = [...routingRules].sort((a, b) => {
-    const pa = Number(a.priority ?? 9999);
-    const pb = Number(b.priority ?? 9999);
-    return pa - pb;
-  });
-
-  for (const rule of sorted) {
-    const route = String(rule.route || "").trim();
-    const keywords = splitKeywordsCell(rule.keywords || "");
-    if (!route || keywords.length === 0) continue;
-
-    for (const kw of keywords) {
-      if (kw && norm.includes(kw)) {
-        return { route, matched: kw, confidence: 1, by: "sheet_keywords" };
-      }
-    }
-  }
-
-  return null;
+function isDebug() {
+  return ENV.LOG_LEVEL === "debug";
 }
 
-// ===================== Google Sheets API (Service Account) =====================
-let SHEETS_CLIENT = null;
+// ===================== Google Sheet (GVIZ) =====================
+// We use the public GVIZ endpoint; sheet must be shared with the service account.
+// Tabs expected: SETTINGS, BUSINESS_INFO, ROUTING_RULES, SALES_SCRIPT, SUPPORT_SCRIPT, SUPPLIERS, MAKE_PAYLOADS_SPEC, PROMPTS
 
-function getServiceAccountCreds() {
-  const raw = ENV.GOOGLE_SERVICE_ACCOUNT_JSON;
-  if (!raw) throw new Error("GOOGLE_SERVICE_ACCOUNT_JSON is missing");
-
-  const decoded = maybeBase64ToString(raw);
-  const parsed = safeJsonParse(decoded);
-  if (!parsed.ok) {
-    throw new Error(
-      `GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON (and not base64 JSON): ${parsed.error}`
-    );
-  }
-  return parsed.value;
+function buildGvizUrl(sheetId, tabName) {
+  // GVIZ JSON is wrapped; we'll parse out the table via a helper below.
+  return `https://docs.google.com/spreadsheets/d/${encodeURIComponent(
+    sheetId
+  )}/gviz/tq?tqx=out:json&sheet=${encodeURIComponent(tabName)}`;
 }
 
-async function getSheetsClient() {
-  if (SHEETS_CLIENT) return SHEETS_CLIENT;
+function gvizToRows(gvizText) {
+  // GVIZ returns: "/*O_o*/\ngoogle.visualization.Query.setResponse({...});"
+  const match = String(gvizText || "").match(/setResponse\(([\s\S]*?)\);?$/);
+  if (!match) return { ok: false, error: "GVIZ wrapper not found" };
+  const parsed = safeJsonParse(match[1]);
+  if (!parsed.ok) return { ok: false, error: parsed.error };
 
-  const creds = getServiceAccountCreds();
-  const auth = new google.auth.GoogleAuth({
-    credentials: creds,
-    scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
-  });
+  const table = parsed.value?.table;
+  const cols = (table?.cols || []).map((c) => c?.label || "");
+  const rows = table?.rows || [];
 
-  const sheets = google.sheets({ version: "v4", auth });
-  SHEETS_CLIENT = sheets;
-  return sheets;
-}
-
-async function fetchSheetRange(rangeA1) {
-  if (!ENV.GSHEET_ID) throw new Error("GSHEET_ID is missing");
-  const sheets = await getSheetsClient();
-
-  const resp = await sheets.spreadsheets.values.get({
-    spreadsheetId: ENV.GSHEET_ID,
-    range: rangeA1,
-    majorDimension: "ROWS",
-  });
-
-  return resp?.data?.values || [];
-}
-
-function rowsToObjects(values) {
-  // First row = headers, rest rows = objects
-  if (!values || values.length === 0) return [];
-
-  const headers = (values[0] || []).map((h) => String(h || "").trim());
-  const out = [];
-
-  for (let i = 1; i < values.length; i++) {
-    const row = values[i] || [];
-    // skip empty row
-    if (row.every((c) => String(c || "").trim() === "")) continue;
-
+  const out = rows.map((r) => {
     const obj = {};
-    for (let c = 0; c < headers.length; c++) {
-      const key = headers[c] || `col_${c}`;
-      obj[key] = row[c] ?? "";
-    }
-    out.push(obj);
+    r.c?.forEach((cell, idx) => {
+      const key = cols[idx] || `col_${idx}`;
+      obj[key] = cell?.v ?? "";
+    });
+    return obj;
+  });
+
+  return { ok: true, rows: out, cols };
+}
+
+// ===================== Config Loader + Cache =====================
+let CACHE = {
+  loaded_at: 0,
+  data: null,
+};
+
+async function fetchTab(sheetId, tabName) {
+  const url = buildGvizUrl(sheetId, tabName);
+  const r = await fetch(url);
+  const txt = await r.text();
+  if (!r.ok) {
+    return { ok: false, error: `GVIZ fetch failed (${r.status}) for ${tabName}` };
+  }
+  const parsed = gvizToRows(txt);
+  if (!parsed.ok) return { ok: false, error: parsed.error };
+  return { ok: true, rows: parsed.rows, cols: parsed.cols };
+}
+
+function rowsToKeyValue(rows) {
+  // expects columns: key, value
+  const out = {};
+  for (const r of rows || []) {
+    const key = String(r.key || r.KEY || "").trim();
+    if (!key) continue;
+    out[key] = String(r.value ?? r.VALUE ?? "").trim();
   }
   return out;
 }
 
-// ===================== Config Cache =====================
-let CONFIG_CACHE = {
-  loaded_at: null,
-  expires_at: 0,
-  data: null,
-};
-
 async function loadConfigFromSheet(force = false) {
-  const now = Date.now();
-  if (!force && CONFIG_CACHE.data && now < CONFIG_CACHE.expires_at) {
-    return { from_cache: true, ...CONFIG_CACHE.data, loaded_at: CONFIG_CACHE.loaded_at };
+  const ttlMs = Math.max(1, ENV.GSHEET_CACHE_TTL_SEC) * 1000;
+  const fresh = Date.now() - CACHE.loaded_at < ttlMs;
+
+  if (!force && CACHE.data && fresh) {
+    return { ok: true, from_cache: true, loaded_at: new Date(CACHE.loaded_at).toISOString(), ...CACHE.data };
   }
 
+  if (!ENV.GSHEET_ID) {
+    throw new Error("GSHEET_ID missing");
+  }
+
+  // Pull tabs
   const tabs = [
     "SETTINGS",
     "BUSINESS_INFO",
@@ -189,191 +157,277 @@ async function loadConfigFromSheet(force = false) {
     "PROMPTS",
   ];
 
-  const raw = {};
-  const counts = {};
-
+  const results = {};
   for (const tab of tabs) {
-    // Read broad range. If you add columns later, still works.
-    const values = await fetchSheetRange(`${tab}!A:Z`);
-    const objs = rowsToObjects(values);
-    raw[tab] = objs;
-    counts[`${tab}_rows`] = objs.length;
+    const ft = await fetchTab(ENV.GSHEET_ID, tab);
+    if (!ft.ok) throw new Error(ft.error);
+    results[tab] = ft.rows;
   }
 
-  // SETTINGS tab expected headers: key | value (Heb/Eng doesn't matter, we handle common variants)
-  const settings = {};
-  for (const r of raw.SETTINGS || []) {
-    const k = String(r.key ?? r.KEY ?? r.Key ?? "").trim();
-    const v = String(r.value ?? r.VALUE ?? r.Value ?? "").trim();
-    if (k) settings[k] = v;
-  }
+  const settings = rowsToKeyValue(results.SETTINGS);
+  const business_info = results.BUSINESS_INFO || [];
+  const routing_rules = results.ROUTING_RULES || [];
+  const sales_script = results.SALES_SCRIPT || [];
+  const support_script = results.SUPPORT_SCRIPT || [];
+  const suppliers = results.SUPPLIERS || [];
+  const make_payloads_spec = results.MAKE_PAYLOADS_SPEC || [];
+  const prompts = results.PROMPTS || [];
 
-  const overview = {
-    BUSINESS_NAME: settings.BUSINESS_NAME || "",
-    DEFAULT_LANGUAGE: settings.DEFAULT_LANGUAGE || "he",
-    SUPPORTED_LANGUAGES: settings.SUPPORTED_LANGUAGES || "he",
-    SITE_BASE_URL: settings.SITE_BASE_URL || "",
-    MAIN_PHONE: settings.MAIN_PHONE || "",
-    BRANCHES: settings.BRANCHES || "",
-  };
-
-  const validation = {
-    missing_settings_keys: [],
-    languages_ok: true,
-    default_language: overview.DEFAULT_LANGUAGE,
-    supported_languages: overview.SUPPORTED_LANGUAGES.split(",").map((x) => x.trim()).filter(Boolean),
-    numeric_warnings: [],
-    counts,
-  };
-
-  const required = ["BUSINESS_NAME", "DEFAULT_LANGUAGE", "SUPPORTED_LANGUAGES"];
-  for (const rk of required) {
-    if (!settings[rk]) validation.missing_settings_keys.push(rk);
-  }
-
-  const routing_rules = (raw.ROUTING_RULES || []).map((r) => ({
-    priority: r.priority ?? r.PRIORITY ?? r.Priority ?? 9999,
-    route: r.route ?? r.ROUTE ?? r.Route ?? "",
-    keywords: r.keywords ?? r.KEYWORDS ?? r.Keywords ?? "",
-    question_if_ambiguous:
-      r.question_if_ambiguous ??
-      r.QUESTION_IF_AMBIGUOUS ??
-      r.Question_if_ambiguous ??
-      "",
-    notes: r.notes ?? r.NOTES ?? r.Notes ?? "",
-  }));
-
-  const data = {
-    ok: true,
-    sheet_id: ENV.GSHEET_ID,
+  const cfg = {
     settings,
-    overview,
-    validation,
+    business_info,
     routing_rules,
+    sales_script,
+    support_script,
+    suppliers,
+    make_payloads_spec,
+    prompts,
+    overview: {
+      BUSINESS_NAME: settings.BUSINESS_NAME || "",
+      DEFAULT_LANGUAGE: settings.DEFAULT_LANGUAGE || "he",
+      SUPPORTED_LANGUAGES: settings.SUPPORTED_LANGUAGES || "he",
+      SITE_BASE_URL: settings.SITE_BASE_URL || "",
+      MAIN_PHONE: settings.MAIN_PHONE || "",
+      BRANCHES: settings.BRANCHES || "",
+    },
   };
 
-  CONFIG_CACHE = {
-    loaded_at: nowISO(),
-    expires_at: now + ENV.GSHEET_CACHE_TTL_SEC * 1000,
-    data,
+  CACHE = {
+    loaded_at: Date.now(),
+    data: cfg,
   };
 
-  return { from_cache: false, ...data, loaded_at: CONFIG_CACHE.loaded_at };
+  return { ok: true, from_cache: false, loaded_at: nowIso(), ...cfg };
 }
 
-// ===================== Gemini Router Fallback =====================
-async function geminiRoute(text, allowedRoutes) {
-  if (!ENV.GEMINI_API_KEY) return null;
+// ===================== Router (Keywords) =====================
+function routeByKeywords(text, rules) {
+  const t = normalizeText(text);
+  if (!t) return null;
 
-  const model = ENV.GEMINI_MODEL || "gemini-1.5-flash";
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
-    model
-  )}:generateContent?key=${encodeURIComponent(ENV.GEMINI_API_KEY)}`;
+  // Build rule list
+  const list = (rules || [])
+    .map((r) => ({
+      priority: Number(r.priority ?? r.PRIORITY ?? 0),
+      route: String(r.route ?? r.ROUTE ?? "").trim(),
+      keywords: splitKeywords(r.keywords ?? r.KEYWORDS ?? ""),
+      question_if_ambiguous: String(r.question_if_ambiguous ?? r.QUESTION_IF_AMBIGUOUS ?? "").trim(),
+      notes: String(r.notes ?? r.NOTES ?? "").trim(),
+    }))
+    .filter((r) => r.route && r.keywords.length);
 
-  const routesList = allowedRoutes.filter(Boolean);
+  // Higher priority first
+  list.sort((a, b) => (b.priority || 0) - (a.priority || 0));
+
+  for (const rule of list) {
+    for (const kw of rule.keywords) {
+      const k = normalizeText(kw);
+      if (!k) continue;
+      if (t.includes(k)) {
+        const route = rule.route;
+        return {
+          route,
+          matched: kw,
+          confidence: 1,
+          by: "sheet_keywords",
+          question: String(rule.question_if_ambiguous || "").trim() || null,
+          priority: Number(rule.priority ?? null),
+        };
+      }
+    }
+  }
+
+  return null;
+}
+
+// ===================== Router (Gemini fallback) =====================
+async function geminiRoute(text, cfg, rules) {
+  LAST_GEMINI_ROUTER_ERROR = "";
+  if (!ENV.GEMINI_API_KEY) {
+    LAST_GEMINI_ROUTER_ERROR = "GEMINI_API_KEY is missing";
+    return null;
+  }
+
+  const routesList = [...new Set((rules || []).map((r) => r.route).filter(Boolean))];
+  if (!routesList.length) {
+    LAST_GEMINI_ROUTER_ERROR = "No routes found in ROUTING_RULES";
+    return null;
+  }
+
+  const businessName = cfg?.settings?.BUSINESS_NAME || cfg?.overview?.BUSINESS_NAME || "העסק";
   const prompt = `
-You are a routing classifier for a Hebrew retail business phone bot.
-Return ONLY strict JSON with keys: route, confidence, reason.
-route must be one of: ${routesList.join(", ")}.
-confidence is a number 0..1.
-If unclear between sales/support, choose "ambiguous" (never "unknown").
-User text: ${text}
+You are a call routing classifier for a Hebrew voicebot.
+Business: ${businessName}
+
+Allowed routes: ${routesList.join(", ")}
+
+User message (Hebrew):
+"${text}"
+
+Return STRICT JSON only (no markdown, no commentary) with this schema:
+{
+  "route": "sales|support|ambiguous",
+  "confidence": 0..1,
+  "reason": "short explanation in Hebrew",
+  "question": "ONLY if route=ambiguous: a short clarifying question in Hebrew"
+}
+
+Rules:
+- Choose sales for pricing, models, products, recommendations, buying intent.
+- Choose support for problems, malfunction, warranty/service, delivery issues, repairs.
+- Choose ambiguous only if you truly cannot decide.
+- Do not output any extra keys.
 `.trim();
 
   const body = {
     contents: [{ role: "user", parts: [{ text: prompt }] }],
-    generationConfig: { temperature: 0.2, maxOutputTokens: 120 },
+    generationConfig: {
+      temperature: 0.1,
+      response_mime_type: "application/json",
+    },
   };
 
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${ENV.GEMINI_MODEL}:generateContent?key=${ENV.GEMINI_API_KEY}`;
 
-  const raw = await res.text();
-  if (!res.ok) {
-    log("Gemini error:", res.status, raw.slice(0, 500));
-    return null;
-  }
-
-  let data;
   try {
-    data = JSON.parse(raw);
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+
+    const json = await r.json();
+
+    if (!r.ok) {
+      LAST_GEMINI_ROUTER_ERROR = `Gemini API HTTP ${r.status}: ${JSON.stringify(json).slice(0, 300)}`;
+      return null;
+    }
+
+    const cand = json?.candidates?.[0];
+    if (!cand?.content?.parts?.length) {
+      LAST_GEMINI_ROUTER_ERROR = "Gemini returned no content parts";
+      return null;
+    }
+
+    const raw = cand.content.parts.map((p) => p.text || "").join("\n").trim();
+
+    // Try to extract an object in case Gemini wraps output (should not, but defensive)
+    const objMatch = raw.match(/\{[\s\S]*\}/);
+    const parsed = safeJsonParse(objMatch ? objMatch[0] : null);
+    if (!parsed.ok) {
+      LAST_GEMINI_ROUTER_ERROR = `Gemini output not JSON: ${String(raw).slice(0, 300)}`;
+      return null;
+    }
+
+    const route = String(parsed.value?.route || "").trim();
+    const confidence = Number(parsed.value?.confidence ?? 0);
+    const reason = String(parsed.value?.reason || "").trim();
+    const question = String(parsed.value?.question || "").trim();
+
+    if (!routesList.includes(route)) {
+      LAST_GEMINI_ROUTER_ERROR = `Gemini route not in allowed list: ${route}`;
+      return null;
+    }
+
+    return {
+      route,
+      confidence: Number.isFinite(confidence) ? confidence : null,
+      reason,
+      question: question || null,
+    };
   } catch (e) {
-    log("Gemini JSON parse fail:", e?.message, raw.slice(0, 200));
+    LAST_GEMINI_ROUTER_ERROR = `Gemini fetch/parse error: ${e?.message || String(e)}`;
     return null;
   }
-
-  const outText =
-    data?.candidates?.[0]?.content?.parts?.map((p) => p.text).join("") || "";
-
-  const jsonMatch = outText.match(/\{[\s\S]*\}/);
-  if (!jsonMatch) return null;
-
-  const parsed = safeJsonParse(jsonMatch[0]);
-  if (!parsed.ok) return null;
-
-  const route = String(parsed.value.route || "").trim();
-  const conf = Number(parsed.value.confidence ?? 0);
-
-  if (!routesList.includes(route)) return null;
-
-  return {
-    route,
-    matched: null,
-    confidence: isFinite(conf) ? Math.max(0, Math.min(1, conf)) : 0.5,
-    by: "gemini_fallback",
-    reason: String(parsed.value.reason || ""),
-  };
 }
 
-// ===================== Routes =====================
-app.get("/", (req, res) => {
-  res.status(200).send("GilSport VoiceBot Realtime - up. Try /health or /config-check");
-});
-
+// ===================== Endpoints =====================
 app.get("/health", (req, res) => {
-  res.json({ ok: true, service: "gilsport-voicebot-realtime", time: nowISO() });
+  res.json({
+    ok: true,
+    service: "gilsport-voicebot-realtime",
+    time: nowIso(),
+  });
 });
 
 app.get("/config-check", async (req, res) => {
-  // Validate service account JSON presence/parse
-  let saValid = null;
   try {
-    getServiceAccountCreds();
-    saValid = true;
-  } catch (e) {
-    saValid = `invalid: ${e?.message || String(e)}`;
-  }
+    // validate service account JSON (optional; depends on your code path)
+    const sa = ENV.GOOGLE_SERVICE_ACCOUNT_JSON;
+    const parsedSA = safeJsonParse(sa);
+    const isBase64Json = (() => {
+      try {
+        const buf = Buffer.from(sa, "base64");
+        const s = buf.toString("utf8");
+        const p2 = safeJsonParse(s);
+        return p2.ok;
+      } catch {
+        return false;
+      }
+    })();
 
-  try {
-    const cfg = await loadConfigFromSheet(false);
-    res.json({
+    if (sa && !parsedSA.ok && !isBase64Json) {
+      return res.json({
+        ok: false,
+        error: `GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON (and not base64 JSON): ${parsedSA.error}`,
+      });
+    }
+
+    const cfg = await loadConfigFromSheet(true);
+
+    // Basic validation summary
+    const missing = [];
+    const required = [
+      "BUSINESS_NAME",
+      "DEFAULT_LANGUAGE",
+      "SUPPORTED_LANGUAGES",
+      "SITE_BASE_URL",
+      "MAIN_PHONE",
+      "BRANCHES",
+    ];
+    for (const k of required) {
+      if (!String(cfg.settings?.[k] || "").trim()) missing.push(k);
+    }
+
+    const supported = String(cfg.settings?.SUPPORTED_LANGUAGES || "he")
+      .split(",")
+      .map((x) => x.trim())
+      .filter(Boolean);
+
+    const defaultLang = String(cfg.settings?.DEFAULT_LANGUAGE || "he").trim();
+
+    return res.json({
       ok: true,
       from_cache: cfg.from_cache,
       loaded_at: cfg.loaded_at,
-      sheet_id: cfg.sheet_id,
-      validation: cfg.validation,
+      sheet_id: ENV.GSHEET_ID,
+      validation: {
+        missing_settings_keys: missing,
+        languages_ok: supported.includes(defaultLang),
+        default_language: defaultLang,
+        supported_languages: supported,
+        numeric_warnings: [],
+        counts: {
+          SETTINGS_rows: (cfg.settings ? Object.keys(cfg.settings).length : 0),
+          BUSINESS_INFO_rows: (cfg.business_info || []).length,
+          ROUTING_RULES_rows: (cfg.routing_rules || []).length,
+          SALES_SCRIPT_rows: (cfg.sales_script || []).length,
+          SUPPORT_SCRIPT_rows: (cfg.support_script || []).length,
+          SUPPLIERS_rows: (cfg.suppliers || []).length,
+          MAKE_PAYLOADS_SPEC_rows: (cfg.make_payloads_spec || []).length,
+          PROMPTS_rows: (cfg.prompts || []).length,
+        },
+      },
       overview: cfg.overview,
       router_llm: {
         enabled: Boolean(ENV.GEMINI_API_KEY),
         provider: "gemini",
         model: ENV.GEMINI_MODEL,
       },
-      google_service_account_json: saValid,
+      google_service_account_json: Boolean(ENV.GOOGLE_SERVICE_ACCOUNT_JSON),
     });
   } catch (e) {
-    res.status(200).json({
-      ok: false,
-      error: e?.message || String(e),
-      router_llm: {
-        enabled: Boolean(ENV.GEMINI_API_KEY),
-        provider: "gemini",
-        model: ENV.GEMINI_MODEL,
-      },
-      google_service_account_json: saValid,
-    });
+    res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 });
 
@@ -382,8 +436,10 @@ app.post("/route", async (req, res) => {
 
   try {
     const cfg = await loadConfigFromSheet(false);
+    const rules = cfg.routing_rules || [];
 
-    const bySheet = routeByKeywords(text, cfg.routing_rules || []);
+    // 1) Fast path: deterministic keyword routing from the sheet
+    const bySheet = routeByKeywords(text, rules);
     if (bySheet) {
       return res.json({
         ok: true,
@@ -393,37 +449,69 @@ app.post("/route", async (req, res) => {
           matched: bySheet.matched,
           confidence: bySheet.confidence,
           by: bySheet.by,
+          question: bySheet.question || null,
+          priority: bySheet.priority ?? null,
         },
       });
     }
 
+    // 2) Fallback: Gemini router (hybrid mode)
     const allowedRoutes = ["sales", "support", "ambiguous"];
-    const byGemini = await geminiRoute(text, allowedRoutes);
-    if (byGemini) {
+    const byGemini = await geminiRoute(text, cfg, rules);
+
+    if (byGemini && allowedRoutes.includes(byGemini.route)) {
+      let question = byGemini.question || null;
+
+      // If Gemini says "ambiguous" but didn't provide a question – use the sheet's question_if_ambiguous (if exists).
+      if (byGemini.route === "ambiguous" && !question) {
+        const ambRule = rules.find(
+          (r) =>
+            String(r.route || "").trim() === "ambiguous" &&
+            String(r.question_if_ambiguous || "").trim()
+        );
+        question = ambRule ? String(ambRule.question_if_ambiguous).trim() : null;
+      }
+
       return res.json({
         ok: true,
         input: { text },
         decision: {
           route: byGemini.route,
           matched: null,
-          confidence: byGemini.confidence,
-          by: byGemini.by,
-          reason: byGemini.reason || "",
+          confidence: byGemini.confidence ?? null,
+          by: "gemini",
+          question,
+          reason: byGemini.reason || null,
         },
       });
     }
 
+    const geminiEnabled = Boolean(ENV.GEMINI_API_KEY);
+    const by =
+      geminiEnabled && LAST_GEMINI_ROUTER_ERROR ? "gemini_failed" : "none";
+
     return res.json({
       ok: true,
       input: { text },
-      decision: { route: "unknown", matched: null, confidence: 0, by: "none" },
+      decision: {
+        route: "unknown",
+        matched: null,
+        confidence: 0,
+        by,
+        error: geminiEnabled ? LAST_GEMINI_ROUTER_ERROR || null : null,
+      },
     });
   } catch (e) {
-    return res.status(200).json({ ok: false, error: e?.message || String(e) });
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 });
 
+app.get("/", (req, res) => {
+  res
+    .status(200)
+    .send("GilSport VoiceBot Realtime - up. Try /health or /config-check");
+});
+
 app.listen(PORT, () => {
-  console.log(`[INFO] Server listening on port ${PORT}`);
-  console.log(`[INFO] ${nowISO()}`);
+  console.log(`[BOOT] listening on ${PORT}`);
 });
