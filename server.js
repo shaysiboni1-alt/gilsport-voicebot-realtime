@@ -4,6 +4,7 @@
 // - /health
 // - /config-check
 // - /route  (keywords first, Gemini fallback)
+// - /models (optional debug helper)
 //
 // Google Sheets access via Service Account (JWT) – NO GVIZ
 // Node 18+ (Render uses Node 22.x)
@@ -24,27 +25,17 @@ const ENV = {
   TIME_ZONE: process.env.TIME_ZONE || "Asia/Jerusalem",
 
   GEMINI_API_KEY: process.env.GEMINI_API_KEY || "",
-  // IMPORTANT: Must include "models/"
-  GEMINI_MODEL: process.env.GEMINI_MODEL || "models/gemini-1.5-flash",
+  // IMPORTANT:
+  // Use a model that is supported for generateContent.
+  // Example known to work for you: models/gemini-2.0-flash-exp
+  GEMINI_MODEL: process.env.GEMINI_MODEL || "models/gemini-2.0-flash-exp",
 
-  // network tuning
   GEMINI_TIMEOUT_MS: Number(process.env.GEMINI_TIMEOUT_MS || 9000),
 
   LOG_LEVEL: (process.env.LOG_LEVEL || "info").toLowerCase(),
 };
 
 let LAST_GEMINI_ROUTER_ERROR = "";
-
-// ===================== Logging =====================
-const LEVELS = { error: 0, warn: 1, info: 2, debug: 3 };
-function log(level, msg, extra) {
-  const cur = LEVELS[ENV.LOG_LEVEL] ?? 2;
-  const lv = LEVELS[level] ?? 2;
-  if (lv > cur) return;
-  const base = `[${level.toUpperCase()}] ${msg}`;
-  if (extra !== undefined) console.log(base, extra);
-  else console.log(base);
-}
 
 // ===================== Utils =====================
 function safeJsonParse(maybeJson) {
@@ -71,13 +62,9 @@ function splitKeywords(cell) {
     .filter(Boolean);
 }
 
-function stripCodeFences(s) {
-  const t = String(s || "").trim();
-  // remove ```json ... ```
-  if (t.startsWith("```")) {
-    return t.replace(/^```[a-zA-Z]*\n?/, "").replace(/```$/, "").trim();
-  }
-  return t;
+function wantDebug(req) {
+  const q = String(req.query?.debug || "").trim();
+  return q === "1" || q.toLowerCase() === "true";
 }
 
 // ===================== Google Sheets (Service Account) =====================
@@ -169,17 +156,9 @@ async function loadConfigFromSheet(force = false) {
     if (k) settings[k] = String(r.value ?? "").trim();
   }
 
-  // Convenience: if BUSINESS_INFO has field/value rows, map them too (optional)
-  const businessInfoMap = {};
-  for (const r of results.BUSINESS_INFO || []) {
-    const f = String(r.field || "").trim();
-    if (f) businessInfoMap[f] = String(r.value ?? "").trim();
-  }
-
   const cfg = {
     settings,
     business_info: results.BUSINESS_INFO || [],
-    business_info_map: businessInfoMap,
     routing_rules: results.ROUTING_RULES || [],
     sales_script: results.SALES_SCRIPT || [],
     support_script: results.SUPPORT_SCRIPT || [],
@@ -191,8 +170,8 @@ async function loadConfigFromSheet(force = false) {
       DEFAULT_LANGUAGE: settings.DEFAULT_LANGUAGE || "he",
       SUPPORTED_LANGUAGES: settings.SUPPORTED_LANGUAGES || "he",
       SITE_BASE_URL: settings.SITE_BASE_URL || "",
-      MAIN_PHONE: settings.MAIN_PHONE || businessInfoMap.MAIN_PHONE || "",
-      BRANCHES: settings.BRANCHES || businessInfoMap.BRANCHES || "",
+      MAIN_PHONE: settings.MAIN_PHONE || "",
+      BRANCHES: settings.BRANCHES || "",
     },
   };
 
@@ -236,134 +215,160 @@ function routeByKeywords(text, rules) {
   return null;
 }
 
-function getAmbiguousQuestionFromSheet(rules) {
-  // choose highest priority row that has a question_if_ambiguous
-  const list = (rules || [])
-    .map((r) => ({
-      priority: Number(r.priority || 0),
-      route: String(r.route || "").trim(),
-      question_if_ambiguous: String(r.question_if_ambiguous || "").trim(),
-    }))
-    .filter((r) => r.question_if_ambiguous)
-    .sort((a, b) => b.priority - a.priority);
-
-  // Prefer explicit "ambiguous" rows, else any question is fine
-  const amb = list.find((r) => r.route === "ambiguous");
-  return (amb?.question_if_ambiguous || list[0]?.question_if_ambiguous || "").trim();
+// ===================== Gemini (Fallback Router) =====================
+function normalizeGeminiModelName(name) {
+  const raw = String(name || "").trim();
+  if (!raw) return "";
+  if (raw.startsWith("models/")) return raw;
+  // allow user to set: gemini-2.0-flash-exp
+  return `models/${raw}`;
 }
 
-// ===================== Gemini Fallback =====================
-async function geminiRoute(text) {
+function buildGeminiRoutingPrompt(text) {
+  // Keep it tight: we only want JSON back
+  return [
+    "You are a routing classifier for a business voicebot.",
+    "Return ONLY valid JSON, no markdown, no extra text.",
+    'Schema: {"route":"sales|support|ambiguous","confidence":0-1,"reason":"short"}',
+    "Rules:",
+    "- sales: buying, prices, products, availability, models, orders, links, WhatsApp link request.",
+    "- support: problems, malfunctions, defects, delivery issues, warranty, exchanges/returns, complaints, service.",
+    "- ambiguous: unclear / generic / not enough info.",
+    "",
+    `User text: ${JSON.stringify(String(text || ""))}`,
+  ].join("\n");
+}
+
+async function geminiRoute(text, timeoutMs) {
   LAST_GEMINI_ROUTER_ERROR = "";
 
   if (!ENV.GEMINI_API_KEY) {
     LAST_GEMINI_ROUTER_ERROR = "GEMINI_API_KEY missing";
-    throw new Error(LAST_GEMINI_ROUTER_ERROR);
-  }
-  if (!ENV.GEMINI_MODEL || !String(ENV.GEMINI_MODEL).startsWith("models/")) {
-    LAST_GEMINI_ROUTER_ERROR = `GEMINI_MODEL invalid (must start with "models/"): ${ENV.GEMINI_MODEL}`;
-    throw new Error(LAST_GEMINI_ROUTER_ERROR);
+    return { ok: false, error: LAST_GEMINI_ROUTER_ERROR };
   }
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/${ENV.GEMINI_MODEL}:generateContent?key=${encodeURIComponent(
+  const model = normalizeGeminiModelName(ENV.GEMINI_MODEL);
+  if (!model) {
+    LAST_GEMINI_ROUTER_ERROR = "GEMINI_MODEL missing";
+    return { ok: false, error: LAST_GEMINI_ROUTER_ERROR };
+  }
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/${model}:generateContent?key=${encodeURIComponent(
     ENV.GEMINI_API_KEY
   )}`;
 
-  const prompt = [
-    "You are a routing classifier for a retail sports store phone assistant.",
-    "Return ONLY valid JSON (no markdown, no code fences).",
-    'Schema: {"route":"sales|support|ambiguous","confidence":0.0-1.0,"reason":"short"}',
-    "Rules:",
-    "- sales: product interest, pricing, models, recommendations, buying, availability, promotions.",
-    "- support: issues, defects, warranty, returns, shipping problems, complaints, service/repair.",
-    "- ambiguous: unclear, general, or needs clarification.",
-    "User text:",
-    text,
-  ].join("\n");
-
-  const body = {
-    contents: [
-      {
-        role: "user",
-        parts: [{ text: prompt }],
-      },
-    ],
-    generationConfig: {
-      temperature: 0,
-      maxOutputTokens: 200,
-    },
-  };
-
   const controller = new AbortController();
-  const to = setTimeout(() => controller.abort(), ENV.GEMINI_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
-  let resp;
-  let rawText = "";
   try {
-    resp = await fetch(url, {
+    const payload = {
+      contents: [
+        {
+          role: "user",
+          parts: [{ text: buildGeminiRoutingPrompt(text) }],
+        },
+      ],
+      generationConfig: {
+        temperature: 0.1,
+        maxOutputTokens: 200,
+      },
+    };
+
+    const resp = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
+      body: JSON.stringify(payload),
       signal: controller.signal,
     });
 
-    rawText = await resp.text();
+    const bodyText = await resp.text();
 
     if (!resp.ok) {
-      // Log a short chunk of the body for debugging
-      const chunk = rawText?.slice(0, 600);
-      LAST_GEMINI_ROUTER_ERROR = `Gemini HTTP ${resp.status} ${resp.statusText} | body: ${chunk}`;
-      throw new Error(LAST_GEMINI_ROUTER_ERROR);
+      LAST_GEMINI_ROUTER_ERROR = `Gemini HTTP ${resp.status} ${resp.statusText} | body: ${bodyText}`;
+      return {
+        ok: false,
+        error: LAST_GEMINI_ROUTER_ERROR,
+        model,
+      };
     }
+
+    let json;
+    try {
+      const body = JSON.parse(bodyText);
+      const candidateText =
+        body?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+      json = JSON.parse(String(candidateText).trim());
+    } catch (e) {
+      LAST_GEMINI_ROUTER_ERROR =
+        "Gemini parse failed (non-JSON response from model)";
+      return {
+        ok: false,
+        error: LAST_GEMINI_ROUTER_ERROR,
+        model,
+      };
+    }
+
+    const route = String(json.route || "").trim();
+    const confidence = Number(json.confidence ?? 0);
+    const reason = String(json.reason || "").trim();
+
+    if (!["sales", "support", "ambiguous"].includes(route)) {
+      LAST_GEMINI_ROUTER_ERROR = `Gemini returned invalid route: ${route}`;
+      return { ok: false, error: LAST_GEMINI_ROUTER_ERROR, model };
+    }
+
+    return {
+      ok: true,
+      decision: {
+        route,
+        confidence: Number.isFinite(confidence) ? confidence : 0,
+        reason,
+        by: "gemini",
+        model,
+      },
+    };
   } catch (e) {
-    if (e?.name === "AbortError") {
-      LAST_GEMINI_ROUTER_ERROR = `Gemini timeout after ${ENV.GEMINI_TIMEOUT_MS}ms`;
-      throw new Error(LAST_GEMINI_ROUTER_ERROR);
-    }
-    LAST_GEMINI_ROUTER_ERROR = e?.message || String(e);
-    throw new Error(LAST_GEMINI_ROUTER_ERROR);
+    const msg =
+      e?.name === "AbortError"
+        ? `Gemini timeout after ${timeoutMs}ms`
+        : `Gemini request failed: ${e?.message || String(e)}`;
+    LAST_GEMINI_ROUTER_ERROR = msg;
+    return { ok: false, error: msg, model: normalizeGeminiModelName(ENV.GEMINI_MODEL) };
   } finally {
-    clearTimeout(to);
+    clearTimeout(timer);
   }
-
-  // Parse response: take the first candidate text
-  let textOut = "";
-  try {
-    const j = JSON.parse(rawText);
-    textOut =
-      j?.candidates?.[0]?.content?.parts?.map((p) => p?.text || "").join("") ||
-      j?.candidates?.[0]?.content?.parts?.[0]?.text ||
-      "";
-  } catch (e) {
-    const chunk = rawText?.slice(0, 600);
-    LAST_GEMINI_ROUTER_ERROR = `Gemini response not JSON (outer). body: ${chunk}`;
-    throw new Error(LAST_GEMINI_ROUTER_ERROR);
-  }
-
-  const cleaned = stripCodeFences(textOut);
-  const parsed = safeJsonParse(cleaned);
-  if (!parsed.ok) {
-    LAST_GEMINI_ROUTER_ERROR = `Gemini inner JSON parse failed: ${parsed.error} | text: ${cleaned.slice(
-      0,
-      400
-    )}`;
-    throw new Error(LAST_GEMINI_ROUTER_ERROR);
-  }
-
-  const route = String(parsed.value?.route || "").trim();
-  const confidence = Number(parsed.value?.confidence ?? 0);
-  const okRoute = route === "sales" || route === "support" || route === "ambiguous";
-  if (!okRoute) {
-    LAST_GEMINI_ROUTER_ERROR = `Gemini returned invalid route: ${route}`;
-    throw new Error(LAST_GEMINI_ROUTER_ERROR);
-  }
-
-  return {
-    route,
-    confidence: Number.isFinite(confidence) ? Math.max(0, Math.min(1, confidence)) : 0,
-    reason: String(parsed.value?.reason || "").trim(),
-  };
 }
+
+// Optional helper: ListModels (useful to confirm available models for this key)
+app.get("/models", async (req, res) => {
+  try {
+    if (!ENV.GEMINI_API_KEY) {
+      return res.status(400).json({ ok: false, error: "GEMINI_API_KEY missing" });
+    }
+    const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(
+      ENV.GEMINI_API_KEY
+    )}`;
+
+    const resp = await fetch(url, { method: "GET" });
+    const txt = await resp.text();
+    if (!resp.ok) {
+      return res.status(resp.status).json({
+        ok: false,
+        error: `ListModels failed: ${resp.status} ${resp.statusText}`,
+        body: txt,
+      });
+    }
+    const data = JSON.parse(txt);
+    // return only minimal fields to keep response small
+    const models = (data.models || []).map((m) => ({
+      name: m.name,
+      supportedGenerationMethods: m.supportedGenerationMethods,
+    }));
+    res.json({ ok: true, models });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
+});
 
 // ===================== Endpoints =====================
 app.get("/health", (req, res) => {
@@ -384,11 +389,6 @@ app.get("/config-check", async (req, res) => {
         SALES_SCRIPT: cfg.sales_script.length,
         SUPPORT_SCRIPT: cfg.support_script.length,
       },
-      gemini: {
-        configured: Boolean(ENV.GEMINI_API_KEY),
-        model: ENV.GEMINI_MODEL,
-        timeout_ms: ENV.GEMINI_TIMEOUT_MS,
-      },
     });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
@@ -396,61 +396,74 @@ app.get("/config-check", async (req, res) => {
 });
 
 app.post("/route", async (req, res) => {
-  const debug = String(req.query?.debug || "") === "1";
+  const debug = wantDebug(req);
 
   try {
     const text = String(req.body?.text || "").trim();
     const cfg = await loadConfigFromSheet(false);
 
-    // 1) Sheet keywords first
+    // 1) Sheet keywords (primary)
     const bySheet = routeByKeywords(text, cfg.routing_rules);
     if (bySheet) {
       return res.json({ ok: true, decision: bySheet });
     }
 
-    // 2) Gemini fallback (only if not found in sheet)
-    try {
-      const g = await geminiRoute(text);
+    // 2) Gemini fallback (hybrid)
+    const g = await geminiRoute(text, ENV.GEMINI_TIMEOUT_MS);
+    if (g.ok) {
+      // If Gemini says ambiguous — return with question if exists in sheet (best effort)
+      if (g.decision.route === "ambiguous") {
+        // take the first non-empty question_if_ambiguous from ROUTING_RULES (you can refine later)
+        const q =
+          (cfg.routing_rules || [])
+            .map((r) => String(r.question_if_ambiguous || "").trim())
+            .find(Boolean) || null;
 
-      // If ambiguous, attach question from sheet (best available)
-      const question =
-        g.route === "ambiguous" ? getAmbiguousQuestionFromSheet(cfg.routing_rules) || null : null;
-
-      const decision = {
-        route: g.route,
-        confidence: g.confidence,
-        by: "gemini",
-        question,
-      };
-
-      // keep output minimal, but log reason in debug level
-      log("debug", "Gemini decision", { decision, reason: g.reason });
-
-      return res.json({ ok: true, decision });
-    } catch (ge) {
-      // IMPORTANT: log the actual Gemini error so Render shows it
-      log("error", "Gemini router failed", LAST_GEMINI_ROUTER_ERROR || ge?.message || String(ge));
-
-      const resp = {
-        ok: true,
-        decision: {
-          route: "unknown",
-          confidence: 0,
-          by: "gemini_failed",
-        },
-      };
-
-      // Only if debug=1, include error detail (does not change normal contract)
-      if (debug) {
-        resp.debug = {
-          gemini_error: LAST_GEMINI_ROUTER_ERROR || ge?.message || String(ge),
-          gemini_model: ENV.GEMINI_MODEL,
-          timeout_ms: ENV.GEMINI_TIMEOUT_MS,
-        };
+        return res.json({
+          ok: true,
+          decision: {
+            route: "ambiguous",
+            confidence: g.decision.confidence,
+            by: "gemini",
+            question: q,
+          },
+          ...(debug
+            ? { debug: { gemini_model: g.decision.model, gemini_reason: g.decision.reason } }
+            : {}),
+        });
       }
 
-      return res.json(resp);
+      return res.json({
+        ok: true,
+        decision: {
+          route: g.decision.route,
+          confidence: g.decision.confidence,
+          by: "gemini",
+        },
+        ...(debug
+          ? { debug: { gemini_model: g.decision.model, gemini_reason: g.decision.reason } }
+          : {}),
+      });
     }
+
+    // Gemini failed
+    return res.json({
+      ok: true,
+      decision: {
+        route: "unknown",
+        confidence: 0,
+        by: "gemini_failed",
+      },
+      ...(debug
+        ? {
+            debug: {
+              gemini_error: g.error || LAST_GEMINI_ROUTER_ERROR,
+              gemini_model: g.model || normalizeGeminiModelName(ENV.GEMINI_MODEL),
+              timeout_ms: ENV.GEMINI_TIMEOUT_MS,
+            },
+          }
+        : {}),
+    });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
@@ -458,7 +471,5 @@ app.post("/route", async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`[BOOT] listening on ${PORT}`);
-  console.log(
-    `[BOOT] gemini model=${ENV.GEMINI_MODEL} api_key=${ENV.GEMINI_API_KEY ? "set" : "missing"}`
-  );
+  console.log(`[BOOT] GEMINI_MODEL=${normalizeGeminiModelName(ENV.GEMINI_MODEL)}`);
 });
