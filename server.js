@@ -6,11 +6,10 @@
 // - /route  (keywords first, Gemini fallback)
 //
 // Google Sheets access via Service Account (JWT)
-// Node 18+ (Render uses Node 22.x)
+// Node 18+ (Render uses Node 22.x) – uses GLOBAL fetch
 
 import express from "express";
 import { google } from "googleapis";
-import fetch from "node-fetch";
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
@@ -131,12 +130,6 @@ async function loadConfigFromSheet(force = false) {
   const cfg = {
     settings,
     routing_rules: results.ROUTING_RULES || [],
-    overview: {
-      BUSINESS_NAME: settings.BUSINESS_NAME || "",
-      DEFAULT_LANGUAGE: settings.DEFAULT_LANGUAGE || "he",
-      SUPPORTED_LANGUAGES: settings.SUPPORTED_LANGUAGES || "he",
-      SITE_BASE_URL: settings.SITE_BASE_URL || "",
-    },
   };
 
   CACHE = { loaded_at: Date.now(), data: cfg };
@@ -177,8 +170,6 @@ function routeByKeywords(text, rules) {
 
 // ===================== Router: Gemini Fallback =====================
 async function routeByGemini(text) {
-  if (!ENV.GEMINI_API_KEY) throw new Error("GEMINI_API_KEY missing");
-
   const body = {
     contents: [
       {
@@ -187,9 +178,7 @@ async function routeByGemini(text) {
           {
             text: `
 Classify the intent into one of:
-- sales
-- support
-- ambiguous
+sales, support, ambiguous
 
 Return JSON ONLY:
 { "route": "...", "confidence": 0-1 }
@@ -241,10 +230,7 @@ app.get("/config-check", async (req, res) => {
       ok: true,
       from_cache: cfg.from_cache,
       loaded_at: cfg.loaded_at,
-      overview: cfg.overview,
-      counts: {
-        ROUTING_RULES: cfg.routing_rules.length,
-      },
+      routing_rules: cfg.routing_rules.length,
     });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
