@@ -5,6 +5,7 @@
 // - /config-check
 // - /route   (keywords first, Gemini fallback)
 // - /kb      (crawl + cache website pages)
+// - /kb/refresh (alias to /kb)
 // - /dialog  (session-based dialogue using SALES/SUPPORT scripts + Make events)
 //
 // Google Sheets access via Service Account (JWT) – NO GVIZ
@@ -284,20 +285,15 @@ function routeByKeywords(text, rules) {
 }
 
 // ===================== Gemini Fallback Router =====================
-// Uses Google Generative Language API (v1beta) generateContent
-// We force a JSON output. Still handle markdown fences / non-json safely.
 function extractFirstJsonObject(s) {
   const text = String(s || "").trim();
   if (!text) return null;
 
-  // remove ```json fences
   const unfenced = text.replace(/```json|```/gi, "").trim();
 
-  // direct parse
   const direct = safeJsonParse(unfenced);
   if (direct.ok) return direct.value;
 
-  // try find first {...}
   const start = unfenced.indexOf("{");
   const end = unfenced.lastIndexOf("}");
   if (start !== -1 && end !== -1 && end > start) {
@@ -317,8 +313,10 @@ async function geminiRoute(text, allowedRoutes = ["sales", "support"]) {
   }
 
   const model = ENV.GEMINI_MODEL; // e.g. models/gemini-2.0-flash-exp
+
+  // ✅ FIX: do NOT encodeURIComponent(model) inside the PATH (it breaks models/...)
   const url =
-    `https://generativelanguage.googleapis.com/v1beta/${encodeURIComponent(model)}:generateContent?key=` +
+    `https://generativelanguage.googleapis.com/v1beta/${model}:generateContent?key=` +
     encodeURIComponent(ENV.GEMINI_API_KEY);
 
   const system = [
@@ -343,10 +341,9 @@ async function geminiRoute(text, allowedRoutes = ["sales", "support"]) {
     },
   };
 
-  let res;
   let rawBody = "";
   try {
-    res = await fetchWithTimeout(
+    const res = await fetchWithTimeout(
       url,
       {
         method: "POST",
@@ -399,18 +396,15 @@ async function geminiRoute(text, allowedRoutes = ["sales", "support"]) {
 let KB_CACHE = {
   loaded_at: 0,
   base_url: "",
-  pages: [], // [{url, text}]
+  pages: [],
   chars: 0,
   last_error: "",
 };
 
 function stripHtml(html) {
   const s = String(html || "");
-  // remove scripts/styles
   const noScripts = s.replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<style[\s\S]*?<\/style>/gi, " ");
-  // remove tags
   const noTags = noScripts.replace(/<\/?[^>]+>/g, " ");
-  // decode basic entities
   const decoded = noTags
     .replace(/&nbsp;/g, " ")
     .replace(/&amp;/g, "&")
@@ -424,10 +418,8 @@ function stripHtml(html) {
 function normalizeUrl(base, href) {
   try {
     const u = new URL(href, base);
-    // keep same origin only
     const b = new URL(base);
     if (u.origin !== b.origin) return null;
-    // drop hash
     u.hash = "";
     return u.toString();
   } catch {
@@ -544,7 +536,6 @@ function kbSearch(query, topK = 3) {
 
 // ===================== Make Events =====================
 function getMakeUrl(cfg, keyName) {
-  // ENV override wins; else from SETTINGS
   if (keyName === "MAKE_SEND_WA_URL" && ENV.MAKE_SEND_WA_URL) return ENV.MAKE_SEND_WA_URL;
   if (keyName === "MAKE_LEAD_URL" && ENV.MAKE_LEAD_URL) return ENV.MAKE_LEAD_URL;
   if (keyName === "MAKE_SUPPORT_URL" && ENV.MAKE_SUPPORT_URL) return ENV.MAKE_SUPPORT_URL;
@@ -574,7 +565,7 @@ async function sendMakeEvent(url, payload) {
 }
 
 // ===================== Session Store (in-memory) =====================
-const SESSIONS = new Map(); // session_id -> {route, step, lang, ...}
+const SESSIONS = new Map();
 const SESSION_TTL_MS = 30 * 60 * 1000;
 
 function gcSessions() {
@@ -598,7 +589,6 @@ function getScriptRows(cfg, route) {
 function getOpeningText(cfg, lang) {
   const t = String(cfg?.settings?.OPENING_TEXT || "").trim();
   if (t) return t;
-  // fallback generic
   const bn = cfg?.overview?.BUSINESS_NAME || "גיל ספורט";
   return `שָׁלוֹם, הִגַּעְתֶּם לְ־${bn}. אֵיךְ אֶפְשָׁר לַעֲזוֹר?`;
 }
@@ -610,9 +600,6 @@ function getClosingText(cfg) {
 }
 
 function findBlockByStep(rows, step) {
-  // Supports either:
-  // - column "step" numeric
-  // - or block_id order in sheet (row index)
   if (!rows.length) return null;
 
   const withStep = rows.filter((r) => String(r.step || "").trim() !== "");
@@ -621,7 +608,6 @@ function findBlockByStep(rows, step) {
     return target || null;
   }
 
-  // fallback: row index mapping (step 0 => row0)
   const idx = Math.max(0, Number(step));
   return rows[idx] || null;
 }
@@ -659,7 +645,6 @@ app.post("/route", async (req, res) => {
     const bySheet = routeByKeywords(text, cfg.routing_rules);
     if (bySheet) return res.json({ ok: true, decision: bySheet });
 
-    // Gemini fallback (hybrid)
     const gem = await geminiRoute(text, ["sales", "support"]);
     if (gem.ok && gem.confidence >= ENV.GEMINI_MIN_CONF) {
       return res.json({
@@ -691,6 +676,17 @@ app.post("/kb", async (req, res) => {
     const force = Boolean(req.body?.force);
     const cfg = await loadConfigFromSheet(false);
     const out = await crawlWebsite(force, cfg);
+    res.json(out);
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ✅ Alias to match your test: POST /kb/refresh
+app.post("/kb/refresh", async (req, res) => {
+  try {
+    const cfg = await loadConfigFromSheet(false);
+    const out = await crawlWebsite(true, cfg);
     res.json(out);
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
@@ -730,7 +726,6 @@ app.post("/dialog", async (req, res) => {
     session.updated_at = Date.now();
     if (userText) session.last_user_text = userText;
 
-    // If empty input: return opening
     if (!userText && session.step === 0) {
       const opening = getOpeningText(cfg, lang);
       session.step = 1;
@@ -747,7 +742,6 @@ app.post("/dialog", async (req, res) => {
       });
     }
 
-    // Determine route if unknown
     let decision = null;
     if (session.route === "unknown") {
       const bySheet = routeByKeywords(userText, cfg.routing_rules);
@@ -766,7 +760,6 @@ app.post("/dialog", async (req, res) => {
       session.route_confidence = decision.confidence;
       session.route_by = decision.by;
 
-      // Fire Make event (non-blocking-ish)
       const payloadBase = {
         ts: nowIso(),
         session_id: sid,
@@ -787,9 +780,7 @@ app.post("/dialog", async (req, res) => {
       }
     }
 
-    // If still unknown: try website KB answer
     if (session.route === "unknown") {
-      // ensure KB is crawled (cached)
       await crawlWebsite(false, cfg);
       const hits = kbSearch(userText, 2);
 
@@ -801,7 +792,6 @@ app.post("/dialog", async (req, res) => {
           `${snippet}\n` +
           `רוצים שֶׁאֲנִי אֲדַיֵּק אֶת הַשְּׁאֵלָה אוֹ שֶׁאֲשַׁלַּח לָכֶם קִישּׁוּר בְּוָאטְסְאַפּ?`;
 
-        // optional Make send WA suggestion event (not sending yet)
         return res.json({
           ok: true,
           session_id: sid,
@@ -816,7 +806,6 @@ app.post("/dialog", async (req, res) => {
         });
       }
 
-      // no KB hit -> generic ask
       return res.json({
         ok: true,
         session_id: sid,
@@ -831,7 +820,6 @@ app.post("/dialog", async (req, res) => {
       });
     }
 
-    // Route known: run script (sales/support)
     const rows = getScriptRows(cfg, session.route);
     if (!rows.length) {
       return res.json({
@@ -848,16 +836,12 @@ app.post("/dialog", async (req, res) => {
       });
     }
 
-    // step handling:
-    // step=0 reserved, step>=1 script steps
     const step = Math.max(0, Number(session.step || 0));
-    const block = findBlockByStep(rows, step - 1); // step1 -> row0
+    const block = findBlockByStep(rows, step - 1);
     const blockId = String(block?.block_id || block?.id || "").trim() || `STEP_${step}`;
 
-    // pick text
     let sayText = pickTextByLang(block || {}, lang, cfg.overview.DEFAULT_LANGUAGE || "he");
 
-    // If block text empty, fallback
     if (!sayText) {
       sayText =
         session.route === "sales"
@@ -865,11 +849,9 @@ app.post("/dialog", async (req, res) => {
           : "בְּהֶמְשֶׁךְ לָזֶה, אֵיזוֹ תַּקָּלָה יֵשׁ לָכֶם?";
     }
 
-    // next step
     session.step = step + 1;
 
-    // simple end condition (if script ended)
-    const isEnd = (step - 1) >= rows.length - 1;
+    const isEnd = step - 1 >= rows.length - 1;
     if (isEnd) {
       sayText = `${sayText}\n${getClosingText(cfg)}`;
     }
