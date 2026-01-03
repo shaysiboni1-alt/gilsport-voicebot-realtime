@@ -38,7 +38,25 @@ const SYSTEM_PROMPT =
 
 // ===== HTTP app =====
 const app = express();
+
+// Root
 app.get("/", (req, res) => res.status(200).send("OK"));
+
+// Render health check hits /health (per your log)
+app.get("/health", (req, res) => res.status(200).send("OK"));
+
+// Quick visibility into env/config (no secrets)
+app.get("/config-check", (req, res) => {
+  res.status(200).json({
+    ok: true,
+    port: PORT,
+    hasGeminiKey: Boolean(GEMINI_API_KEY),
+    geminiModel: GEMINI_MODEL,
+    hasOpeningText: Boolean(OPENING_TEXT),
+    hasSystemPrompt: Boolean(SYSTEM_PROMPT),
+  });
+});
+
 const server = http.createServer(app);
 
 // ===== WS server for Twilio =====
