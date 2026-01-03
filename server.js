@@ -7,11 +7,14 @@
 // - /kb      (crawl + cache website pages)
 // - /kb/refresh (alias to /kb)
 // - /dialog  (session-based dialogue using SALES/SUPPORT scripts + Make events)
+// - /twilio-media-stream (WebSocket endpoint for Twilio Media Streams)
 //
 // Google Sheets access via Service Account (JWT) – NO GVIZ
 // Node 18+ (Render uses Node 22.x)
 
 import express from "express";
+import http from "http";
+import { WebSocketServer } from "ws";
 import { google } from "googleapis";
 
 const app = express();
@@ -42,6 +45,9 @@ const ENV = {
   KB_MAX_PAGES: Number(process.env.KB_MAX_PAGES || 12),
   KB_MAX_CHARS_PER_PAGE: Number(process.env.KB_MAX_CHARS_PER_PAGE || 6000),
   KB_CACHE_TTL_SEC: Number(process.env.KB_CACHE_TTL_SEC || 900),
+
+  // WS / Twilio Media Stream logging
+  TWILIO_STREAM_LOG_EVERY_N_MEDIA: Number(process.env.TWILIO_STREAM_LOG_EVERY_N_MEDIA || 50),
 
   LOG_LEVEL: (process.env.LOG_LEVEL || "info").toLowerCase(),
 };
@@ -403,7 +409,9 @@ let KB_CACHE = {
 
 function stripHtml(html) {
   const s = String(html || "");
-  const noScripts = s.replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<style[\s\S]*?<\/style>/gi, " ");
+  const noScripts = s
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ");
   const noTags = noScripts.replace(/<\/?[^>]+>/g, " ");
   const decoded = noTags
     .replace(/&nbsp;/g, " ")
@@ -693,6 +701,11 @@ app.post("/kb/refresh", async (req, res) => {
   }
 });
 
+// Helpful message if you open it in browser (HTTP), while Twilio uses WSS upgrade
+app.get("/twilio-media-stream", (req, res) => {
+  res.status(426).send("Use WebSocket (wss) to connect to /twilio-media-stream");
+});
+
 // Dialog engine (session-based)
 app.post("/dialog", async (req, res) => {
   try {
@@ -828,7 +841,8 @@ app.post("/dialog", async (req, res) => {
         route: session.route,
         step: session.step,
         language: lang,
-        bot_say: "יֵשׁ לִי נִיתּוּב, אֲבָל אֵין עֲדַיִן תַּסְרִיט בַּשִּׁיטְס. רוֹצִים שֶׁאֲעָבִיר אֶתְכֶם לְנָצִיג?",
+        bot_say:
+          "יֵשׁ לִי נִיתּוּב, אֲבָל אֵין עֲדַיִן תַּסְרִיט בַּשִּׁיטְס. רוֹצִים שֶׁאֲעָבִיר אֶתְכֶם לְנָצִיג?",
         expect: "user_text",
         event: null,
         block_id: "NO_SCRIPT",
@@ -873,6 +887,96 @@ app.post("/dialog", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
+// ===================== Twilio Media Streams WebSocket =====================
+// Twilio connects via: wss://<host>/twilio-media-stream
+// We accept, log start/stop, and count media packets (so you SEE logs in Render).
+const server = http.createServer(app);
+const wss = new WebSocketServer({ noServer: true });
+
+server.on("upgrade", (req, socket, head) => {
+  const url = req.url || "";
+  if (url.startsWith("/twilio-media-stream")) {
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      wss.emit("connection", ws, req);
+    });
+    return;
+  }
+  socket.destroy();
+});
+
+wss.on("connection", (ws, req) => {
+  const peer = req?.socket?.remoteAddress || "unknown";
+  const path = req?.url || "";
+  const connId = `tw_${Math.random().toString(36).slice(2, 8)}${Date.now().toString(36).slice(-4)}`;
+
+  let streamSid = "";
+  let callSid = "";
+  let mediaCount = 0;
+
+  log("info", `[WS][${connId}] connected`, { peer, path });
+
+  const pingTimer = setInterval(() => {
+    try {
+      if (ws.readyState === ws.OPEN) ws.ping();
+    } catch {}
+  }, 25000);
+
+  ws.on("message", (buf) => {
+    const txt = Buffer.isBuffer(buf) ? buf.toString("utf8") : String(buf || "");
+    const parsed = safeJsonParse(txt);
+    if (!parsed.ok) {
+      log("warn", `[WS][${connId}] non-json message`, txt.slice(0, 200));
+      return;
+    }
+
+    const msg = parsed.value || {};
+    const ev = String(msg.event || "").toLowerCase();
+
+    if (ev === "start") {
+      streamSid = msg?.start?.streamSid || "";
+      callSid = msg?.start?.callSid || "";
+      const custom = msg?.start?.customParameters || {};
+      log("info", `[WS][${connId}] start`, { streamSid, callSid, customParameters: custom });
+      return;
+    }
+
+    if (ev === "media") {
+      mediaCount += 1;
+      if (mediaCount === 1 || mediaCount % ENV.TWILIO_STREAM_LOG_EVERY_N_MEDIA === 0) {
+        log("debug", `[WS][${connId}] media`, {
+          streamSid,
+          callSid,
+          mediaCount,
+          track: msg?.media?.track,
+          chunkBytesB64: (msg?.media?.payload || "").length,
+        });
+      }
+      return;
+    }
+
+    if (ev === "stop") {
+      log("info", `[WS][${connId}] stop`, { streamSid, callSid, mediaCount, stop: msg?.stop || {} });
+      try {
+        ws.close();
+      } catch {}
+      return;
+    }
+
+    // Other events
+    log("debug", `[WS][${connId}] event`, { ev, keys: Object.keys(msg || {}) });
+  });
+
+  ws.on("close", () => {
+    clearInterval(pingTimer);
+    log("info", `[WS][${connId}] closed`, { streamSid, callSid, mediaCount });
+  });
+
+  ws.on("error", (err) => {
+    log("error", `[WS][${connId}] error`, err?.message || String(err));
+  });
+});
+
+// ===================== Boot =====================
+server.listen(PORT, () => {
   console.log(`[BOOT] listening on ${PORT}`);
 });
