@@ -1,358 +1,381 @@
-import express from "express";
-import http from "http";
-import { WebSocketServer } from "ws";
-import { google } from "googleapis";
+// server.js
+// Twilio Media Streams <-> Gemini Live (Realtime) bridge
+// - In: Twilio sends 8kHz mu-law frames
+// - Convert to PCM16 8kHz -> resample to PCM16 16kHz -> send to Gemini realtimeInput.audio
+// - Out: Gemini returns PCM16 (often 24kHz) -> resample to PCM16 8kHz -> mu-law -> send to Twilio "media"
 
-const app = express();
-app.use(express.json({ limit: "2mb" }));
+"use strict";
+
+const express = require("express");
+const http = require("http");
+const WebSocket = require("ws");
+const { GoogleGenAI } = require("@google/genai");
 
 const PORT = process.env.PORT || 10000;
 
-// ===================== ENV =====================
-const ENV = {
-  GOOGLE_SERVICE_ACCOUNT_JSON: process.env.GOOGLE_SERVICE_ACCOUNT_JSON || "",
-  GSHEET_ID: process.env.GSHEET_ID || "",
-  GSHEET_CACHE_TTL_SEC: Number(process.env.GSHEET_CACHE_TTL_SEC || 60),
-  TIME_ZONE: process.env.TIME_ZONE || "Asia/Jerusalem",
+// ===== ENV =====
+const GEMINI_API_KEY =
+  process.env.GEMINI_API_KEY ||
+  process.env.GOOGLE_API_KEY ||
+  process.env.GOOGLE_GENAI_API_KEY ||
+  "";
 
-  GEMINI_API_KEY: process.env.GEMINI_API_KEY || "",
-  GEMINI_MODEL: process.env.GEMINI_MODEL || "models/gemini-2.0-flash-exp",
-  GEMINI_TIMEOUT_MS: Number(process.env.GEMINI_TIMEOUT_MS || 9000),
-  GEMINI_MIN_CONF: Number(process.env.GEMINI_MIN_CONF || 0.65),
+const GEMINI_MODEL =
+  process.env.GEMINI_MODEL || "gemini-2.0-flash-live-001"; // change if you use another live model
 
-  MAKE_SEND_WA_URL: process.env.MAKE_SEND_WA_URL || "",
-  MAKE_LEAD_URL: process.env.MAKE_LEAD_URL || "",
-  MAKE_SUPPORT_URL: process.env.MAKE_SUPPORT_URL || "",
-  MAKE_ABANDONED_URL: process.env.MAKE_ABANDONED_URL || "",
+const OPENING_TEXT =
+  process.env.OPENING_TEXT ||
+  "שָׁלוֹם, הִגַּעְתֶּם לְ־גִּיל סְפּוֹרְט. מְדַבֶּרֶת נֶטַע. אֵיךְ אֶפְשָׁר לַעֲזוֹר לָכֶם?";
 
-  KB_MAX_PAGES: Number(process.env.KB_MAX_PAGES || 12),
-  KB_MAX_CHARS_PER_PAGE: Number(process.env.KB_MAX_CHARS_PER_PAGE || 6000),
-  KB_CACHE_TTL_SEC: Number(process.env.KB_CACHE_TTL_SEC || 900),
+const SYSTEM_PROMPT =
+  process.env.SYSTEM_PROMPT ||
+  [
+    "You are 'Netta', a realtime voice agent for GilSport.",
+    "You can speak Hebrew, English, Russian, and Arabic. Mirror the caller language naturally.",
+    "Be short, fast, helpful. Ask one question at a time.",
+    "If user asks to switch language, switch immediately.",
+  ].join("\n");
 
-  TWILIO_STREAM_LOG_EVERY_N_MEDIA: Number(process.env.TWILIO_STREAM_LOG_EVERY_N_MEDIA || 50),
+// ===== HTTP app =====
+const app = express();
+app.get("/", (req, res) => res.status(200).send("OK"));
+const server = http.createServer(app);
 
-  // ✅ Test tone settings
-  TEST_TONE_ON_START: String(process.env.TEST_TONE_ON_START || "true").toLowerCase() === "true",
-  TEST_TONE_FREQ_HZ: Number(process.env.TEST_TONE_FREQ_HZ || 440),
-  TEST_TONE_MS: Number(process.env.TEST_TONE_MS || 650),
+// ===== WS server for Twilio =====
+const wss = new WebSocket.Server({ server, path: "/twilio-media-stream" });
 
-  LOG_LEVEL: (process.env.LOG_LEVEL || "info").toLowerCase(),
-};
-
-let LAST_GEMINI_ERROR = "";
-let LAST_KB_ERROR = "";
-
-// ===================== Logging =====================
-function log(level, ...args) {
-  const levels = ["debug", "info", "warn", "error"];
-  const cur = levels.indexOf(ENV.LOG_LEVEL);
-  const idx = levels.indexOf(level);
-  if (idx === -1) return;
-  if (cur === -1 || idx >= cur) console.log(`[${level.toUpperCase()}]`, ...args);
+function logInfo(...args) {
+  console.log("[INFO]", ...args);
+}
+function logWarn(...args) {
+  console.warn("[WARN]", ...args);
+}
+function logErr(...args) {
+  console.error("[ERR]", ...args);
 }
 
-// ===================== Utils =====================
-function safeJsonParse(maybeJson) {
-  try {
-    if (!maybeJson) return { ok: false, error: "empty" };
-    return { ok: true, value: JSON.parse(maybeJson) };
-  } catch (e) {
-    return { ok: false, error: e?.message || String(e) };
+// ---------- Audio helpers (mu-law, resample) ----------
+
+// mu-law decode/encode (G.711 mu-law)
+const MULAW_MAX = 0x1fff;
+const BIAS = 33;
+
+function mulawToLinearSample(muLawByte) {
+  let u = (~muLawByte) & 0xff;
+  let sign = u & 0x80;
+  let exponent = (u >> 4) & 0x07;
+  let mantissa = u & 0x0f;
+  let sample = ((mantissa << 1) + 1) << (exponent + 2);
+  sample -= BIAS;
+  return sign ? -sample : sample;
+}
+
+function linearToMulawSample(sample) {
+  // clamp
+  let s = sample;
+  if (s > 32767) s = 32767;
+  if (s < -32768) s = -32768;
+
+  let sign = 0;
+  if (s < 0) {
+    sign = 0x80;
+    s = -s;
   }
+
+  // add bias
+  s = s + BIAS;
+  if (s > MULAW_MAX) s = MULAW_MAX;
+
+  // find exponent
+  let exponent = 7;
+  for (let exp = 0; exp < 8; exp++) {
+    if (s <= (0x1f << (exp + 3))) {
+      exponent = exp;
+      break;
+    }
+  }
+
+  let mantissa = (s >> (exponent + 3)) & 0x0f;
+  let mu = ~(sign | (exponent << 4) | mantissa) & 0xff;
+  return mu;
 }
-function nowIso() {
-  return new Date().toISOString();
-}
-function normalizeText(s) {
-  return String(s || "").toLowerCase().replace(/\s+/g, " ").trim();
-}
-function splitKeywords(cell) {
-  return String(cell || "")
-    .split(/[,|\n]/g)
-    .map((x) => x.trim())
-    .filter(Boolean);
-}
-function normalizeRowKeys(row) {
-  const out = {};
-  for (const [k, v] of Object.entries(row || {})) {
-    const nk = String(k || "").trim().toLowerCase().replace(/\s+/g, "_");
-    out[nk] = v ?? "";
+
+function mulawBytesToPcm16Buffer(muLawBuf) {
+  const out = Buffer.alloc(muLawBuf.length * 2);
+  for (let i = 0; i < muLawBuf.length; i++) {
+    const sample = mulawToLinearSample(muLawBuf[i]);
+    out.writeInt16LE(sample, i * 2);
   }
   return out;
 }
-function pickTextByLang(row, lang, fallbackLang = "he") {
-  const r = normalizeRowKeys(row);
-  const candidates = [r[lang], r[`text_${lang}`], r.text, r.value, r[fallbackLang], r[`text_${fallbackLang}`]].filter(
-    (x) => String(x || "").trim()
-  );
-  return String(candidates[0] || "").trim();
-}
-function detectLanguage(text, supportedCsv = "he,en,ru,ar") {
-  const t = String(text || "");
-  const supported = supportedCsv.split(",").map((x) => x.trim()).filter(Boolean);
-  const hasArabic = /[\u0600-\u06FF]/.test(t);
-  const hasCyr = /[\u0400-\u04FF]/.test(t);
-  const hasHeb = /[\u0590-\u05FF]/.test(t);
-  if (hasArabic && supported.includes("ar")) return "ar";
-  if (hasCyr && supported.includes("ru")) return "ru";
-  if (hasHeb && supported.includes("he")) return "he";
-  if (supported.includes("en")) return "en";
-  return supported[0] || "he";
-}
-async function fetchWithTimeout(url, options = {}, timeoutMs = 8000) {
-  const ctrl = new AbortController();
-  const id = setTimeout(() => ctrl.abort(), Math.max(1, timeoutMs));
-  try {
-    const res = await fetch(url, { ...options, signal: ctrl.signal });
-    return res;
-  } finally {
-    clearTimeout(id);
+
+function pcm16BufferToMulawBytes(pcmBuf) {
+  const samples = pcmBuf.length / 2;
+  const out = Buffer.alloc(samples);
+  for (let i = 0; i < samples; i++) {
+    const sample = pcmBuf.readInt16LE(i * 2);
+    out[i] = linearToMulawSample(sample);
   }
+  return out;
 }
 
-// ===================== Google Sheets (Service Account) =====================
-function getServiceAccountAuth() {
-  const raw = ENV.GOOGLE_SERVICE_ACCOUNT_JSON;
-  if (!raw) throw new Error("GOOGLE_SERVICE_ACCOUNT_JSON missing");
+// Simple linear resampler for PCM16LE mono
+function resamplePcm16Linear(pcmBuf, inRate, outRate) {
+  if (inRate === outRate) return pcmBuf;
 
-  let creds;
-  const parsed = safeJsonParse(raw);
-  if (parsed.ok) creds = parsed.value;
-  else creds = JSON.parse(Buffer.from(raw, "base64").toString("utf8"));
+  const inSamples = pcmBuf.length / 2;
+  const inArr = new Int16Array(inSamples);
+  for (let i = 0; i < inSamples; i++) inArr[i] = pcmBuf.readInt16LE(i * 2);
 
-  if (!creds?.client_email || !creds?.private_key) {
-    throw new Error("Service account JSON missing client_email/private_key");
+  const ratio = outRate / inRate;
+  const outSamples = Math.max(1, Math.floor(inSamples * ratio));
+  const outBuf = Buffer.alloc(outSamples * 2);
+
+  for (let i = 0; i < outSamples; i++) {
+    const srcPos = i / ratio;
+    const i0 = Math.floor(srcPos);
+    const i1 = Math.min(i0 + 1, inSamples - 1);
+    const t = srcPos - i0;
+
+    const s0 = inArr[i0];
+    const s1 = inArr[i1];
+    const v = Math.round(s0 + (s1 - s0) * t);
+
+    outBuf.writeInt16LE(v, i * 2);
   }
-
-  return new google.auth.JWT({
-    email: creds.client_email,
-    key: creds.private_key,
-    scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
-  });
+  return outBuf;
 }
 
-async function fetchSheetTab(auth, sheetId, tabName) {
-  const sheets = google.sheets({ version: "v4", auth });
-  const res = await sheets.spreadsheets.values.get({ spreadsheetId: sheetId, range: tabName });
-  const rows = res.data.values || [];
-  if (!rows.length) return [];
-  const headers = rows[0].map((h) => String(h || "").trim());
-  return rows.slice(1).map((r) => {
-    const obj = {};
-    headers.forEach((h, i) => (obj[h] = r[i] ?? ""));
-    return obj;
-  });
+// Split buffer into chunks
+function chunkBuffer(buf, chunkBytes) {
+  const chunks = [];
+  for (let i = 0; i < buf.length; i += chunkBytes) {
+    chunks.push(buf.subarray(i, Math.min(i + chunkBytes, buf.length)));
+  }
+  return chunks;
 }
 
-// ===================== Config Loader + Cache =====================
-let CONFIG_CACHE = { loaded_at: 0, data: null };
+// Twilio expects 20ms frames: 8kHz => 160 samples => 160 mu-law bytes
+const TWILIO_FRAME_MS = 20;
+const TWILIO_RATE = 8000;
+const TWILIO_FRAME_BYTES = Math.floor((TWILIO_RATE * TWILIO_FRAME_MS) / 1000); // 160 bytes
 
-async function loadConfigFromSheet(force = false) {
-  const ttlMs = Math.max(1, ENV.GSHEET_CACHE_TTL_SEC) * 1000;
-  const fresh = Date.now() - CONFIG_CACHE.loaded_at < ttlMs;
+// Gemini input target
+const GEMINI_IN_RATE = 16000;
 
-  if (!force && CONFIG_CACHE.data && fresh) {
-    return { ok: true, from_cache: true, loaded_at: new Date(CONFIG_CACHE.loaded_at).toISOString(), ...CONFIG_CACHE.data };
-  }
+// We'll assume Gemini outputs 24000 PCM unless detected otherwise
+const GEMINI_OUT_RATE_DEFAULT = 24000;
 
-  if (!ENV.GSHEET_ID) throw new Error("GSHEET_ID missing");
+// ---------- Gemini Live session wrapper ----------
 
-  const auth = getServiceAccountAuth();
-  await auth.authorize();
+async function createGeminiLiveSession() {
+  if (!GEMINI_API_KEY) throw new Error("Missing GEMINI_API_KEY / GOOGLE_API_KEY");
 
-  const tabs = ["SETTINGS", "BUSINESS_INFO", "ROUTING_RULES", "SALES_SCRIPT", "SUPPORT_SCRIPT", "SUPPLIERS", "MAKE_PAYLOADS_SPEC", "PROMPTS"];
-  const results = {};
-  for (const tab of tabs) results[tab] = await fetchSheetTab(auth, ENV.GSHEET_ID, tab);
+  const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 
-  const settings = {};
-  for (const row of results.SETTINGS || []) {
-    const r = normalizeRowKeys(row);
-    const k = String(r.key || "").trim();
-    if (k) settings[k] = String(r.value ?? "").trim();
-  }
-
-  const cfg = {
-    settings,
-    business_info: results.BUSINESS_INFO || [],
-    routing_rules: (results.ROUTING_RULES || []).map(normalizeRowKeys),
-    sales_script: (results.SALES_SCRIPT || []).map(normalizeRowKeys),
-    support_script: (results.SUPPORT_SCRIPT || []).map(normalizeRowKeys),
-    suppliers: (results.SUPPLIERS || []).map(normalizeRowKeys),
-    make_payloads_spec: (results.MAKE_PAYLOADS_SPEC || []).map(normalizeRowKeys),
-    prompts: (results.PROMPTS || []).map(normalizeRowKeys),
-    overview: {
-      BUSINESS_NAME: settings.BUSINESS_NAME || "",
-      DEFAULT_LANGUAGE: settings.DEFAULT_LANGUAGE || "he",
-      SUPPORTED_LANGUAGES: settings.SUPPORTED_LANGUAGES || "he,en,ru,ar",
-      SITE_BASE_URL: settings.SITE_BASE_URL || "",
-      MAIN_PHONE: settings.MAIN_PHONE || "",
-      BRANCHES: settings.BRANCHES || "",
+  const config = {
+    systemInstruction: SYSTEM_PROMPT,
+    generationConfig: {
+      responseModalities: ["AUDIO"], // we want audio back
+      // You can tune later: temperature, etc.
     },
   };
 
-  CONFIG_CACHE = { loaded_at: Date.now(), data: cfg };
-  return { ok: true, from_cache: false, loaded_at: nowIso(), ...cfg };
+  // connect returns a session with sendRealtimeInput() and receive() async iterator
+  const session = await ai.live.connect({
+    model: GEMINI_MODEL,
+    config,
+  });
+
+  return session;
 }
 
-// ===================== Minimal endpoints =====================
-app.get("/health", (req, res) => res.json({ ok: true, time: nowIso() }));
+// ---------- Main WS handling ----------
 
-app.get("/twilio-media-stream", (req, res) => {
-  res.status(426).send("Use WebSocket (wss) to connect to /twilio-media-stream");
-});
+wss.on("connection", async (ws, req) => {
+  const connId = `tw_${Math.random().toString(36).slice(2, 12)}`;
+  logInfo(`[WS][${connId}] connected`, { peer: req.socket.remoteAddress, path: req.url });
 
-// ===================== Twilio Media Streams WebSocket =====================
+  let streamSid = null;
+  let callSid = null;
 
-// ---- µ-law encoder for 8kHz tone (Twilio expects PCMU by default) ----
-function linearToMuLawSample(sample) {
-  const MU_LAW_MAX = 0x1fff;
-  const BIAS = 0x84;
+  let geminiSession = null;
+  let geminiReceiverTask = null;
 
-  let sign = (sample >> 8) & 0x80;
-  if (sign !== 0) sample = -sample;
-  if (sample > MU_LAW_MAX) sample = MU_LAW_MAX;
+  // playback queue of mu-law frames to send to Twilio paced
+  let playQueue = [];
+  let playTimer = null;
+  let interrupted = false;
 
-  sample += BIAS;
+  function startPlaybackPump() {
+    if (playTimer) return;
+    playTimer = setInterval(() => {
+      if (ws.readyState !== WebSocket.OPEN) return;
+      if (playQueue.length === 0) return;
 
-  let exponent = 7;
-  for (let expMask = 0x4000; (sample & expMask) === 0 && exponent > 0; exponent--, expMask >>= 1) {}
+      // send one 20ms frame per tick
+      const frame = playQueue.shift();
+      const payloadB64 = frame.toString("base64");
 
-  const mantissa = (sample >> (exponent + 3)) & 0x0f;
-  const muLawByte = ~(sign | (exponent << 4) | mantissa);
-  return muLawByte & 0xff;
-}
-
-function genMuLawSineBase64(freqHz, ms, sampleRate = 8000) {
-  const totalSamples = Math.floor((ms / 1000) * sampleRate);
-  const pcmu = Buffer.alloc(totalSamples);
-
-  const amp = 12000; // safe amplitude
-  for (let i = 0; i < totalSamples; i++) {
-    const t = i / sampleRate;
-    const s = Math.floor(Math.sin(2 * Math.PI * freqHz * t) * amp);
-    pcmu[i] = linearToMuLawSample(s);
-  }
-
-  return pcmu.toString("base64");
-}
-
-function sendOutboundAudio(ws, streamSid, base64Pcmu) {
-  // Send in 20ms frames: 8000hz => 160 samples => 160 bytes in PCMU
-  const bytes = Buffer.from(base64Pcmu, "base64");
-  const frameSize = 160;
-  let offset = 0;
-
-  const sendFrame = () => {
-    if (ws.readyState !== ws.OPEN) return;
-    if (offset >= bytes.length) return;
-
-    const chunk = bytes.subarray(offset, offset + frameSize);
-    offset += frameSize;
-
-    const payload = chunk.toString("base64");
-    ws.send(
-      JSON.stringify({
+      const msg = {
         event: "media",
         streamSid,
-        media: {
-          payload,
-          track: "outbound",
-        },
-      })
-    );
-
-    setTimeout(sendFrame, 20);
-  };
-
-  sendFrame();
-}
-
-const server = http.createServer(app);
-const wss = new WebSocketServer({ noServer: true });
-
-server.on("upgrade", (req, socket, head) => {
-  const url = req.url || "";
-  if (url.startsWith("/twilio-media-stream")) {
-    wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
-    return;
+        media: { payload: payloadB64 },
+      };
+      ws.send(JSON.stringify(msg));
+    }, TWILIO_FRAME_MS);
   }
-  socket.destroy();
-});
 
-wss.on("connection", (ws, req) => {
-  const peer = req?.socket?.remoteAddress || "unknown";
-  const path = req?.url || "";
-  const connId = `tw_${Math.random().toString(36).slice(2, 8)}${Date.now().toString(36).slice(-4)}`;
+  function stopPlaybackPump() {
+    if (playTimer) clearInterval(playTimer);
+    playTimer = null;
+    playQueue = [];
+  }
 
-  let streamSid = "";
-  let callSid = "";
-  let mediaCount = 0;
+  function enqueuePcmToTwilio(pcmBuf, pcmRate) {
+    // resample to 8k
+    const pcm8k = resamplePcm16Linear(pcmBuf, pcmRate, TWILIO_RATE);
+    // to mu-law bytes
+    const mu = pcm16BufferToMulawBytes(pcm8k);
+    // chunk into 20ms frames (160 bytes)
+    const frames = chunkBuffer(mu, TWILIO_FRAME_BYTES);
+    for (const f of frames) playQueue.push(f);
+    startPlaybackPump();
+  }
 
-  log("info", `[WS][${connId}] connected`, { peer, path });
+  async function startGemini(customParameters) {
+    geminiSession = await createGeminiLiveSession();
 
-  const pingTimer = setInterval(() => {
-    try {
-      if (ws.readyState === ws.OPEN) ws.ping();
-    } catch {}
-  }, 25000);
-
-  ws.on("message", (buf) => {
-    const txt = Buffer.isBuffer(buf) ? buf.toString("utf8") : String(buf || "");
-    const parsed = safeJsonParse(txt);
-    if (!parsed.ok) return;
-
-    const msg = parsed.value || {};
-    const ev = String(msg.event || "").toLowerCase();
-
-    if (ev === "start") {
-      streamSid = msg?.start?.streamSid || "";
-      callSid = msg?.start?.callSid || "";
-      const custom = msg?.start?.customParameters || {};
-      log("info", `[WS][${connId}] start`, { streamSid, callSid, customParameters: custom });
-
-      // ✅ Send test tone to prove outbound audio works
-      if (ENV.TEST_TONE_ON_START && streamSid) {
-        const b64 = genMuLawSineBase64(ENV.TEST_TONE_FREQ_HZ, ENV.TEST_TONE_MS);
-        log("info", `[WS][${connId}] sending test tone`, { freq: ENV.TEST_TONE_FREQ_HZ, ms: ENV.TEST_TONE_MS });
-        sendOutboundAudio(ws, streamSid, b64);
-      }
-      return;
-    }
-
-    if (ev === "media") {
-      mediaCount += 1;
-      if (mediaCount === 1 || mediaCount % ENV.TWILIO_STREAM_LOG_EVERY_N_MEDIA === 0) {
-        log("debug", `[WS][${connId}] media`, {
-          streamSid,
-          callSid,
-          mediaCount,
-          track: msg?.media?.track,
-          chunkBytesB64: (msg?.media?.payload || "").length,
-        });
-      }
-      return;
-    }
-
-    if (ev === "stop") {
-      log("info", `[WS][${connId}] stop`, { streamSid, callSid, mediaCount, stop: msg?.stop || {} });
+    // Start receiver loop
+    geminiReceiverTask = (async () => {
       try {
-        ws.close();
-      } catch {}
+        for await (const msg of geminiSession.receive()) {
+          // If the model says it's interrupted, drop queued playback (barge-in)
+          if (msg?.serverContent?.interrupted) {
+            interrupted = true;
+            stopPlaybackPump();
+          }
+
+          // Audio from model is usually in: msg.serverContent.modelTurn.parts[].inlineData
+          const parts = msg?.serverContent?.modelTurn?.parts || [];
+          for (const p of parts) {
+            const inline = p.inlineData;
+            if (inline?.data && typeof inline.data === "string") {
+              // We don't always get mimeType reliably; assume PCM16 @ 24000 unless specified
+              const mime = inline.mimeType || "";
+              let outRate = GEMINI_OUT_RATE_DEFAULT;
+
+              const m = /rate=(\d+)/.exec(mime);
+              if (m) outRate = parseInt(m[1], 10);
+
+              const pcm = Buffer.from(inline.data, "base64");
+              enqueuePcmToTwilio(pcm, outRate);
+            }
+          }
+        }
+      } catch (e) {
+        logErr(`[WS][${connId}] gemini receive loop error`, e?.message || e);
+      }
+    })();
+
+    // Trigger opening from Gemini (NOT Twilio)
+    const opener =
+      (customParameters?.opening_text && String(customParameters.opening_text)) || OPENING_TEXT;
+
+    await geminiSession.sendRealtimeInput({
+      text: opener,
+    });
+  }
+
+  async function closeAll() {
+    try {
+      stopPlaybackPump();
+      if (geminiSession) {
+        try {
+          // Tell Gemini audio stream ended
+          await geminiSession.sendRealtimeInput({ audioStreamEnd: true });
+        } catch {}
+        try {
+          await geminiSession.close();
+        } catch {}
+      }
+    } finally {
+      geminiSession = null;
+      geminiReceiverTask = null;
+    }
+  }
+
+  ws.on("message", async (data) => {
+    let msg;
+    try {
+      msg = JSON.parse(data.toString("utf8"));
+    } catch {
+      return;
+    }
+
+    if (msg.event === "start") {
+      streamSid = msg.start?.streamSid || null;
+      callSid = msg.start?.callSid || null;
+
+      const customParameters = msg.start?.customParameters || {};
+
+      logInfo(`[WS][${connId}] start`, { streamSid, callSid, customParameters });
+
+      try {
+        await startGemini(customParameters);
+        logInfo(`[WS][${connId}] gemini live connected`);
+      } catch (e) {
+        logErr(`[WS][${connId}] failed to start gemini`, e?.message || e);
+      }
+      return;
+    }
+
+    if (msg.event === "media") {
+      if (!geminiSession) return;
+
+      // Twilio media payload is base64 mu-law 8kHz mono
+      const b64 = msg.media?.payload;
+      if (!b64) return;
+
+      const muLaw = Buffer.from(b64, "base64");
+      const pcm8k = mulawBytesToPcm16Buffer(muLaw);
+      const pcm16k = resamplePcm16Linear(pcm8k, TWILIO_RATE, GEMINI_IN_RATE);
+
+      try {
+        await geminiSession.sendRealtimeInput({
+          audio: {
+            mimeType: `audio/pcm;rate=${GEMINI_IN_RATE}`,
+            data: pcm16k.toString("base64"),
+          },
+        });
+      } catch (e) {
+        // If Gemini disconnects, avoid crashing
+        logWarn(`[WS][${connId}] sendRealtimeInput audio failed`, e?.message || e);
+      }
+      return;
+    }
+
+    if (msg.event === "stop") {
+      logInfo(`[WS][${connId}] stop`, {
+        streamSid: msg.stop?.streamSid,
+        callSid: msg.stop?.callSid,
+      });
+      await closeAll();
       return;
     }
   });
 
-  ws.on("close", () => {
-    clearInterval(pingTimer);
-    log("info", `[WS][${connId}] closed`, { streamSid, callSid, mediaCount });
+  ws.on("close", async () => {
+    logInfo(`[WS][${connId}] closed`, { streamSid, callSid });
+    await closeAll();
   });
 
-  ws.on("error", (err) => {
-    log("error", `[WS][${connId}] error`, err?.message || String(err));
+  ws.on("error", async (err) => {
+    logErr(`[WS][${connId}] ws error`, err?.message || err);
+    await closeAll();
   });
 });
 
-// ===================== Boot =====================
 server.listen(PORT, () => {
-  console.log(`[BOOT] listening on ${PORT}`);
+  console.log("[BOOT] listening on", PORT);
 });
