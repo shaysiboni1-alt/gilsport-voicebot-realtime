@@ -1,17 +1,16 @@
 {
-  "name": "gilsport-voicebot-realtime",
+  "name": "gilsport-voicebot-gateway",
   "version": "1.0.0",
-  "type": "module",
-  "private": true,
-  "main": "server.js",
+  "main": "voice-gateway.js",
+  "type": "commonjs",
   "scripts": {
-    "start": "node server.js"
-  },
-  "engines": {
-    "node": ">=18"
+    "start": "node voice-gateway.js"
   },
   "dependencies": {
+    "@google/genai": "^1.0.0",
     "express": "^4.19.2",
-    "googleapis": "^140.0.0"
+    "twilio": "^5.4.0",
+    "uuid": "^9.0.1",
+    "ws": "^8.18.0"
   }
 }
