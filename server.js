@@ -28,7 +28,27 @@ const PORT = envNum("PORT", 10000);
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const OPENAI_REALTIME_MODEL =
   process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview-2024-12-17";
-const OPENAI_VOICE = process.env.OPENAI_VOICE || "alloy";
+
+// Voice: normalize to lowercase + validate (prevents "Alloy" bug)
+const ALLOWED_VOICES = new Set([
+  "alloy",
+  "ash",
+  "ballad",
+  "coral",
+  "echo",
+  "sage",
+  "shimmer",
+  "verse",
+  "marin",
+  "cedar"
+]);
+function normalizeVoice(v) {
+  const raw = String(v || "").trim();
+  const lower = raw.toLowerCase();
+  if (ALLOWED_VOICES.has(lower)) return lower;
+  return "alloy";
+}
+const OPENAI_VOICE = normalizeVoice(process.env.OPENAI_VOICE || "alloy");
 
 const GSHEET_ID = process.env.GSHEET_ID || "";
 const GOOGLE_SERVICE_ACCOUNT_JSON_B64 = process.env.GOOGLE_SERVICE_ACCOUNT_JSON_B64 || "";
@@ -46,6 +66,11 @@ const MB_IDLE_WARNING_MS = envNum("MB_IDLE_WARNING_MS", 40000);
 const MB_IDLE_HANGUP_MS = envNum("MB_IDLE_HANGUP_MS", 90000);
 
 const MB_MAX_CALL_MS = envNum("MB_MAX_CALL_MS", 5 * 60 * 1000);
+
+// NEW: transcript logging flags (safe defaults)
+const MB_LOG_TRANSCRIPTS = envBool("MB_LOG_TRANSCRIPTS", true);
+const MB_ENABLE_TRANSCRIPTION = envBool("MB_ENABLE_TRANSCRIPTION", true);
+const MB_TRANSCRIPTION_MODEL = process.env.MB_TRANSCRIPTION_MODEL || "whisper-1";
 
 // --------------------------------------------------
 // Logging
@@ -108,7 +133,7 @@ async function loadSheets() {
       const row = {};
       headers.forEach((h, i) => (row[h] = r[i] || ""));
       if (row.prompt_id && row.content_he) {
-        prompts[row.prompt_id] = row.content_he;
+        prompts[String(row.prompt_id).trim()] = String(row.content_he);
       }
     }
 
@@ -126,6 +151,11 @@ async function loadSheets() {
 const getPrompt = (id, fallback = "") =>
   String(SHEETS.prompts[id] || fallback).trim();
 
+const preview = (s, n = 120) => {
+  const t = String(s || "").replace(/\s+/g, " ").trim();
+  return t.length > n ? t.slice(0, n) + "..." : t;
+};
+
 // --------------------------------------------------
 // Express
 // --------------------------------------------------
@@ -141,13 +171,12 @@ app.get("/health", (_, res) => {
   });
 });
 
-// NEW: quick ENV diagnostics (safe – no secrets)
+// quick ENV diagnostics (safe – no secrets)
 app.get("/diag/env", (_, res) => {
   res.json({
     ok: true,
     booted_at: RUNTIME.booted_at,
 
-    // Safe ENV checks
     has_OPENAI_API_KEY: Boolean(OPENAI_API_KEY),
     OPENAI_REALTIME_MODEL,
     OPENAI_VOICE,
@@ -158,13 +187,29 @@ app.get("/diag/env", (_, res) => {
     MB_DEBUG,
     MB_WEBHOOK_URL_present: Boolean(MB_WEBHOOK_URL),
 
-    // Useful derived info
+    MB_LOG_TRANSCRIPTS,
+    MB_ENABLE_TRANSCRIPTION,
+    MB_TRANSCRIPTION_MODEL,
+
     sheets_loaded_at: SHEETS.loaded_at,
     prompts_count: Object.keys(SHEETS.prompts).length
   });
 });
 
-// NEW: runtime counters (helps prove WS is/ isn’t reaching server)
+// NEW: prompt diagnostics (helps catch OPENING_SCRIPT mismatch/timing)
+app.get("/diag/prompts", (_, res) => {
+  const keys = Object.keys(SHEETS.prompts).sort();
+  res.json({
+    ok: true,
+    sheets_loaded_at: SHEETS.loaded_at,
+    prompts_count: keys.length,
+    prompt_ids: keys,
+    opening_preview: preview(getPrompt("OPENING_SCRIPT", "")),
+    master_preview: preview(getPrompt("MASTER_PROMPT", ""))
+  });
+});
+
+// runtime counters
 app.get("/diag/runtime", (_, res) => {
   res.json({
     ok: true,
@@ -207,7 +252,6 @@ wss.on("connection", (twilioWs, req) => {
   RUNTIME.ws_connections += 1;
   RUNTIME.last_ws_conn_at = new Date().toISOString();
 
-  // ALWAYS log: if you don't see this, Twilio isn't reaching this server/path
   always("WS connection", {
     at: RUNTIME.last_ws_conn_at,
     ip: req?.socket?.remoteAddress || "?",
@@ -216,20 +260,21 @@ wss.on("connection", (twilioWs, req) => {
     total_ws_connections: RUNTIME.ws_connections
   });
 
-  // ---- Minimal critical fix:
-  // Twilio starts sending "media" immediately. OpenAI may still be CONNECTING.
-  // We buffer audio until OpenAI websocket is OPEN, and we never send on CONNECTING.
   let twilioStreamSid = null;
   let openaiReady = false;
-  const pendingAudio = []; // array of base64 g711_ulaw payloads
+  const pendingAudio = [];
 
-  // Telemetry only (no behavior changes)
   const connTag = `conn_${Date.now().toString(36)}_${Math.random().toString(16).slice(2, 6)}`;
   let twilioMediaFrames = 0;
   let twilioMediaBytesB64 = 0;
   let openaiAudioDeltas = 0;
   let openaiAudioBytesB64 = 0;
   let lastStatsAt = Date.now();
+
+  // Transcript buffers
+  let lastCallerText = "";
+  let botTextAccum = "";
+  let botTextLastPrintedAt = 0;
 
   const maybePrintStats = (force = false) => {
     const now = Date.now();
@@ -247,10 +292,8 @@ wss.on("connection", (twilioWs, req) => {
     });
   };
 
-  // NOTE: declare openaiWs variable early so closures can reference safely
   let openaiWs = null;
 
-  // Helper: safe send to OpenAI
   const safeOpenAISend = (obj) => {
     try {
       if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
@@ -264,7 +307,6 @@ wss.on("connection", (twilioWs, req) => {
     }
   };
 
-  // Helper: safe send to Twilio
   const safeTwilioSend = (obj) => {
     try {
       if (twilioWs && twilioWs.readyState === WebSocket.OPEN) {
@@ -286,7 +328,6 @@ wss.on("connection", (twilioWs, req) => {
     return;
   }
 
-  debug(`[${connTag}] Twilio WS connected (media stream). ip=${req?.socket?.remoteAddress || "?"}`);
   debug(`[${connTag}] Creating OpenAI WS... model=${OPENAI_REALTIME_MODEL} voice=${OPENAI_VOICE}`);
 
   openaiWs = new WebSocket(
@@ -299,30 +340,50 @@ wss.on("connection", (twilioWs, req) => {
     }
   );
 
-  openaiWs.on("open", () => {
+  openaiWs.on("open", async () => {
     debug(`[${connTag}] OpenAI connected`);
     openaiReady = true;
 
-    // Configure session
-    safeOpenAISend({
-      type: "session.update",
-      session: {
-        modalities: ["audio", "text"],
-        voice: OPENAI_VOICE,
-        input_audio_format: "g711_ulaw",
-        output_audio_format: "g711_ulaw",
-        turn_detection: {
-          type: "server_vad",
-          threshold: MB_VAD_THRESHOLD,
-          silence_duration_ms: MB_VAD_SILENCE_MS,
-          prefix_padding_ms: MB_VAD_PREFIX_MS
-        },
-        instructions: getPrompt(
-          "MASTER_PROMPT",
-          "אתם עוזרת קולית בשם נטע עבור גיל ספורט. דברו קצר, קליל וברור."
-        )
-      }
+    // ✅ Surgical: ensure sheets are loaded BEFORE we read OPENING_SCRIPT / MASTER_PROMPT
+    if (!SHEETS.loaded_at) {
+      debug(`[${connTag}] Sheets not loaded yet. Loading now before prompts...`);
+      await loadSheets();
+      debug(`[${connTag}] Sheets loaded_at=${SHEETS.loaded_at || null}`);
+    }
+
+    const masterPrompt = getPrompt(
+      "MASTER_PROMPT",
+      "אתם עוזרת קולית בשם נטע עבור גיל ספורט. דברו קצר, קליל וברור."
+    );
+    const openingScript = getPrompt("OPENING_SCRIPT", "שלום, מדברת נטע מגיל ספורט.");
+
+    always(`[${connTag}] PROMPTS`, {
+      sheets_loaded_at: SHEETS.loaded_at,
+      master_preview: preview(masterPrompt),
+      opening_preview: preview(openingScript)
     });
+
+    // Configure session
+    const session = {
+      modalities: ["audio", "text"],
+      voice: OPENAI_VOICE,
+      input_audio_format: "g711_ulaw",
+      output_audio_format: "g711_ulaw",
+      turn_detection: {
+        type: "server_vad",
+        threshold: MB_VAD_THRESHOLD,
+        silence_duration_ms: MB_VAD_SILENCE_MS,
+        prefix_padding_ms: MB_VAD_PREFIX_MS
+      },
+      instructions: masterPrompt
+    };
+
+    // Ask for transcription (caller side)
+    if (MB_ENABLE_TRANSCRIPTION) {
+      session.input_audio_transcription = { model: MB_TRANSCRIPTION_MODEL };
+    }
+
+    safeOpenAISend({ type: "session.update", session });
 
     // Opening message
     safeOpenAISend({
@@ -330,18 +391,16 @@ wss.on("connection", (twilioWs, req) => {
       item: {
         type: "message",
         role: "user",
-        content: [
-          {
-            type: "input_text",
-            text: getPrompt("OPENING_SCRIPT", "שלום, מדברת נטע מגיל ספורט.")
-          }
-        ]
+        content: [{ type: "input_text", text: openingScript }]
       }
     });
 
-    safeOpenAISend({ type: "response.create" });
+    // Ask for response (audio+text)
+    safeOpenAISend({
+      type: "response.create",
+      response: { modalities: ["audio", "text"] }
+    });
 
-    // Flush buffered audio that arrived before OpenAI was ready
     if (pendingAudio.length) {
       debug(`[${connTag}] Flushing buffered audio frames: ${pendingAudio.length}`);
     }
@@ -379,11 +438,11 @@ wss.on("connection", (twilioWs, req) => {
       return;
     }
 
-    // Surface important OpenAI events for debugging format/noise
     if (msg.type === "error") {
       error(`[${connTag}] OpenAI error event`, msg);
       return;
     }
+
     if (msg.type === "session.created" || msg.type === "session.updated") {
       debug(
         `[${connTag}] OpenAI ${msg.type}`,
@@ -391,19 +450,73 @@ wss.on("connection", (twilioWs, req) => {
           ? {
               voice: msg.session.voice,
               input_audio_format: msg.session.input_audio_format,
-              output_audio_format: msg.session.output_audio_format
+              output_audio_format: msg.session.output_audio_format,
+              has_transcription: Boolean(msg.session.input_audio_transcription)
             }
           : msg
       );
       return;
     }
 
-    // Send audio back to Twilio
-    if (msg.type === "response.audio.delta") {
-      // Twilio needs the ORIGINAL Twilio streamSid (from start), not something from OpenAI
-      if (!twilioStreamSid) {
+    // -----------------------------
+    // Caller transcription logging
+    // -----------------------------
+    // Different accounts/models sometimes emit slightly different type names.
+    // We accept a few common ones.
+    if (MB_LOG_TRANSCRIPTS) {
+      const t = msg.type || "";
+      const possibleTranscript =
+        msg.transcript ||
+        msg.text ||
+        msg?.item?.content?.[0]?.transcript ||
+        msg?.item?.content?.[0]?.text ||
+        "";
+
+      const isCallerTranscriptEvent =
+        t.includes("input_audio_transcription") ||
+        t.includes("conversation.item.input_audio_transcription") ||
+        t.includes("input_audio_transcript");
+
+      if (isCallerTranscriptEvent && possibleTranscript) {
+        lastCallerText = String(possibleTranscript).trim();
+        if (lastCallerText) {
+          always(`[CALLER][${connTag}]`, lastCallerText);
+        }
         return;
       }
+    }
+
+    // -----------------------------
+    // Bot text logging (when model returns text deltas)
+    // -----------------------------
+    if (MB_LOG_TRANSCRIPTS && msg.type === "response.text.delta" && msg.delta) {
+      botTextAccum += String(msg.delta);
+      const now = Date.now();
+      // print every ~700ms to keep logs readable
+      if (now - botTextLastPrintedAt > 700) {
+        const chunk = botTextAccum.trim();
+        if (chunk) always(`[BOT][${connTag}]`, preview(chunk, 400));
+        botTextLastPrintedAt = now;
+      }
+      return;
+    }
+
+    if (MB_LOG_TRANSCRIPTS && (msg.type === "response.text.done" || msg.type === "response.done")) {
+      const doneText =
+        (msg?.response?.output_text && String(msg.response.output_text)) ||
+        botTextAccum ||
+        "";
+      const final = String(doneText).trim();
+      if (final) always(`[BOT_FINAL][${connTag}]`, preview(final, 1200));
+      botTextAccum = "";
+      return;
+    }
+
+    // -----------------------------
+    // Audio back to Twilio
+    // -----------------------------
+    if (msg.type === "response.audio.delta") {
+      if (!twilioStreamSid) return;
 
       const delta = msg.delta || "";
       openaiAudioDeltas += 1;
@@ -429,7 +542,6 @@ wss.on("connection", (twilioWs, req) => {
       return;
     }
 
-    // Capture streamSid from Twilio "start"
     if (msg.event === "start" && msg.start?.streamSid) {
       twilioStreamSid = msg.start.streamSid;
       debug(`[${connTag}] Twilio stream started`, {
@@ -442,20 +554,15 @@ wss.on("connection", (twilioWs, req) => {
       return;
     }
 
-    // Forward audio to OpenAI (buffer if OpenAI not ready yet)
     if (msg.event === "media" && msg.media?.payload) {
       const payload = msg.media.payload;
 
       twilioMediaFrames += 1;
       twilioMediaBytesB64 += payload.length;
 
-      // If OpenAI isn't open yet, buffer to prevent "readyState 0 (CONNECTING)" crash
       if (!openaiReady || !openaiWs || openaiWs.readyState !== WebSocket.OPEN) {
         pendingAudio.push(payload);
-
-        // Safety: keep buffer bounded (prevents memory blow if OpenAI never opens)
         if (pendingAudio.length > 400) pendingAudio.splice(0, pendingAudio.length - 400);
-
         maybePrintStats(false);
         return;
       }
@@ -469,7 +576,6 @@ wss.on("connection", (twilioWs, req) => {
       return;
     }
 
-    // Optional: handle stop
     if (msg.event === "stop") {
       debug(`[${connTag}] Twilio stream stopped`);
       maybePrintStats(true);
@@ -507,7 +613,6 @@ server.listen(PORT, () => {
   log(`GilSport VoiceBot running on port ${PORT}`);
   loadSheets();
 
-  // Always log key startup facts (safe)
   always("BOOT", {
     at: RUNTIME.booted_at,
     port: PORT,
@@ -516,6 +621,9 @@ server.listen(PORT, () => {
     OPENAI_REALTIME_MODEL,
     OPENAI_VOICE,
     has_GSHEET_ID: Boolean(GSHEET_ID),
-    has_GOOGLE_SERVICE_ACCOUNT_JSON_B64: Boolean(GOOGLE_SERVICE_ACCOUNT_JSON_B64)
+    has_GOOGLE_SERVICE_ACCOUNT_JSON_B64: Boolean(GOOGLE_SERVICE_ACCOUNT_JSON_B64),
+    MB_LOG_TRANSCRIPTS,
+    MB_ENABLE_TRANSCRIPTION,
+    MB_TRANSCRIPTION_MODEL
   });
 });
