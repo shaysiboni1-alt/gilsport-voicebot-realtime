@@ -314,6 +314,19 @@ wss.on("connection", (twilioWs, req) => {
     always(`[BOT][${connTag}]`, t);
   };
 
+  // To avoid spamming response.create
+  let awaitingResponse = false;
+  const requestAssistantResponse = () => {
+    if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN) return;
+    if (awaitingResponse) return;
+    awaitingResponse = true;
+
+    safeOpenAISend({
+      type: "response.create",
+      response: { modalities: ["audio", "text"] }
+    });
+  };
+
   let openaiWs = null;
 
   const safeOpenAISend = (obj) => {
@@ -378,7 +391,7 @@ wss.on("connection", (twilioWs, req) => {
       "אתם עוזרת קולית בשם נטע עבור גיל ספורט. דברו קצר, קליל וברור."
     );
 
-    // ✅ Opening script comes from SETTINGS (Single Source of Truth)
+    // ✅ Opening script comes from SETTINGS
     const openingScript = getSetting("OPENING_SCRIPT", "שלום, מדברת נטע מגיל ספורט.");
 
     always(`[${connTag}] SOURCES`, {
@@ -410,8 +423,8 @@ wss.on("connection", (twilioWs, req) => {
 
     safeOpenAISend({ type: "session.update", session });
 
-    // ✅ Make the bot SAY the opening verbatim (not as "user" trigger)
-    // We do a one-time response.create with override instructions.
+    // ✅ Make the bot SAY the opening verbatim (one-time override)
+    awaitingResponse = true;
     safeOpenAISend({
       type: "response.create",
       response: {
@@ -478,14 +491,12 @@ wss.on("connection", (twilioWs, req) => {
     }
 
     // -----------------------------
-    // CALLER FINAL (robust across event names)
-    // We only log completed/done-like events to keep logs clean.
+    // CALLER FINAL (robust)
     // -----------------------------
     if (MB_LOG_TRANSCRIPTS) {
       const type = String(msg.type || "");
       const doneLike = type.includes("done") || type.includes("completed");
 
-      // common spots where transcript may appear
       const possible =
         msg.transcript ||
         msg.text ||
@@ -500,8 +511,26 @@ wss.on("connection", (twilioWs, req) => {
 
       if (doneLike && isInputTranscript && possible) {
         printCallerFinal(String(possible).trim());
+        // after we got user final, request assistant response (if not already)
+        requestAssistantResponse();
         return;
       }
+    }
+
+    // -----------------------------
+    // Turn boundary events (safe trigger)
+    // -----------------------------
+    if (msg.type === "input_audio_buffer.speech_stopped") {
+      requestAssistantResponse();
+      return;
+    }
+
+    // -----------------------------
+    // response lifecycle
+    // -----------------------------
+    if (msg.type === "response.done") {
+      awaitingResponse = false;
+      return;
     }
 
     // -----------------------------
