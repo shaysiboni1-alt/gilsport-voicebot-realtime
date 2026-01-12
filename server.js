@@ -134,7 +134,8 @@ app.post("/twilio-voice", (req, res) => {
   const host = req.headers.host;
   const wsUrl = `wss://${host}/twilio-media-stream`;
 
-  res.type("text/xml").send(`
+  res.type("text/xml").send(
+    `
 <Response>
   <Connect>
     <Stream url="${wsUrl}">
@@ -143,7 +144,8 @@ app.post("/twilio-voice", (req, res) => {
     </Stream>
   </Connect>
 </Response>
-`.trim());
+`.trim()
+  );
 });
 
 const server = http.createServer(app);
@@ -154,9 +156,47 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: "/twilio-media-stream" });
 
 wss.on("connection", (twilioWs) => {
+  // ---- Minimal critical fix:
+  // Twilio starts sending "media" immediately. OpenAI may still be CONNECTING.
+  // We buffer audio until OpenAI websocket is OPEN, and we never send on CONNECTING.
+  let twilioStreamSid = null;
+  let openaiReady = false;
+  const pendingAudio = []; // array of base64 g711_ulaw payloads
+
+  // Helper: safe send to OpenAI
+  const safeOpenAISend = (obj) => {
+    try {
+      if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+        openaiWs.send(JSON.stringify(obj));
+        return true;
+      }
+      return false;
+    } catch (e) {
+      error("OpenAI send failed", e.message);
+      return false;
+    }
+  };
+
+  // Helper: safe send to Twilio
+  const safeTwilioSend = (obj) => {
+    try {
+      if (twilioWs && twilioWs.readyState === WebSocket.OPEN) {
+        twilioWs.send(JSON.stringify(obj));
+        return true;
+      }
+      return false;
+    } catch (e) {
+      error("Twilio send failed", e.message);
+      return false;
+    }
+  };
+
   if (!OPENAI_API_KEY) {
     error("OPENAI_API_KEY missing — closing call");
-    return twilioWs.close();
+    try {
+      twilioWs.close();
+    } catch (_) {}
+    return;
   }
 
   const openaiWs = new WebSocket(
@@ -171,8 +211,10 @@ wss.on("connection", (twilioWs) => {
 
   openaiWs.on("open", () => {
     debug("OpenAI connected");
+    openaiReady = true;
 
-    openaiWs.send(JSON.stringify({
+    // Configure session
+    safeOpenAISend({
       type: "session.update",
       session: {
         modalities: ["audio", "text"],
@@ -185,46 +227,136 @@ wss.on("connection", (twilioWs) => {
           silence_duration_ms: MB_VAD_SILENCE_MS,
           prefix_padding_ms: MB_VAD_PREFIX_MS
         },
-        instructions:
-          getPrompt(
-            "MASTER_PROMPT",
-            "אתם עוזרת קולית בשם נטע עבור גיל ספורט. דברו קצר, קליל וברור."
-          )
+        instructions: getPrompt(
+          "MASTER_PROMPT",
+          "אתם עוזרת קולית בשם נטע עבור גיל ספורט. דברו קצר, קליל וברור."
+        )
       }
-    }));
+    });
 
-    openaiWs.send(JSON.stringify({
+    // Opening message
+    safeOpenAISend({
       type: "conversation.item.create",
       item: {
         type: "message",
         role: "user",
         content: [
-          { type: "input_text", text: getPrompt("OPENING_SCRIPT", "שלום, מדברת נטע מגיל ספורט.") }
+          {
+            type: "input_text",
+            text: getPrompt("OPENING_SCRIPT", "שלום, מדברת נטע מגיל ספורט.")
+          }
         ]
       }
-    }));
+    });
 
-    openaiWs.send(JSON.stringify({ type: "response.create" }));
-  });
+    safeOpenAISend({ type: "response.create" });
 
-  twilioWs.on("message", (data) => {
-    const msg = JSON.parse(data.toString());
-    if (msg.event === "media" && msg.media?.payload) {
-      openaiWs.send(JSON.stringify({
-        type: "input_audio_buffer.append",
-        audio: msg.media.payload
-      }));
+    // Flush buffered audio that arrived before OpenAI was ready
+    while (pendingAudio.length > 0 && openaiWs.readyState === WebSocket.OPEN) {
+      const audio = pendingAudio.shift();
+      safeOpenAISend({ type: "input_audio_buffer.append", audio });
     }
   });
 
+  openaiWs.on("error", (e) => {
+    error("OpenAI websocket error", e?.message || e);
+    try {
+      twilioWs.close();
+    } catch (_) {}
+  });
+
+  openaiWs.on("close", () => {
+    debug("OpenAI closed");
+    try {
+      twilioWs.close();
+    } catch (_) {}
+  });
+
+  twilioWs.on("message", (data) => {
+    let msg;
+    try {
+      msg = JSON.parse(data.toString());
+    } catch (e) {
+      error("Twilio message JSON parse failed", e.message);
+      return;
+    }
+
+    // Capture streamSid from Twilio "start"
+    if (msg.event === "start" && msg.start?.streamSid) {
+      twilioStreamSid = msg.start.streamSid;
+      debug("Twilio stream started", { streamSid: twilioStreamSid });
+      return;
+    }
+
+    // Forward audio to OpenAI (buffer if OpenAI not ready yet)
+    if (msg.event === "media" && msg.media?.payload) {
+      const payload = msg.media.payload;
+
+      // If OpenAI isn't open yet, buffer to prevent "readyState 0 (CONNECTING)" crash
+      if (!openaiReady || openaiWs.readyState !== WebSocket.OPEN) {
+        pendingAudio.push(payload);
+
+        // Safety: keep buffer bounded (prevents memory blow if OpenAI never opens)
+        if (pendingAudio.length > 400) pendingAudio.splice(0, pendingAudio.length - 400);
+
+        return;
+      }
+
+      safeOpenAISend({
+        type: "input_audio_buffer.append",
+        audio: payload
+      });
+
+      return;
+    }
+
+    // Optional: handle stop
+    if (msg.event === "stop") {
+      debug("Twilio stream stopped");
+      try {
+        openaiWs.close();
+      } catch (_) {}
+      return;
+    }
+  });
+
+  twilioWs.on("error", (e) => {
+    error("Twilio websocket error", e?.message || e);
+    try {
+      openaiWs.close();
+    } catch (_) {}
+  });
+
+  twilioWs.on("close", () => {
+    debug("Twilio closed");
+    try {
+      openaiWs.close();
+    } catch (_) {}
+  });
+
   openaiWs.on("message", (data) => {
-    const msg = JSON.parse(data.toString());
+    let msg;
+    try {
+      msg = JSON.parse(data.toString());
+    } catch (e) {
+      error("OpenAI message JSON parse failed", e.message);
+      return;
+    }
+
+    // Send audio back to Twilio
     if (msg.type === "response.audio.delta") {
-      twilioWs.send(JSON.stringify({
+      // Twilio needs the ORIGINAL Twilio streamSid (from start), not something from OpenAI
+      if (!twilioStreamSid) {
+        // If audio arrives before start (rare), just drop until we have streamSid
+        return;
+      }
+
+      safeTwilioSend({
         event: "media",
-        streamSid: msg.streamSid,
+        streamSid: twilioStreamSid,
         media: { payload: msg.delta }
-      }));
+      });
+      return;
     }
   });
 });
