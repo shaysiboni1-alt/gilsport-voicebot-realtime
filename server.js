@@ -155,13 +155,37 @@ const server = http.createServer(app);
 // --------------------------------------------------
 const wss = new WebSocket.Server({ server, path: "/twilio-media-stream" });
 
-wss.on("connection", (twilioWs) => {
+wss.on("connection", (twilioWs, req) => {
   // ---- Minimal critical fix:
   // Twilio starts sending "media" immediately. OpenAI may still be CONNECTING.
   // We buffer audio until OpenAI websocket is OPEN, and we never send on CONNECTING.
   let twilioStreamSid = null;
   let openaiReady = false;
   const pendingAudio = []; // array of base64 g711_ulaw payloads
+
+  // Telemetry only (no behavior changes)
+  const connTag = `conn_${Date.now().toString(36)}_${Math.random().toString(16).slice(2, 6)}`;
+  let twilioMediaFrames = 0;
+  let twilioMediaBytesB64 = 0;
+  let openaiAudioDeltas = 0;
+  let openaiAudioBytesB64 = 0;
+  let lastStatsAt = Date.now();
+
+  const maybePrintStats = (force = false) => {
+    const now = Date.now();
+    if (!force && now - lastStatsAt < 5000) return;
+    lastStatsAt = now;
+
+    debug(`[${connTag}] STATS`, {
+      twilioStreamSid,
+      openaiReady,
+      pendingAudio: pendingAudio.length,
+      twilioMediaFrames,
+      twilioMediaBytesB64,
+      openaiAudioDeltas,
+      openaiAudioBytesB64
+    });
+  };
 
   // NOTE: declare openaiWs variable early so closures can reference safely
   let openaiWs = null;
@@ -202,7 +226,8 @@ wss.on("connection", (twilioWs) => {
     return;
   }
 
-  debug("Twilio WS connected (media stream). Creating OpenAI WS...");
+  debug(`[${connTag}] Twilio WS connected (media stream). ip=${req?.socket?.remoteAddress || "?"}`);
+  debug(`[${connTag}] Creating OpenAI WS... model=${OPENAI_REALTIME_MODEL} voice=${OPENAI_VOICE}`);
 
   openaiWs = new WebSocket(
     `wss://api.openai.com/v1/realtime?model=${OPENAI_REALTIME_MODEL}`,
@@ -215,7 +240,7 @@ wss.on("connection", (twilioWs) => {
   );
 
   openaiWs.on("open", () => {
-    debug("OpenAI connected");
+    debug(`[${connTag}] OpenAI connected`);
     openaiReady = true;
 
     // Configure session
@@ -258,23 +283,26 @@ wss.on("connection", (twilioWs) => {
 
     // Flush buffered audio that arrived before OpenAI was ready
     if (pendingAudio.length) {
-      debug(`Flushing buffered audio frames: ${pendingAudio.length}`);
+      debug(`[${connTag}] Flushing buffered audio frames: ${pendingAudio.length}`);
     }
     while (pendingAudio.length > 0 && openaiWs && openaiWs.readyState === WebSocket.OPEN) {
       const audio = pendingAudio.shift();
       safeOpenAISend({ type: "input_audio_buffer.append", audio });
     }
+
+    maybePrintStats(true);
   });
 
   openaiWs.on("error", (e) => {
-    error("OpenAI websocket error", e?.message || e);
+    error(`[${connTag}] OpenAI websocket error`, e?.message || e);
     try {
       twilioWs.close();
     } catch (_) {}
   });
 
   openaiWs.on("close", () => {
-    debug("OpenAI closed");
+    debug(`[${connTag}] OpenAI closed`);
+    maybePrintStats(true);
     try {
       twilioWs.close();
     } catch (_) {}
@@ -285,13 +313,21 @@ wss.on("connection", (twilioWs) => {
     try {
       msg = JSON.parse(data.toString());
     } catch (e) {
-      error("OpenAI message JSON parse failed", e.message);
+      error(`[${connTag}] OpenAI message JSON parse failed`, e.message);
       return;
     }
 
-    // Optional: surface OpenAI error events (helps debug noise/silence)
+    // Surface important OpenAI events for debugging format/noise
     if (msg.type === "error") {
-      error("OpenAI error event", msg);
+      error(`[${connTag}] OpenAI error event`, msg);
+      return;
+    }
+    if (msg.type === "session.created" || msg.type === "session.updated") {
+      debug(`[${connTag}] OpenAI ${msg.type}`, msg.session ? {
+        voice: msg.session.voice,
+        input_audio_format: msg.session.input_audio_format,
+        output_audio_format: msg.session.output_audio_format
+      } : msg);
       return;
     }
 
@@ -299,15 +335,20 @@ wss.on("connection", (twilioWs) => {
     if (msg.type === "response.audio.delta") {
       // Twilio needs the ORIGINAL Twilio streamSid (from start), not something from OpenAI
       if (!twilioStreamSid) {
-        // If audio arrives before start (rare), just drop until we have streamSid
         return;
       }
+
+      const delta = msg.delta || "";
+      openaiAudioDeltas += 1;
+      openaiAudioBytesB64 += delta.length;
 
       safeTwilioSend({
         event: "media",
         streamSid: twilioStreamSid,
-        media: { payload: msg.delta }
+        media: { payload: delta }
       });
+
+      maybePrintStats(false);
       return;
     }
   });
@@ -317,20 +358,29 @@ wss.on("connection", (twilioWs) => {
     try {
       msg = JSON.parse(data.toString());
     } catch (e) {
-      error("Twilio message JSON parse failed", e.message);
+      error(`[${connTag}] Twilio message JSON parse failed`, e.message);
       return;
     }
 
     // Capture streamSid from Twilio "start"
     if (msg.event === "start" && msg.start?.streamSid) {
       twilioStreamSid = msg.start.streamSid;
-      debug("Twilio stream started", { streamSid: twilioStreamSid });
+      debug(`[${connTag}] Twilio stream started`, {
+        streamSid: twilioStreamSid,
+        callSid: msg.start?.callSid,
+        tracks: msg.start?.tracks,
+        mediaFormat: msg.start?.mediaFormat
+      });
+      maybePrintStats(true);
       return;
     }
 
     // Forward audio to OpenAI (buffer if OpenAI not ready yet)
     if (msg.event === "media" && msg.media?.payload) {
       const payload = msg.media.payload;
+
+      twilioMediaFrames += 1;
+      twilioMediaBytesB64 += payload.length;
 
       // If OpenAI isn't open yet, buffer to prevent "readyState 0 (CONNECTING)" crash
       if (!openaiReady || !openaiWs || openaiWs.readyState !== WebSocket.OPEN) {
@@ -339,6 +389,7 @@ wss.on("connection", (twilioWs) => {
         // Safety: keep buffer bounded (prevents memory blow if OpenAI never opens)
         if (pendingAudio.length > 400) pendingAudio.splice(0, pendingAudio.length - 400);
 
+        maybePrintStats(false);
         return;
       }
 
@@ -347,12 +398,14 @@ wss.on("connection", (twilioWs) => {
         audio: payload
       });
 
+      maybePrintStats(false);
       return;
     }
 
     // Optional: handle stop
     if (msg.event === "stop") {
-      debug("Twilio stream stopped");
+      debug(`[${connTag}] Twilio stream stopped`);
+      maybePrintStats(true);
       try {
         if (openaiWs) openaiWs.close();
       } catch (_) {}
@@ -361,14 +414,16 @@ wss.on("connection", (twilioWs) => {
   });
 
   twilioWs.on("error", (e) => {
-    error("Twilio websocket error", e?.message || e);
+    error(`[${connTag}] Twilio websocket error`, e?.message || e);
+    maybePrintStats(true);
     try {
       if (openaiWs) openaiWs.close();
     } catch (_) {}
   });
 
   twilioWs.on("close", () => {
-    debug("Twilio closed");
+    debug(`[${connTag}] Twilio closed`);
+    maybePrintStats(true);
     try {
       if (openaiWs) openaiWs.close();
     } catch (_) {}
