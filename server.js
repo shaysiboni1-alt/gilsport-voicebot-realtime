@@ -54,6 +54,23 @@ const log = (...a) => console.log("[INFO]", ...a);
 const debug = (...a) => MB_DEBUG && console.log("[DEBUG]", ...a);
 const error = (...a) => console.error("[ERROR]", ...a);
 
+// ALWAYS logs (not dependent on MB_DEBUG)
+const always = (...a) => console.log("[ALWAYS]", ...a);
+
+// --------------------------------------------------
+// Runtime diagnostics (no behavior changes)
+// --------------------------------------------------
+const RUNTIME = {
+  booted_at: new Date().toISOString(),
+  ws_connections: 0,
+  ws_closed: 0,
+  ws_errors: 0,
+  openai_errors: 0,
+  openai_closed: 0,
+  last_ws_conn_at: null,
+  last_ws_close_at: null
+};
+
 // --------------------------------------------------
 // Sheets (Single Source of Truth)
 // --------------------------------------------------
@@ -124,6 +141,37 @@ app.get("/health", (_, res) => {
   });
 });
 
+// NEW: quick ENV diagnostics (safe – no secrets)
+app.get("/diag/env", (_, res) => {
+  res.json({
+    ok: true,
+    booted_at: RUNTIME.booted_at,
+
+    // Safe ENV checks
+    has_OPENAI_API_KEY: Boolean(OPENAI_API_KEY),
+    OPENAI_REALTIME_MODEL,
+    OPENAI_VOICE,
+
+    has_GSHEET_ID: Boolean(GSHEET_ID),
+    has_GOOGLE_SERVICE_ACCOUNT_JSON_B64: Boolean(GOOGLE_SERVICE_ACCOUNT_JSON_B64),
+
+    MB_DEBUG,
+    MB_WEBHOOK_URL_present: Boolean(MB_WEBHOOK_URL),
+
+    // Useful derived info
+    sheets_loaded_at: SHEETS.loaded_at,
+    prompts_count: Object.keys(SHEETS.prompts).length
+  });
+});
+
+// NEW: runtime counters (helps prove WS is/ isn’t reaching server)
+app.get("/diag/runtime", (_, res) => {
+  res.json({
+    ok: true,
+    ...RUNTIME
+  });
+});
+
 app.post("/sheets/reload", async (_, res) => {
   await loadSheets();
   res.json({ ok: true, reloaded: true, at: SHEETS.loaded_at });
@@ -156,6 +204,18 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: "/twilio-media-stream" });
 
 wss.on("connection", (twilioWs, req) => {
+  RUNTIME.ws_connections += 1;
+  RUNTIME.last_ws_conn_at = new Date().toISOString();
+
+  // ALWAYS log: if you don't see this, Twilio isn't reaching this server/path
+  always("WS connection", {
+    at: RUNTIME.last_ws_conn_at,
+    ip: req?.socket?.remoteAddress || "?",
+    ua: req?.headers?.["user-agent"] || "?",
+    url: req?.url || "/twilio-media-stream",
+    total_ws_connections: RUNTIME.ws_connections
+  });
+
   // ---- Minimal critical fix:
   // Twilio starts sending "media" immediately. OpenAI may still be CONNECTING.
   // We buffer audio until OpenAI websocket is OPEN, and we never send on CONNECTING.
@@ -294,6 +354,7 @@ wss.on("connection", (twilioWs, req) => {
   });
 
   openaiWs.on("error", (e) => {
+    RUNTIME.openai_errors += 1;
     error(`[${connTag}] OpenAI websocket error`, e?.message || e);
     try {
       twilioWs.close();
@@ -301,6 +362,7 @@ wss.on("connection", (twilioWs, req) => {
   });
 
   openaiWs.on("close", () => {
+    RUNTIME.openai_closed += 1;
     debug(`[${connTag}] OpenAI closed`);
     maybePrintStats(true);
     try {
@@ -323,11 +385,16 @@ wss.on("connection", (twilioWs, req) => {
       return;
     }
     if (msg.type === "session.created" || msg.type === "session.updated") {
-      debug(`[${connTag}] OpenAI ${msg.type}`, msg.session ? {
-        voice: msg.session.voice,
-        input_audio_format: msg.session.input_audio_format,
-        output_audio_format: msg.session.output_audio_format
-      } : msg);
+      debug(
+        `[${connTag}] OpenAI ${msg.type}`,
+        msg.session
+          ? {
+              voice: msg.session.voice,
+              input_audio_format: msg.session.input_audio_format,
+              output_audio_format: msg.session.output_audio_format
+            }
+          : msg
+      );
       return;
     }
 
@@ -414,6 +481,7 @@ wss.on("connection", (twilioWs, req) => {
   });
 
   twilioWs.on("error", (e) => {
+    RUNTIME.ws_errors += 1;
     error(`[${connTag}] Twilio websocket error`, e?.message || e);
     maybePrintStats(true);
     try {
@@ -422,6 +490,8 @@ wss.on("connection", (twilioWs, req) => {
   });
 
   twilioWs.on("close", () => {
+    RUNTIME.ws_closed += 1;
+    RUNTIME.last_ws_close_at = new Date().toISOString();
     debug(`[${connTag}] Twilio closed`);
     maybePrintStats(true);
     try {
@@ -436,4 +506,16 @@ wss.on("connection", (twilioWs, req) => {
 server.listen(PORT, () => {
   log(`GilSport VoiceBot running on port ${PORT}`);
   loadSheets();
+
+  // Always log key startup facts (safe)
+  always("BOOT", {
+    at: RUNTIME.booted_at,
+    port: PORT,
+    MB_DEBUG,
+    has_OPENAI_API_KEY: Boolean(OPENAI_API_KEY),
+    OPENAI_REALTIME_MODEL,
+    OPENAI_VOICE,
+    has_GSHEET_ID: Boolean(GSHEET_ID),
+    has_GOOGLE_SERVICE_ACCOUNT_JSON_B64: Boolean(GOOGLE_SERVICE_ACCOUNT_JSON_B64)
+  });
 });
