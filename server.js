@@ -7,12 +7,12 @@ require("dotenv").config();
 
 const express = require("express");
 const http = require("http");
+const https = require("https"); // שימוש במודול מובנה במקום axios
 const WebSocket = require("ws");
 const { google } = require("googleapis");
-const axios = require("axios");
 
 // --------------------------------------------------
-// Helpers & Env
+// Helpers
 // --------------------------------------------------
 const envNum = (k, d) => {
   const v = Number(process.env[k]);
@@ -22,6 +22,10 @@ const envBool = (k, d = false) =>
   ["1", "true", "yes", "on"].includes(String(process.env[k] || "").toLowerCase()) || d;
 
 const PORT = envNum("PORT", 10000);
+
+// --------------------------------------------------
+// ENV
+// --------------------------------------------------
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const OPENAI_REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview-2024-12-17";
 
@@ -48,7 +52,7 @@ const MB_TRANSCRIPTION_MODEL = process.env.MB_TRANSCRIPTION_MODEL || "whisper-1"
 const MB_LOG_RAW_OPENAI = envBool("MB_LOG_RAW_OPENAI", false);
 
 // --------------------------------------------------
-// Logging & Diagnostics
+// Logging
 // --------------------------------------------------
 const log = (...a) => console.log("[INFO]", ...a);
 const debug = (...a) => MB_DEBUG && console.log("[DEBUG]", ...a);
@@ -60,26 +64,84 @@ const preview = (s, n = 300) => {
   return t.length > n ? t.slice(0, n) + "..." : t;
 };
 
+// --------------------------------------------------
+// Runtime diagnostics
+// --------------------------------------------------
 const RUNTIME = {
   booted_at: new Date().toISOString(),
   ws_connections: 0,
   ws_closed: 0,
+  ws_errors: 0,
   openai_errors: 0,
-  last_ws_conn_at: null
+  openai_closed: 0,
+  last_ws_conn_at: null,
+  last_ws_close_at: null
 };
+
+// --------------------------------------------------
+// Webhook Caller (Native HTTPS)
+// --------------------------------------------------
+function callWebhook(payload) {
+  if (!MB_WEBHOOK_URL) return;
+  const data = JSON.stringify({ ...payload, timestamp: new Date().toISOString() });
+  const url = new URL(MB_WEBHOOK_URL);
+  
+  const options = {
+    hostname: url.hostname,
+    path: url.pathname + url.search,
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Content-Length": Buffer.byteLength(data)
+    }
+  };
+
+  const req = https.request(options);
+  req.on("error", (e) => error("Webhook failed", e.message));
+  req.write(data);
+  req.end();
+}
 
 // --------------------------------------------------
 // Sheets (Single Source of Truth - 6 Tabs)
 // --------------------------------------------------
 let SHEETS = {
   loaded_at: null,
-  prompts: {},
+  prompts: {}, 
   settings: {},
-  routingRules: [],
-  businessInfo: [],
-  salesScript: [],
-  supportScript: []
+  routing_rules: [],
+  business_info: [],
+  sales_script: [],
+  support_script: []
 };
+
+function parseTable(rows, keyColName, valColName) {
+  const out = {};
+  if (!rows || rows.length === 0) return out;
+  const headers = (rows[0] || []).map((h) => String(h || "").trim());
+  const keyIdx = headers.indexOf(keyColName);
+  const valIdx = headers.indexOf(valColName);
+  if (keyIdx === -1 || valIdx === -1) return out;
+
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i];
+    const k = String(r[keyIdx] || "").trim();
+    const v = String(r[valIdx] || "");
+    if (!k) continue;
+    out[k] = v;
+  }
+  return out;
+}
+
+function parseToObjects(rows) {
+  if (!rows || rows.length < 2) return [];
+  const headers = rows[0].map(h => String(h || "").trim());
+  return rows.slice(1).map(r => {
+    const obj = {};
+    headers.forEach((h, i) => { if(h) obj[h] = r[i] || ""; });
+    return obj;
+  });
+}
 
 async function loadSheets() {
   if (!GSHEET_ID || !GOOGLE_SERVICE_ACCOUNT_JSON_B64) return;
@@ -92,149 +154,108 @@ async function loadSheets() {
     });
     const sheets = google.sheets({ version: "v4", auth });
 
-    const ranges = [
-      "SETTINGS!A:Z", "PROMPTS!A:Z", "ROUTING_RULES!A:Z", 
-      "BUSINESS_INFO!A:Z", "SALES_SCRIPT!A:Z", "SUPPORT_SCRIPT!A:Z"
-    ];
+    const res = await sheets.spreadsheets.values.batchGet({
+      spreadsheetId: GSHEET_ID,
+      ranges: ["PROMPTS!A:Z", "SETTINGS!A:Z", "ROUTING_RULES!A:Z", "BUSINESS_INFO!A:Z", "SALES_SCRIPT!A:Z", "SUPPORT_SCRIPT!A:Z"]
+    });
 
-    const res = await sheets.spreadsheets.values.batchGet({ spreadsheetId: GSHEET_ID, ranges });
-    const valueRanges = res.data.valueRanges || [];
+    const vrs = res.data.valueRanges || [];
+    const getRange = (name) => vrs.find(v => v.range.includes(name))?.values || [];
 
-    const getRows = (name) => (valueRanges.find(vr => (vr.range || "").includes(name))?.values || []);
-    
-    const parseMap = (rows) => {
-      const out = {};
-      if (rows.length < 2) return out;
-      const headers = rows[0];
-      for (let i = 1; i < rows.length; i++) {
-        const k = String(rows[i][0] || "").trim();
-        const v = String(rows[i][1] || "").trim();
-        if (k) out[k] = v;
-      }
-      return out;
-    };
+    SHEETS.prompts = parseTable(getRange("PROMPTS"), "prompt_id", "content_he");
+    SHEETS.settings = parseTable(getRange("SETTINGS"), "key", "value");
+    SHEETS.routing_rules = parseToObjects(getRange("ROUTING_RULES"));
+    SHEETS.business_info = parseToObjects(getRange("BUSINESS_INFO"));
+    SHEETS.sales_script = parseToObjects(getRange("SALES_SCRIPT"));
+    SHEETS.support_script = parseToObjects(getRange("SUPPORT_SCRIPT"));
 
-    const parseList = (rows) => {
-      if (rows.length < 2) return [];
-      const headers = rows[0];
-      return rows.slice(1).map(r => {
-        const obj = {};
-        headers.forEach((h, i) => { if (h) obj[h] = r[i] || ""; });
-        return obj;
-      });
-    };
-
-    SHEETS.settings = parseMap(getRows("SETTINGS"));
-    SHEETS.prompts = parseMap(getRows("PROMPTS"));
-    SHEETS.routingRules = parseList(getRows("ROUTING_RULES"));
-    SHEETS.businessInfo = parseList(getRows("BUSINESS_INFO"));
-    SHEETS.salesScript = parseList(getRows("SALES_SCRIPT"));
-    SHEETS.supportScript = parseList(getRows("SUPPORT_SCRIPT"));
-    
     SHEETS.loaded_at = new Date().toISOString();
-    log(`Sheets loaded successfully at ${SHEETS.loaded_at}`);
+    log(`Sheets loaded (6 tabs) at ${SHEETS.loaded_at}`);
   } catch (e) {
     error("Sheets load failed", e.message);
   }
 }
 
-const getPrompt = (id, fallback = "") => SHEETS.prompts[id] || fallback;
-const getSetting = (key, fallback = "") => SHEETS.settings[key] || fallback;
+const getPrompt = (id, fallback = "") => String(SHEETS.prompts[id] || fallback).trim();
+const getSetting = (key, fallback = "") => String(SHEETS.settings[key] || fallback).trim();
 
 // --------------------------------------------------
-// Webhook & Recording Logic
+// Decision Proxy Logic (No FSM)
 // --------------------------------------------------
-async function sendWebhook(payload) {
-  if (!MB_WEBHOOK_URL) return;
-  try {
-    const data = {
-      timestamp: new Date().toISOString(),
-      ...payload
-    };
-    debug("[WEBHOOK_SEND]", data.event);
-    await axios.post(MB_WEBHOOK_URL, data, { timeout: 5000 });
-  } catch (e) {
-    error("Webhook failed", e.message);
-  }
-}
-
-// --------------------------------------------------
-// Decision Proxy (Option B) - No FSM
-// --------------------------------------------------
-function getContextKnowledge(callerText) {
+function getKnowledgeInjection(callerText) {
   const text = (callerText || "").toLowerCase();
-  let contextInjection = "";
+  let injection = "";
 
-  // 1. Check Routing/Delivery
-  if (text.includes("משלוח") || text.includes("איפה ההזמנה") || text.includes("אספקה")) {
-    const deliveryPolicy = SHEETS.businessInfo.find(i => i.topic === "delivery")?.content || "";
-    contextInjection += `\nמידע על משלוחים: ${deliveryPolicy}. חשוב: אין לנו גישה לסטטוס חי בזמן אמת. אם מדובר באספקה להיום ואנחנו אחרי שעות הפעילות, תציעי להשאיר פרטים או תני מספרי מובילים אם יש במידע.`;
+  // Delivery / Routing Rules
+  if (text.includes("משלוח") || text.includes("איפה") || text.includes("הזמנה")) {
+    const biz = SHEETS.business_info.find(i => String(i.topic || "").includes("delivery"))?.content || "";
+    injection += `\nמידע משלוחים מהשיטס: ${biz}. חשוב: אין לנו גישה לסטטוס חי. אם מדובר באספקה להיום ואנחנו אחרי שעות הפעילות, מסרי מספרי מובילים (אם יש במידע) ואל תבטיחי בדיקה.`;
+  }
+  
+  // Support
+  if (text.includes("תקלה") || text.includes("בעיה") || text.includes("עזרה")) {
+    const support = SHEETS.support_script.map(s => `${s.issue}: ${s.solution}`).join(" | ");
+    if (support) injection += `\nפתרונות תמיכה מהשיטס: ${support}`;
   }
 
-  // 2. Check Support
-  if (text.includes("תמיכה") || text.includes("בעיה") || text.includes("תקלה")) {
-    const supportInfo = SHEETS.supportScript.map(s => `${s.issue}: ${s.solution}`).join("\n");
-    contextInjection += `\nמידע תמיכה: ${supportInfo}`;
-  }
-
-  // 3. Sales/Products
-  if (text.includes("מחיר") || text.includes("קנייה") || text.includes("מעוניין")) {
-    const salesInfo = SHEETS.salesScript.map(s => `${s.product}: ${s.pitch}`).join("\n");
-    contextInjection += `\nמידע מכירות: ${salesInfo}`;
-  }
-
-  return contextInjection;
+  return injection;
 }
 
 // --------------------------------------------------
-// Express & Server Start
+// Express
 // --------------------------------------------------
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 
+app.get("/health", (_, res) => res.json({ ok: true, sheets: SHEETS.loaded_at }));
+
 app.post("/twilio-voice", (req, res) => {
   const host = req.headers.host;
   const wsUrl = `wss://${host}/twilio-media-stream`;
   res.type("text/xml").send(`
-    <Response>
-      <Connect>
-        <Stream url="${wsUrl}">
-          <Parameter name="caller" value="${req.body.From || ""}" />
-          <Parameter name="called" value="${req.body.To || ""}" />
-        </Stream>
-      </Connect>
-    </Response>`.trim());
+<Response>
+  <Connect>
+    <Stream url="${wsUrl}">
+      <Parameter name="caller" value="${req.body.From || ""}" />
+      <Parameter name="called" value="${req.body.To || ""}" />
+    </Stream>
+  </Connect>
+</Response>`.trim());
 });
 
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: "/twilio-media-stream" });
 
 // --------------------------------------------------
-// WebSocket (The Bridge)
+// WebSocket (Twilio <-> OpenAI)
 // --------------------------------------------------
 wss.on("connection", (twilioWs, req) => {
   RUNTIME.ws_connections += 1;
   RUNTIME.last_ws_conn_at = new Date().toISOString();
-  
-  const connTag = `conn_${Date.now().toString(36)}`;
+
   let twilioStreamSid = null;
+  let callerNum = "";
+  let calledNum = "";
   let openaiReady = false;
   let awaitingResponse = false;
   let pendingResponseRequest = false;
-  let callAbandoned = true; // Default to true until response.done or clean close
-  let callerId = "";
-  let calledId = "";
-  
-  let lastCallerText = "";
-  let fullTranscript = [];
+  let hasSpokenToBot = false; // To distinguish between active calls and instant hangups
+  let lastCallerFinal = "";
+  let transcript = [];
 
-  const openaiWs = new WebSocket(`wss://api.openai.com/v1/realtime?model=${OPENAI_REALTIME_MODEL}`, {
+  const connTag = `conn_${Date.now().toString(36)}`;
+
+  let openaiWs = new WebSocket(`wss://api.openai.com/v1/realtime?model=${OPENAI_REALTIME_MODEL}`, {
     headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "OpenAI-Beta": "realtime=v1" }
   });
 
-  const safeSendOpenAI = (obj) => {
-    if (openaiWs.readyState === WebSocket.OPEN) openaiWs.send(JSON.stringify(obj));
+  const safeOpenAISend = (obj) => {
+    if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+      openaiWs.send(JSON.stringify(obj));
+      return true;
+    }
+    return false;
   };
 
   const requestAssistantResponse = (reason = "") => {
@@ -244,64 +265,77 @@ wss.on("connection", (twilioWs, req) => {
     }
     awaitingResponse = true;
     pendingResponseRequest = false;
-    safeSendOpenAI({ type: "response.create", response: { modalities: ["audio", "text"] } });
+    safeOpenAISend({ type: "response.create", response: { modalities: ["audio", "text"] } });
   };
 
   openaiWs.on("open", async () => {
-    debug(`[${connTag}] OpenAI Connected`);
     openaiReady = true;
     if (!SHEETS.loaded_at) await loadSheets();
 
-    const masterPrompt = getPrompt("MASTER_PROMPT", "את נטע מגיל ספורט. דברי קצר ומהיר.");
+    const masterPrompt = getPrompt("MASTER_PROMPT", "את נטע מגיל ספורט. קצרה, קלילה, עוזרת.");
     const openingScript = getSetting("OPENING_SCRIPT", "שלום, מדברת נטע מגיל ספורט.");
 
-    safeSendOpenAI({
+    safeOpenAISend({
       type: "session.update",
       session: {
+        modalities: ["audio", "text"],
         voice: OPENAI_VOICE,
-        instructions: masterPrompt,
         input_audio_transcription: { model: MB_TRANSCRIPTION_MODEL },
-        turn_detection: { type: "server_vad", threshold: MB_VAD_THRESHOLD, silence_duration_ms: MB_VAD_SILENCE_MS }
+        turn_detection: {
+          type: "server_vad",
+          threshold: MB_VAD_THRESHOLD,
+          silence_duration_ms: MB_VAD_SILENCE_MS,
+          prefix_padding_ms: MB_VAD_PREFIX_MS
+        },
+        instructions: masterPrompt
       }
     });
 
-    // Opening Script (Verbatim)
+    // Initial Greeting
     awaitingResponse = true;
-    safeSendOpenAI({
+    safeOpenAISend({
       type: "response.create",
       response: {
-        instructions: `תגידי עכשיו בדיוק: ${openingScript}. אל תוסיפי כלום.`,
-        modalities: ["audio", "text"]
+        modalities: ["audio", "text"],
+        instructions: `תגידי בדיוק: ${openingScript}`
       }
     });
 
-    sendWebhook({ event: "call_started", callSid: twilioStreamSid, caller: callerId });
+    callWebhook({ event: "call_started", callSid: twilioStreamSid, caller: callerNum });
   });
 
   openaiWs.on("message", (data) => {
     const msg = JSON.parse(data.toString());
 
     if (msg.type === "response.audio_transcript.done") {
-      const text = msg.transcript;
-      fullTranscript.push(`Bot: ${text}`);
-      always(`[BOT][${connTag}]`, text);
+      const t = String(msg.transcript || "").trim();
+      if (t) {
+        transcript.push(`Bot: ${t}`);
+        always(`[BOT][${connTag}]`, t);
+      }
     }
 
     if (msg.type === "conversation.item.input_audio_transcription.completed") {
-      const text = msg.transcript?.trim();
-      if (text) {
-        lastCallerText = text;
-        fullTranscript.push(`User: ${text}`);
-        always(`[CALLER][${connTag}]`, text);
-        
-        // Proxy Decision Layer: Inject sheet knowledge based on caller text
-        const extraContext = getContextKnowledge(text);
-        if (extraContext) {
-          safeSendOpenAI({
+      const t = String(msg.transcript || "").trim();
+      if (t) {
+        lastCallerFinal = t;
+        transcript.push(`User: ${t}`);
+        always(`[CALLER][${connTag}]`, t);
+        hasSpokenToBot = true;
+
+        // Inject Knowledge based on Sheets
+        const injection = getKnowledgeInjection(t);
+        if (injection) {
+          safeOpenAISend({
             type: "conversation.item.create",
-            item: { type: "message", role: "system", content: [{ type: "input_text", text: extraContext }] }
+            item: {
+              type: "message",
+              role: "system",
+              content: [{ type: "input_text", text: injection }]
+            }
           });
         }
+        requestAssistantResponse("caller_transcript_done");
       }
     }
 
@@ -311,7 +345,6 @@ wss.on("connection", (twilioWs, req) => {
 
     if (msg.type === "response.done") {
       awaitingResponse = false;
-      callAbandoned = false; // Successfully completed at least one turn
       if (pendingResponseRequest) {
         pendingResponseRequest = false;
         requestAssistantResponse("pending_after_done");
@@ -319,7 +352,11 @@ wss.on("connection", (twilioWs, req) => {
     }
 
     if (msg.type === "response.audio.delta" && twilioStreamSid) {
-      twilioWs.send(JSON.stringify({ event: "media", streamSid: twilioStreamSid, media: { payload: msg.delta } }));
+      twilioWs.send(JSON.stringify({
+        event: "media",
+        streamSid: twilioStreamSid,
+        media: { payload: msg.delta }
+      }));
     }
   });
 
@@ -327,55 +364,41 @@ wss.on("connection", (twilioWs, req) => {
     const msg = JSON.parse(data.toString());
     if (msg.event === "start") {
       twilioStreamSid = msg.start.streamSid;
-      callerId = msg.start.customParameters?.caller || "";
-      calledId = msg.start.customParameters?.called || "";
-      always(`[TWILIO_START][${connTag}]`, twilioStreamSid);
+      callerNum = msg.start.customParameters?.caller || "";
+      calledNum = msg.start.customParameters?.called || "";
     }
     if (msg.event === "media" && openaiReady) {
-      safeSendOpenAI({ type: "input_audio_buffer.append", audio: msg.media.payload });
+      safeOpenAISend({ type: "input_audio_buffer.append", audio: msg.media.payload });
     }
     if (msg.event === "stop") {
-      openaiWs.close();
+      if (openaiWs) openaiWs.close();
     }
   });
 
-  const cleanup = () => {
-    if (callAbandoned) {
-      sendWebhook({
-        event: "call_abandoned",
-        callSid: twilioStreamSid,
-        caller: callerId,
-        caller_last_utterance: lastCallerText,
-        transcript: fullTranscript.join("\n"),
-        recording_url_public: `https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_ACCOUNT_SID}/Recordings/${twilioStreamSid}` 
-      });
+  const onCallEnd = () => {
+    const recUrl = `https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_ACCOUNT_SID}/Recordings/${twilioStreamSid}`;
+    const commonPayload = {
+      callSid: twilioStreamSid,
+      caller: callerNum,
+      called: calledNum,
+      caller_last_utterance: lastCallerFinal,
+      transcript: transcript.join("\n"),
+      recording_url_public: recUrl
+    };
+
+    if (!hasSpokenToBot && transcript.length < 2) {
+      callWebhook({ ...commonPayload, event: "call_abandoned" });
     } else {
-      sendWebhook({
-        event: "call_ended",
-        callSid: twilioStreamSid,
-        caller: callerId,
-        caller_last_utterance: lastCallerText,
-        transcript: fullTranscript.join("\n"),
-        recording_url_public: `https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_ACCOUNT_SID}/Recordings/${twilioStreamSid}`
-      });
+      callWebhook({ ...commonPayload, event: "call_ended" });
     }
   };
 
-  twilioWs.on("close", cleanup);
+  twilioWs.on("close", onCallEnd);
   openaiWs.on("close", () => twilioWs.close());
   openaiWs.on("error", (e) => error("OpenAI Error", e.message));
 });
 
-// --------------------------------------------------
-// Health & Diagnostic Endpoints
-// --------------------------------------------------
-app.get("/health", (req, res) => res.json({ ok: true, sheets_loaded: SHEETS.loaded_at }));
-app.post("/sheets/reload", async (req, res) => {
-  await loadSheets();
-  res.json({ ok: true, at: SHEETS.loaded_at });
-});
-
 server.listen(PORT, () => {
-  log(`Neta VoiceBot running on port ${PORT}`);
+  log(`GilSport VoiceBot running on port ${PORT}`);
   loadSheets();
 });
