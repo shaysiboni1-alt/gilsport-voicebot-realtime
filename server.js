@@ -23,7 +23,7 @@ const envBool = (k, d = false) =>
 const PORT = envNum("PORT", 10000);
 
 // --------------------------------------------------
-// ENV (NO EARLY FAILS ❗)
+// ENV
 // --------------------------------------------------
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const OPENAI_REALTIME_MODEL =
@@ -39,13 +39,6 @@ const MB_DEBUG = envBool("MB_DEBUG", false);
 const MB_VAD_THRESHOLD = envNum("MB_VAD_THRESHOLD", 0.65);
 const MB_VAD_SILENCE_MS = envNum("MB_VAD_SILENCE_MS", 900);
 const MB_VAD_PREFIX_MS = envNum("MB_VAD_PREFIX_MS", 200);
-const MB_NO_BARGE_TAIL_MS = envNum("MB_NO_BARGE_TAIL_MS", 1600);
-const MB_ALLOW_BARGE_IN = envBool("MB_ALLOW_BARGE_IN", false);
-
-const MB_IDLE_WARNING_MS = envNum("MB_IDLE_WARNING_MS", 40000);
-const MB_IDLE_HANGUP_MS = envNum("MB_IDLE_HANGUP_MS", 90000);
-
-const MB_MAX_CALL_MS = envNum("MB_MAX_CALL_MS", 5 * 60 * 1000);
 
 // --------------------------------------------------
 // Logging
@@ -55,7 +48,7 @@ const debug = (...a) => MB_DEBUG && console.log("[DEBUG]", ...a);
 const error = (...a) => console.error("[ERROR]", ...a);
 
 // --------------------------------------------------
-// Sheets (Single Source of Truth)
+// Sheets
 // --------------------------------------------------
 let SHEETS = {
   loaded_at: null,
@@ -149,11 +142,23 @@ app.post("/twilio-voice", (req, res) => {
 const server = http.createServer(app);
 
 // --------------------------------------------------
-// WebSocket (Twilio <-> OpenAI)
+// WebSocket – FIXED (Upgrade handled manually)
 // --------------------------------------------------
-const wss = new WebSocket.Server({ server, path: "/twilio-media-stream" });
+const wss = new WebSocket.Server({ noServer: true });
+
+server.on("upgrade", (req, socket, head) => {
+  if (req.url === "/twilio-media-stream") {
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      wss.emit("connection", ws, req);
+    });
+  } else {
+    socket.destroy();
+  }
+});
 
 wss.on("connection", (twilioWs) => {
+  log("[WS] Twilio connected");
+
   if (!OPENAI_API_KEY) {
     error("OPENAI_API_KEY missing — closing call");
     return twilioWs.close();
@@ -185,10 +190,10 @@ wss.on("connection", (twilioWs) => {
           silence_duration_ms: MB_VAD_SILENCE_MS,
           prefix_padding_ms: MB_VAD_PREFIX_MS
         },
-        instructions:
-          getPrompt("MASTER_PROMPT",
-            "אתם עוזרת קולית בשם נטע עבור גיל ספורט. דברו קצר, קליל וברור."
-          )
+        instructions: getPrompt(
+          "MASTER_PROMPT",
+          "אתם עוזרת קולית בשם נטע עבור גיל ספורט. דברו קצר, קליל וברור."
+        )
       }
     }));
 
@@ -197,7 +202,10 @@ wss.on("connection", (twilioWs) => {
       item: {
         type: "message",
         role: "user",
-        content: [{ type: "input_text", text: getPrompt("OPENING_SCRIPT", "שלום, מדברת נטע מגיל ספורט.") }]
+        content: [{
+          type: "input_text",
+          text: getPrompt("OPENING_SCRIPT", "שלום, מדברת נטע מגיל ספורט.")
+        }]
       }
     }));
 
