@@ -103,8 +103,26 @@ const RUNTIME = {
 // --------------------------------------------------
 let SHEETS = {
   loaded_at: null,
-  prompts: {}
+  prompts: {},   // from PROMPTS tab (prompt_id -> content_he)
+  settings: {}   // from SETTINGS tab (key -> value)
 };
+
+function parseTable(rows, keyColName, valColName) {
+  const out = {};
+  const headers = (rows.shift() || []).map((h) => String(h || "").trim());
+  const keyIdx = headers.indexOf(keyColName);
+  const valIdx = headers.indexOf(valColName);
+
+  if (keyIdx === -1 || valIdx === -1) return out;
+
+  for (const r of rows) {
+    const k = String(r[keyIdx] || "").trim();
+    const v = String(r[valIdx] || "");
+    if (!k) continue;
+    out[k] = v;
+  }
+  return out;
+}
 
 async function loadSheets() {
   if (!GSHEET_ID || !GOOGLE_SERVICE_ACCOUNT_JSON_B64) return;
@@ -122,29 +140,46 @@ async function loadSheets() {
 
     const sheets = google.sheets({ version: "v4", auth });
 
-    const res = await sheets.spreadsheets.values.get({
+    // ✅ load PROMPTS + SETTINGS in one call
+    const res = await sheets.spreadsheets.values.batchGet({
       spreadsheetId: GSHEET_ID,
-      range: "PROMPTS!A:Z"
+      ranges: ["PROMPTS!A:Z", "SETTINGS!A:Z"]
     });
 
-    const rows = res.data.values || [];
-    const headers = rows.shift() || [];
+    const valueRanges = res.data.valueRanges || [];
+    const promptsRange = valueRanges.find((vr) => (vr.range || "").startsWith("PROMPTS!"));
+    const settingsRange = valueRanges.find((vr) => (vr.range || "").startsWith("SETTINGS!"));
 
+    const promptsRows = (promptsRange?.values || []).slice();
+    const settingsRows = (settingsRange?.values || []).slice();
+
+    // PROMPTS: expects columns prompt_id + content_he
     const prompts = {};
-    for (const r of rows) {
-      const row = {};
-      headers.forEach((h, i) => (row[h] = r[i] || ""));
-      if (row.prompt_id && row.content_he) {
-        prompts[String(row.prompt_id).trim()] = String(row.content_he);
+    if (promptsRows.length) {
+      const headers = promptsRows.shift() || [];
+      for (const r of promptsRows) {
+        const row = {};
+        headers.forEach((h, i) => (row[h] = r[i] || ""));
+        if (row.prompt_id && row.content_he) {
+          prompts[String(row.prompt_id).trim()] = String(row.content_he);
+        }
       }
     }
 
+    // SETTINGS: expects columns key + value
+    const settings = settingsRows.length
+      ? parseTable(settingsRows, "key", "value")
+      : {};
+
     SHEETS = {
       loaded_at: new Date().toISOString(),
-      prompts
+      prompts,
+      settings
     };
 
-    log(`Sheets loaded (${Object.keys(prompts).length} prompts)`);
+    log(
+      `Sheets loaded (prompts=${Object.keys(prompts).length}, settings=${Object.keys(settings).length})`
+    );
   } catch (e) {
     error("Sheets load failed", e.message);
   }
@@ -152,6 +187,9 @@ async function loadSheets() {
 
 const getPrompt = (id, fallback = "") =>
   String(SHEETS.prompts[id] || fallback).trim();
+
+const getSetting = (key, fallback = "") =>
+  String(SHEETS.settings[key] || fallback).trim();
 
 // --------------------------------------------------
 // Express
@@ -164,7 +202,8 @@ app.get("/health", (_, res) => {
   res.json({
     ok: true,
     sheets_loaded_at: SHEETS.loaded_at,
-    prompts: Object.keys(SHEETS.prompts).length
+    prompts: Object.keys(SHEETS.prompts).length,
+    settings: Object.keys(SHEETS.settings).length
   });
 });
 
@@ -183,19 +222,23 @@ app.get("/diag/env", (_, res) => {
     MB_TRANSCRIPTION_MODEL,
     MB_LOG_RAW_OPENAI,
     sheets_loaded_at: SHEETS.loaded_at,
-    prompts_count: Object.keys(SHEETS.prompts).length
+    prompts_count: Object.keys(SHEETS.prompts).length,
+    settings_count: Object.keys(SHEETS.settings).length
   });
 });
 
 app.get("/diag/prompts", (_, res) => {
   const keys = Object.keys(SHEETS.prompts).sort();
+  const sKeys = Object.keys(SHEETS.settings).sort();
   res.json({
     ok: true,
     sheets_loaded_at: SHEETS.loaded_at,
     prompts_count: keys.length,
+    settings_count: sKeys.length,
     prompt_ids: keys,
-    opening_preview: preview(getPrompt("OPENING_SCRIPT", "")),
-    master_preview: preview(getPrompt("MASTER_PROMPT", ""))
+    setting_keys: sKeys,
+    opening_from_settings_preview: preview(getSetting("OPENING_SCRIPT", "")),
+    master_from_prompts_preview: preview(getPrompt("MASTER_PROMPT", ""))
   });
 });
 
@@ -252,27 +295,25 @@ wss.on("connection", (twilioWs, req) => {
 
   const connTag = `conn_${Date.now().toString(36)}_${Math.random().toString(16).slice(2, 6)}`;
 
-  // Clear transcript log buffers
-  let callerFinalQueue = [];
-  let botTextBuffer = "";
+  let lastCallerFinal = "";
   let lastBotFinal = "";
 
   const printCallerFinal = (text) => {
     const t = String(text || "").trim();
     if (!t) return;
+    if (t === lastCallerFinal) return;
+    lastCallerFinal = t;
     always(`[CALLER][${connTag}]`, t);
   };
 
   const printBotFinal = (text) => {
     const t = String(text || "").trim();
     if (!t) return;
-    // avoid duplicate spam
     if (t === lastBotFinal) return;
     lastBotFinal = t;
     always(`[BOT][${connTag}]`, t);
   };
 
-  // NOTE: declare openaiWs variable early so closures can reference safely
   let openaiWs = null;
 
   const safeOpenAISend = (obj) => {
@@ -325,20 +366,25 @@ wss.on("connection", (twilioWs, req) => {
     debug(`[${connTag}] OpenAI connected`);
     openaiReady = true;
 
-    // Ensure sheets loaded before prompts
+    // Ensure sheets loaded before config
     if (!SHEETS.loaded_at) {
       debug(`[${connTag}] Sheets not loaded yet. Loading now...`);
       await loadSheets();
     }
 
+    // ✅ Master prompt stays in PROMPTS
     const masterPrompt = getPrompt(
       "MASTER_PROMPT",
       "אתם עוזרת קולית בשם נטע עבור גיל ספורט. דברו קצר, קליל וברור."
     );
-    const openingScript = getPrompt("OPENING_SCRIPT", "שלום, מדברת נטע מגיל ספורט.");
 
-    always(`[${connTag}] PROMPTS`, {
+    // ✅ Opening script comes from SETTINGS (Single Source of Truth)
+    const openingScript = getSetting("OPENING_SCRIPT", "שלום, מדברת נטע מגיל ספורט.");
+
+    always(`[${connTag}] SOURCES`, {
       sheets_loaded_at: SHEETS.loaded_at,
+      opening_from: "SETTINGS.OPENING_SCRIPT",
+      master_from: "PROMPTS.MASTER_PROMPT",
       opening_preview: preview(openingScript, 220),
       master_preview: preview(masterPrompt, 220)
     });
@@ -364,20 +410,16 @@ wss.on("connection", (twilioWs, req) => {
 
     safeOpenAISend({ type: "session.update", session });
 
-    // Opening as "user" message to trigger assistant response
-    safeOpenAISend({
-      type: "conversation.item.create",
-      item: {
-        type: "message",
-        role: "user",
-        content: [{ type: "input_text", text: openingScript }]
-      }
-    });
-
-    // Ask for response with both audio+text
+    // ✅ Make the bot SAY the opening verbatim (not as "user" trigger)
+    // We do a one-time response.create with override instructions.
     safeOpenAISend({
       type: "response.create",
-      response: { modalities: ["audio", "text"] }
+      response: {
+        modalities: ["audio", "text"],
+        instructions:
+          `תגידי עכשיו בדיוק את המשפט הבא מילה במילה, ללא תוספות וללא שאלות:\n` +
+          `${openingScript}`
+      }
     });
 
     // Flush buffered audio
@@ -412,11 +454,9 @@ wss.on("connection", (twilioWs, req) => {
       return;
     }
 
-    // RAW dump when needed (to discover exact event types on YOUR account)
+    // RAW dump when needed
     if (MB_LOG_RAW_OPENAI) {
-      // keep it readable: type + tiny payload
       const small = { type: msg.type, event_id: msg.event_id };
-      // attach a few known fields if exist
       if (msg.delta) small.delta_len = String(msg.delta).length;
       if (msg.transcript) small.transcript = preview(msg.transcript, 200);
       if (msg.text) small.text = preview(msg.text, 200);
@@ -429,73 +469,39 @@ wss.on("connection", (twilioWs, req) => {
     }
 
     // -----------------------------
-    // BOT TEXT (robust)
+    // BOT FINAL (clean)
     // -----------------------------
-    // Some accounts emit text deltas:
-    if (MB_LOG_TRANSCRIPTS && msg.type === "response.text.delta" && msg.delta) {
-      botTextBuffer += String(msg.delta);
+    if (MB_LOG_TRANSCRIPTS && msg.type === "response.audio_transcript.done") {
+      const t = String(msg.transcript || "").trim();
+      if (t) printBotFinal(t);
       return;
     }
 
-    // Some emit final text as done:
-    if (MB_LOG_TRANSCRIPTS && (msg.type === "response.text.done" || msg.type === "response.done")) {
-      const finalText =
-        (msg?.response?.output_text && String(msg.response.output_text)) ||
-        botTextBuffer ||
+    // -----------------------------
+    // CALLER FINAL (robust across event names)
+    // We only log completed/done-like events to keep logs clean.
+    // -----------------------------
+    if (MB_LOG_TRANSCRIPTS) {
+      const type = String(msg.type || "");
+      const doneLike = type.includes("done") || type.includes("completed");
+
+      // common spots where transcript may appear
+      const possible =
+        msg.transcript ||
+        msg.text ||
+        msg?.item?.content?.[0]?.transcript ||
+        msg?.item?.content?.[0]?.text ||
         "";
-      if (finalText.trim()) printBotFinal(finalText.trim());
-      botTextBuffer = "";
-      return;
-    }
 
-    // Some emit assistant message items (super common):
-    // conversation.item.created / conversation.item.completed / conversation.item.updated
-    if (
-      MB_LOG_TRANSCRIPTS &&
-      (msg.type === "conversation.item.created" ||
-        msg.type === "conversation.item.completed" ||
-        msg.type === "conversation.item.updated") &&
-      msg.item &&
-      msg.item.type === "message"
-    ) {
-      const role = msg.item.role;
-      const content = Array.isArray(msg.item.content) ? msg.item.content : [];
-      const joined = content
-        .map((p) => p?.text || p?.transcript || "")
-        .filter(Boolean)
-        .join(" ")
-        .trim();
+      const isInputTranscript =
+        type.includes("input_audio_transcription") ||
+        type.includes("input_audio_transcript") ||
+        type.includes("conversation.item.input_audio_transcription");
 
-      if (joined) {
-        if (role === "assistant") printBotFinal(joined);
-        if (role === "user") printCallerFinal(joined);
+      if (doneLike && isInputTranscript && possible) {
+        printCallerFinal(String(possible).trim());
+        return;
       }
-      return;
-    }
-
-    // -----------------------------
-    // CALLER TRANSCRIPTION (robust)
-    // -----------------------------
-    // Common transcription events (varies by model/version):
-    const t = msg.type || "";
-    const possibleTranscript =
-      msg.transcript ||
-      msg.text ||
-      msg?.item?.content?.[0]?.transcript ||
-      msg?.item?.content?.[0]?.text ||
-      "";
-
-    const isCallerTranscriptEvent =
-      t.includes("input_audio_transcription") ||
-      t.includes("input_audio_transcript") ||
-      t.includes("conversation.item.input_audio_transcription");
-
-    // We log ONLY when it's "completed/done" to be clean
-    const isDoneLike = t.includes("completed") || t.includes("done");
-
-    if (MB_LOG_TRANSCRIPTS && isCallerTranscriptEvent && isDoneLike && possibleTranscript) {
-      printCallerFinal(String(possibleTranscript).trim());
-      return;
     }
 
     // -----------------------------
@@ -515,7 +521,6 @@ wss.on("connection", (twilioWs, req) => {
 
   twilioWs.on("message", (data) => {
     let msg;
-
     try {
       msg = JSON.parse(data.toString());
     } catch (e) {
@@ -525,12 +530,15 @@ wss.on("connection", (twilioWs, req) => {
 
     if (msg.event === "start" && msg.start?.streamSid) {
       twilioStreamSid = msg.start.streamSid;
-      always(`[TWILIO_START][${connTag}]`, JSON.stringify({
-        streamSid: twilioStreamSid,
-        callSid: msg.start?.callSid,
-        tracks: msg.start?.tracks,
-        mediaFormat: msg.start?.mediaFormat
-      }));
+      always(
+        `[TWILIO_START][${connTag}]`,
+        JSON.stringify({
+          streamSid: twilioStreamSid,
+          callSid: msg.start?.callSid,
+          tracks: msg.start?.tracks,
+          mediaFormat: msg.start?.mediaFormat
+        })
+      );
       return;
     }
 
