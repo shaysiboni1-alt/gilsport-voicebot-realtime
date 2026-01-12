@@ -95,7 +95,7 @@ async function loadSheets() {
 
     log(`Sheets loaded (${Object.keys(prompts).length} prompts)`);
   } catch (e) {
-    error("Sheets load failed", e.message);
+    error("Sheets load failed", e?.message || String(e));
   }
 }
 
@@ -122,7 +122,7 @@ app.post("/sheets/reload", async (_, res) => {
   res.json({ ok: true, reloaded: true, at: SHEETS.loaded_at });
 });
 
-// Twilio Voice → Media Stream
+// OPTIONAL: אם אי פעם תחזיר TwiML מהרנדר עצמו
 app.post("/twilio-voice", (req, res) => {
   const host = req.headers.host;
   const wsUrl = `wss://${host}/twilio-media-stream`;
@@ -142,7 +142,7 @@ app.post("/twilio-voice", (req, res) => {
 const server = http.createServer(app);
 
 // --------------------------------------------------
-// WebSocket – FIXED (Upgrade handled manually)
+// WebSocket – Upgrade handled manually
 // --------------------------------------------------
 const wss = new WebSocket.Server({ noServer: true });
 
@@ -159,13 +159,21 @@ server.on("upgrade", (req, socket, head) => {
 wss.on("connection", (twilioWs) => {
   log("[WS] Twilio connected");
 
+  let twilioStreamSid = null;
+  let openaiWs = null;
+
+  const safeClose = () => {
+    try { twilioWs.close(); } catch {}
+    try { openaiWs?.close(); } catch {}
+  };
+
   if (!OPENAI_API_KEY) {
     error("OPENAI_API_KEY missing — closing call");
-    return twilioWs.close();
+    return safeClose();
   }
 
-  const openaiWs = new WebSocket(
-    `wss://api.openai.com/v1/realtime?model=${OPENAI_REALTIME_MODEL}`,
+  openaiWs = new WebSocket(
+    `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_REALTIME_MODEL)}`,
     {
       headers: {
         Authorization: `Bearer ${OPENAI_API_KEY}`,
@@ -177,6 +185,7 @@ wss.on("connection", (twilioWs) => {
   openaiWs.on("open", () => {
     debug("OpenAI connected");
 
+    // session
     openaiWs.send(JSON.stringify({
       type: "session.update",
       session: {
@@ -197,6 +206,7 @@ wss.on("connection", (twilioWs) => {
       }
     }));
 
+    // פתיח (כמו שהיה אצלך)
     openaiWs.send(JSON.stringify({
       type: "conversation.item.create",
       item: {
@@ -212,24 +222,83 @@ wss.on("connection", (twilioWs) => {
     openaiWs.send(JSON.stringify({ type: "response.create" }));
   });
 
+  openaiWs.on("close", () => {
+    debug("OpenAI closed");
+    safeClose();
+  });
+
+  openaiWs.on("error", (e) => {
+    error("OpenAI WS error", e?.message || String(e));
+    safeClose();
+  });
+
   twilioWs.on("message", (data) => {
-    const msg = JSON.parse(data.toString());
+    let msg;
+    try {
+      msg = JSON.parse(data.toString());
+    } catch (e) {
+      error("Twilio WS JSON parse failed", e?.message || String(e));
+      return;
+    }
+
+    if (msg.event === "start") {
+      twilioStreamSid = msg?.start?.streamSid || msg?.streamSid || null;
+      log("[WS] start", twilioStreamSid || "(no streamSid)");
+      return;
+    }
+
+    if (msg.event === "stop") {
+      log("[WS] stop");
+      return safeClose();
+    }
+
     if (msg.event === "media" && msg.media?.payload) {
-      openaiWs.send(JSON.stringify({
-        type: "input_audio_buffer.append",
-        audio: msg.media.payload
-      }));
+      if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+        openaiWs.send(JSON.stringify({
+          type: "input_audio_buffer.append",
+          audio: msg.media.payload
+        }));
+      }
     }
   });
 
+  twilioWs.on("close", () => {
+    debug("Twilio WS closed");
+    safeClose();
+  });
+
+  twilioWs.on("error", (e) => {
+    error("Twilio WS error", e?.message || String(e));
+    safeClose();
+  });
+
   openaiWs.on("message", (data) => {
-    const msg = JSON.parse(data.toString());
+    let msg;
+    try {
+      msg = JSON.parse(data.toString());
+    } catch (e) {
+      error("OpenAI JSON parse failed", e?.message || String(e));
+      return;
+    }
+
     if (msg.type === "response.audio.delta") {
-      twilioWs.send(JSON.stringify({
-        event: "media",
-        streamSid: msg.streamSid,
-        media: { payload: msg.delta }
-      }));
+      // חובה: להשתמש ב-streamSid של Twilio, לא של OpenAI
+      if (!twilioStreamSid) return;
+
+      try {
+        twilioWs.send(JSON.stringify({
+          event: "media",
+          streamSid: twilioStreamSid,
+          media: { payload: msg.delta }
+        }));
+      } catch (e) {
+        error("Failed sending audio to Twilio", e?.message || String(e));
+      }
+    }
+
+    // אופציונלי: לוג שקט רק לדיבאג
+    if (MB_DEBUG && msg.type && msg.type.startsWith("error")) {
+      debug("OpenAI msg", msg);
     }
   });
 });
