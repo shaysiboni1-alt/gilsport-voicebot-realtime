@@ -103,8 +103,8 @@ const RUNTIME = {
 // --------------------------------------------------
 let SHEETS = {
   loaded_at: null,
-  prompts: {},   // from PROMPTS tab (prompt_id -> content_he)
-  settings: {}   // from SETTINGS tab (key -> value)
+  prompts: {}, // from PROMPTS tab (prompt_id -> content_he)
+  settings: {} // from SETTINGS tab (key -> value)
 };
 
 function parseTable(rows, keyColName, valColName) {
@@ -167,9 +167,7 @@ async function loadSheets() {
     }
 
     // SETTINGS: expects columns key + value
-    const settings = settingsRows.length
-      ? parseTable(settingsRows, "key", "value")
-      : {};
+    const settings = settingsRows.length ? parseTable(settingsRows, "key", "value") : {};
 
     SHEETS = {
       loaded_at: new Date().toISOString(),
@@ -185,11 +183,8 @@ async function loadSheets() {
   }
 }
 
-const getPrompt = (id, fallback = "") =>
-  String(SHEETS.prompts[id] || fallback).trim();
-
-const getSetting = (key, fallback = "") =>
-  String(SHEETS.settings[key] || fallback).trim();
+const getPrompt = (id, fallback = "") => String(SHEETS.prompts[id] || fallback).trim();
+const getSetting = (key, fallback = "") => String(SHEETS.settings[key] || fallback).trim();
 
 // --------------------------------------------------
 // Express
@@ -314,19 +309,7 @@ wss.on("connection", (twilioWs, req) => {
     always(`[BOT][${connTag}]`, t);
   };
 
-  // To avoid spamming response.create
-  let awaitingResponse = false;
-  const requestAssistantResponse = () => {
-    if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN) return;
-    if (awaitingResponse) return;
-    awaitingResponse = true;
-
-    safeOpenAISend({
-      type: "response.create",
-      response: { modalities: ["audio", "text"] }
-    });
-  };
-
+  // NOTE: declare openaiWs variable early so closures can reference safely
   let openaiWs = null;
 
   const safeOpenAISend = (obj) => {
@@ -362,6 +345,32 @@ wss.on("connection", (twilioWs, req) => {
     } catch (_) {}
     return;
   }
+
+  // -----------------------------
+  // Anti-overlap: only ONE active response at a time
+  // -----------------------------
+  let awaitingResponse = false;
+  let pendingResponseRequest = false;
+
+  const requestAssistantResponse = (reason = "") => {
+    if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN) return;
+
+    // If a response is already running - remember we owe ONE more response after it's done
+    if (awaitingResponse) {
+      pendingResponseRequest = true;
+      debug(`[${connTag}] response.request queued (awaitingResponse=true) reason=${reason}`);
+      return;
+    }
+
+    awaitingResponse = true;
+    pendingResponseRequest = false;
+
+    debug(`[${connTag}] response.create (reason=${reason})`);
+    safeOpenAISend({
+      type: "response.create",
+      response: { modalities: ["audio", "text"] }
+    });
+  };
 
   debug(`[${connTag}] Creating OpenAI WS... model=${OPENAI_REALTIME_MODEL} voice=${OPENAI_VOICE}`);
 
@@ -425,6 +434,8 @@ wss.on("connection", (twilioWs, req) => {
 
     // ✅ Make the bot SAY the opening verbatim (one-time override)
     awaitingResponse = true;
+    pendingResponseRequest = false;
+
     safeOpenAISend({
       type: "response.create",
       response: {
@@ -512,7 +523,7 @@ wss.on("connection", (twilioWs, req) => {
       if (doneLike && isInputTranscript && possible) {
         printCallerFinal(String(possible).trim());
         // after we got user final, request assistant response (if not already)
-        requestAssistantResponse();
+        requestAssistantResponse("caller_transcript_done");
         return;
       }
     }
@@ -521,7 +532,7 @@ wss.on("connection", (twilioWs, req) => {
     // Turn boundary events (safe trigger)
     // -----------------------------
     if (msg.type === "input_audio_buffer.speech_stopped") {
-      requestAssistantResponse();
+      requestAssistantResponse("speech_stopped");
       return;
     }
 
@@ -530,6 +541,14 @@ wss.on("connection", (twilioWs, req) => {
     // -----------------------------
     if (msg.type === "response.done") {
       awaitingResponse = false;
+
+      // If something arrived while we were speaking - do exactly ONE next response
+      if (pendingResponseRequest) {
+        debug(`[${connTag}] response.done -> draining pendingResponseRequest`);
+        // drain once
+        pendingResponseRequest = false;
+        requestAssistantResponse("pending_after_done");
+      }
       return;
     }
 
