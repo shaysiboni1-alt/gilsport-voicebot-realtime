@@ -717,6 +717,20 @@ wss.on("connection", (twilioWs, req) => {
       /* ignore coupon lookup errors */
     }
 
+    // Always mention the caller's default phone number so the assistant suggests it first
+    try {
+      const callerNum = String(caller || "").trim();
+      if (callerNum) {
+        // remove non-digits and insert spaces so the model reads each digit separately
+        const spacedCaller = callerNum.replace(/\D/g, "").split("").join(" ");
+        parts.push(
+          `ברירת המחדל לחזרה אליכם היא למספר שממנו התקשרתם: ${spacedCaller}. הציעי לשאול אם נוח להשתמש במיספר הזה או אם יש מספר אחר. אל תמציאי מספרים.`
+        );
+      }
+    } catch (_) {
+      /* ignore caller number errors */
+    }
+
     // Include guardrails and routing prompts if available
     try {
       const ps = SHEETS.prompts || {};
@@ -881,7 +895,14 @@ wss.on("connection", (twilioWs, req) => {
         "אה, שלום",
         "אה שלום",
         "אה, שלום לך",
-        "אה שלום לך"
+        "אה שלום לך",
+        // English greetings and farewells to ignore
+        "hi",
+        "hello",
+        "bye",
+        "bye-bye",
+        "bye bye",
+        "bye, bye"
       ];
       // Remove greeting phrases from beginning
       for (const g of greetings) {
