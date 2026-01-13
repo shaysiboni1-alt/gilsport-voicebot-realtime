@@ -500,6 +500,10 @@ wss.on("connection", (twilioWs, req) => {
   // This prevents sending multiple assistant responses for the same caller final.
   let lastRequestedCallerFinal = "";
 
+  // Tracks whether we've heard caller speech that hasn't yet been responded to.
+  // Used with speech_stopped to ensure one response per caller turn.
+  let hasHeardCaller = false;
+
   // Speech segment tracking. Each time VAD reports speech stopped, we
   // increment currentSpeechSegmentIndex. lastRespondedSegmentIndex tracks the
   // segment index we have already responded to. This helps avoid multiple
@@ -882,6 +886,9 @@ wss.on("connection", (twilioWs, req) => {
     awaitingResponse = true;
     pendingResponseRequest = false;
 
+    // We've consumed the caller's speech for this segment; reset flag.
+    hasHeardCaller = false;
+
     // Mark that we've requested a response for the current caller final to prevent
     // duplicate requests for the same utterance.
     lastRequestedCallerFinal = lastCallerFinal;
@@ -1064,6 +1071,8 @@ wss.on("connection", (twilioWs, req) => {
         type.includes("input_audio_transcript") ||
         type.includes("conversation.item.input_audio_transcription");
       if (doneLike && isInputTranscript && possible) {
+        // Mark that we've heard caller speech in this segment
+        hasHeardCaller = true;
         // Update caller final but do not queue a response here. The response
         // will be triggered by speech_stopped event (VAD) to ensure we respond
         // once per speech segment.
@@ -1077,10 +1086,20 @@ wss.on("connection", (twilioWs, req) => {
     // -----------------------------
     if (msg.type === "input_audio_buffer.speech_stopped") {
       // When server VAD reports that the caller stopped speaking, mark that
-      // a new speech segment has ended and a response is required. We only
-      // respond once per segment after the assistant finishes speaking.
-      currentSpeechSegmentIndex += 1;
-      pendingResponseRequest = true;
+      // a new speech segment has ended.  Only respond if we've heard caller
+      // speech since the last response.  If the assistant is not currently
+      // speaking, respond immediately; otherwise queue exactly one response.
+      if (hasHeardCaller) {
+        currentSpeechSegmentIndex += 1;
+        if (!awaitingResponse) {
+          // Respond immediately and clear the flag
+          hasHeardCaller = false;
+          lastRespondedSegmentIndex = currentSpeechSegmentIndex;
+          requestAssistantResponse("speech_stopped");
+        } else {
+          pendingResponseRequest = true;
+        }
+      }
       return;
     }
 
