@@ -861,7 +861,12 @@ wss.on("connection", (twilioWs, req) => {
         "היי שלום לך",
         "שלום לך",
         "ביי שלום",
-        "ביי, שלום"
+        "ביי, שלום",
+        "אה",
+        "אה, שלום",
+        "אה שלום",
+        "אה, שלום לך",
+        "אה שלום לך"
       ];
       // Remove greeting phrases from beginning
       for (const g of greetings) {
@@ -1154,10 +1159,39 @@ wss.on("connection", (twilioWs, req) => {
         lastCallerNormalized = normalized;
         // Only queue a response when the normalized utterance has at least two words,
         // and we haven't responded to a semantically equivalent utterance yet
+        // Determine if the utterance contains any meaningful keywords (for routing)
+        const keywordList = [
+          "קופון",
+          "תקלה",
+          "בעיה",
+          "שירות",
+          "החלפה",
+          "החזרה",
+          "לא עובד",
+          "משלוח",
+          "אספקה",
+          "שליח",
+          "הזמנה",
+          "הגיע",
+          "לא הגיע",
+          "מוביל",
+          "מחיר",
+          "לקנות",
+          "רכישה",
+          "מוצר",
+          "דגם",
+          "מידה",
+          "צבע",
+          "מלאי",
+          "מבצע",
+          "קנייה",
+          "קניה"
+        ];
+        const hasKeyword = keywordList.some((kw) => normalized.includes(kw));
         if (
-          wordCount >= 3 &&
           normalized &&
-          normalized !== lastRequestedCallerNormalized
+          normalized !== lastRequestedCallerNormalized &&
+          (wordCount >= 4 || hasKeyword)
         ) {
           pendingResponseRequest = true;
         }
