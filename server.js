@@ -500,16 +500,9 @@ wss.on("connection", (twilioWs, req) => {
   // This prevents sending multiple assistant responses for the same caller final.
   let lastRequestedCallerFinal = "";
 
-  // Tracks whether we've heard caller speech that hasn't yet been responded to.
-  // Used with speech_stopped to ensure one response per caller turn.
-  let hasHeardCaller = false;
-
-  // Speech segment tracking. Each time VAD reports speech stopped, we
-  // increment currentSpeechSegmentIndex. lastRespondedSegmentIndex tracks the
-  // segment index we have already responded to. This helps avoid multiple
-  // responses for the same caller turn.
-  let currentSpeechSegmentIndex = 0;
-  let lastRespondedSegmentIndex = 0;
+  // Internal flags for response management.  We no longer track speech
+  // segments; instead, we queue responses based on new caller final
+  // transcriptions (see message handlers below).
 
   // Call/session state for webhook + routing + abandoned
   let callSid = null;
@@ -526,6 +519,12 @@ wss.on("connection", (twilioWs, req) => {
 
   // Proxy decision: dynamic response instructions (no FSM)
   let proxyInstructions = "";
+
+  // Buffer audio frames when the assistant is speaking. When awaitingResponse is
+  // true, we temporarily store incoming caller audio and send it only after
+  // the assistant finishes speaking. This prevents the model from listening
+  // and reacting to noise or speech while it's talking.
+  let pausedAudioBuffer = [];
 
   const pushTurn = (from, text) => {
     const t = String(text || "").trim();
@@ -868,32 +867,34 @@ wss.on("connection", (twilioWs, req) => {
   // -----------------------------
   // Anti-overlap: only ONE active response at a time
   // -----------------------------
+  // awaitingResponse indicates the assistant is currently speaking. While true
+  // we pause forwarding caller audio to OpenAI. When false, we can send
+  // audio and, if there is a pending user utterance, trigger a response.
   let awaitingResponse = false;
+  // pendingResponseRequest is flagged whenever we detect a new caller
+  // utterance (final transcript). It is consumed on the next response.done.
   let pendingResponseRequest = false;
 
   const requestAssistantResponse = (reason = "") => {
-    // No valid connection → bail
+    // Only send a response if the OpenAI WS is ready
     if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN) return;
 
-    // If a response is already running we don't queue another one here.  The
-    // next caller_final event will set pendingResponseRequest=true if needed.
+    // Don't start a new response while another is in flight
     if (awaitingResponse) {
       debug(`[${connTag}] response.request ignored (awaitingResponse=true) reason=${reason}`);
       return;
     }
 
-    // We are free to start a new response. Reset flags.
+    // Reset flags: we're starting a new response now
     awaitingResponse = true;
     pendingResponseRequest = false;
 
-    // We've consumed the caller's speech for this segment; reset flag.
-    hasHeardCaller = false;
-
-    // Mark that we've requested a response for the current caller final to prevent
-    // duplicate requests for the same utterance.
+    // Mark that we've responded to the most recent caller utterance
     lastRequestedCallerFinal = lastCallerFinal;
 
-    // Build dynamic instructions for this turn. Fallback to master prompt if none.
+    // Build dynamic instructions for this turn. If proxyInstructions is empty,
+    // fall back to master prompt. We rebuild instructions here because the
+    // caller may have asked a new question that requires updated context.
     let instructions = proxyInstructions;
     if (!instructions) {
       try {
@@ -1071,50 +1072,43 @@ wss.on("connection", (twilioWs, req) => {
         type.includes("input_audio_transcript") ||
         type.includes("conversation.item.input_audio_transcription");
       if (doneLike && isInputTranscript && possible) {
-        // Mark that we've heard caller speech in this segment
-        hasHeardCaller = true;
-        // Update caller final but do not queue a response here. The response
-        // will be triggered by speech_stopped event (VAD) to ensure we respond
-        // once per speech segment.
+        // Update caller final and queue a response if this is a new utterance
+        const before = lastCallerFinal;
         printCallerFinal(String(possible).trim());
+        if (lastCallerFinal !== before && lastCallerFinal !== lastRequestedCallerFinal) {
+          pendingResponseRequest = true;
+        }
         return;
       }
     }
 
     // -----------------------------
-    // Turn boundary events (safe trigger)
+    // Turn boundary events
     // -----------------------------
     if (msg.type === "input_audio_buffer.speech_stopped") {
-      // When server VAD reports that the caller stopped speaking, mark that
-      // a new speech segment has ended.  Only respond if we've heard caller
-      // speech since the last response.  If the assistant is not currently
-      // speaking, respond immediately; otherwise queue exactly one response.
-      if (hasHeardCaller) {
-        currentSpeechSegmentIndex += 1;
-        if (!awaitingResponse) {
-          // Respond immediately and clear the flag
-          hasHeardCaller = false;
-          lastRespondedSegmentIndex = currentSpeechSegmentIndex;
-          requestAssistantResponse("speech_stopped");
-        } else {
-          pendingResponseRequest = true;
-        }
-      }
+      // Ignore speech_stopped events for response timing. We'll respond after
+      // the assistant finishes speaking (response.done) based on pendingResponseRequest.
       return;
     }
 
     // response lifecycle
     if (msg.type === "response.done") {
       awaitingResponse = false;
-      // If something arrived while we were speaking - do exactly ONE next response
-      if (pendingResponseRequest) {
-        // Only respond if we haven't yet responded to this speech segment.
-        if (currentSpeechSegmentIndex > lastRespondedSegmentIndex) {
-          debug(`[${connTag}] response.done -> draining pendingResponseRequest`);
-          pendingResponseRequest = false;
-          lastRespondedSegmentIndex = currentSpeechSegmentIndex;
-          requestAssistantResponse("pending_after_done");
+      // Flush any buffered audio frames that arrived while assistant was speaking
+      if (Array.isArray(pausedAudioBuffer) && pausedAudioBuffer.length > 0) {
+        while (pausedAudioBuffer.length > 0) {
+          const audioFrame = pausedAudioBuffer.shift();
+          safeOpenAISend({ type: "input_audio_buffer.append", audio: audioFrame });
         }
+      }
+      // If we have a pending caller utterance, and we haven't already
+      // responded to it, send one response now. We rely on the check
+      // lastCallerFinal !== lastRequestedCallerFinal to ensure we respond
+      // exactly once per caller utterance.
+      if (pendingResponseRequest && lastCallerFinal !== lastRequestedCallerFinal) {
+        debug(`[${connTag}] response.done -> draining pendingResponseRequest`);
+        pendingResponseRequest = false;
+        requestAssistantResponse("pending_after_done");
       }
       return;
     }
@@ -1175,6 +1169,17 @@ wss.on("connection", (twilioWs, req) => {
       if (!openaiReady || !openaiWs || openaiWs.readyState !== WebSocket.OPEN) {
         pendingAudio.push(payload);
         if (pendingAudio.length > 400) pendingAudio.splice(0, pendingAudio.length - 400);
+        return;
+      }
+      // If the assistant is currently speaking, buffer the audio instead of
+      // sending it immediately. This prevents the model from listening during
+      // its own response.
+      if (awaitingResponse) {
+        pausedAudioBuffer.push(payload);
+        // cap buffer to avoid unbounded growth
+        if (pausedAudioBuffer.length > 400) {
+          pausedAudioBuffer.splice(0, pausedAudioBuffer.length - 400);
+        }
         return;
       }
       safeOpenAISend({
