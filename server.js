@@ -718,6 +718,40 @@ wss.on("connection", (twilioWs, req) => {
       parts.push(
         "מטרה: להבין תקלה בקצרה, פרטי מוצר/מותג/הזמנה, ולסגור עם הבטחה לחזרה."
       );
+      // Detect brand keywords in the caller's utterance and provide importer phone numbers when appropriate.
+      try {
+        const importerRows = Array.isArray(SHEETS.suppliersImporters)
+          ? SHEETS.suppliersImporters
+          : [];
+        const brandPhones = [];
+        for (const r of importerRows) {
+          const kw = String(r.brand_keyword || "").toLowerCase().trim();
+          if (!kw) continue;
+          if (low.includes(kw)) {
+            const when = String(r.when_to_give || "").toLowerCase();
+            // Only give phone when the sheet instructs to do so (e.g. contains "fault" or "תקלה")
+            if (
+              (when && when.includes("fault")) ||
+              when.includes("fault_or_specific_request") ||
+              when.includes("תקלה")
+            ) {
+              let p = String(r.phone_e164 || r.phone || "").trim();
+              if (p) {
+                // Remove whitespace and avoid scientific notation
+                p = p.replace(/\s+/g, "");
+                brandPhones.push(p);
+              }
+            }
+          }
+        }
+        if (brandPhones.length) {
+          parts.push(
+            "מספרי יבואנים למותג התקלה: " + brandPhones.join(", ")
+          );
+        }
+      } catch (_) {
+        /* ignore brand detection errors */
+      }
     } else if (route === "sales") {
       parts.push(
         "מטרה: להבין במה מתעניינים (סוג מוצר/דגם/מותג) ואז לקחת פרטי חזרה (אפשר להציע להשתמש במספר המזוהה)."
