@@ -218,6 +218,17 @@ async function loadSheets() {
     const promptsRows = (promptsRange?.values || []).slice();
     const settingsRows = (settingsRange?.values || []).slice();
 
+const kbFactsRange = valueRanges.find((vr) => (vr.range || "").startsWith("KB_FACTS!"));
+const doNotSayRange = valueRanges.find((vr) => (vr.range || "").startsWith("DO_NOT_SAY!"));
+const suppliersImportersRange = valueRanges.find((vr) => (vr.range || "").startsWith("SUPPLIERS_IMPORTERS!"));
+const deliveryContactsRange = valueRanges.find((vr) => (vr.range || "").startsWith("DELIVERY_CONTACTS!"));
+
+const kbFactsRows = rowsToObjects((kbFactsRange?.values || []).slice());
+const doNotSayRows = rowsToObjects((doNotSayRange?.values || []).slice());
+const suppliersImportersRows = rowsToObjects((suppliersImportersRange?.values || []).slice());
+const deliveryContactsRows = rowsToObjects((deliveryContactsRange?.values || []).slice());
+
+
     // PROMPTS: expects columns prompt_id + content_he
     const prompts = {};
     if (promptsRows.length) {
