@@ -709,7 +709,7 @@ wss.on("connection", (twilioWs, req) => {
         if (couponVal) {
           const spacedCouponEarly = couponVal.replace(/\D/g, "").split("").join(" ");
           parts.push(
-            `אם נשאלת על קוד קופון או קוד הנחה, תשיבי מיד: קוד הקופון לרכישה באתר הוא ${spacedCouponEarly}. אל תגידי שאין לך מידע בנושא.`
+            `אם נשאלת על קוד קופון או קוד הנחה, תשיבי מיד: קוד הקופון לרכישה באתר הוא ${spacedCouponEarly}. אל תגידי שאין לך מידע בנושא, מפני שהמידע נמצא בשיטס. אל תמציאי קוד אחר.`
           );
         }
       }
@@ -719,12 +719,21 @@ wss.on("connection", (twilioWs, req) => {
 
     // Always mention the caller's default phone number so the assistant suggests it first
     try {
-      const callerNum = String(caller || "").trim();
-      if (callerNum) {
-        // remove non-digits and insert spaces so the model reads each digit separately
-        const spacedCaller = callerNum.replace(/\D/g, "").split("").join(" ");
+      const callerRaw = String(caller || "").trim();
+      if (callerRaw) {
+        // extract digits and convert Israeli E.164 numbers (+972…) to 0X… local format
+        let digits = callerRaw.replace(/\D/g, "");
+        if (digits.startsWith("972") && digits.length > 3) {
+          digits = "0" + digits.slice(3);
+        }
+        // insert spaces to ensure the model reads each digit separately
+        const spacedCaller = digits.split("").join(" ");
         parts.push(
-          `ברירת המחדל לחזרה אליכם היא למספר שממנו התקשרתם: ${spacedCaller}. הציעי לשאול אם נוח להשתמש במיספר הזה או אם יש מספר אחר. אל תמציאי מספרים.`
+          `המספר ממנו התקשרתם הוא ${spacedCaller}. ברירת המחדל היא לחזור למספר זה. שאלי תמיד אם נוח לכם שנחזור למספר הזה או אם יש מספר אחר. אל תמציאי מספרים.`
+        );
+        // Also instruct to collect full name and confirm number for all routes
+        parts.push(
+          `בכל שיחה, קחי שם מלא של הלקוח ושאלי האם נוח לחזור למספר המזוהה (${spacedCaller}) או שמעדיף מספר אחר. אם נמסר מספר, הקראי אותו ספרה־ספרה ללא השמטה או תוספת, ובמידת הצורך הודיעי שהמספר נרשם בלי לקרוא אותו שוב.`
         );
       }
     } catch (_) {
