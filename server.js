@@ -861,26 +861,44 @@ wss.on("connection", (twilioWs, req) => {
   let pendingResponseRequest = false;
 
   const requestAssistantResponse = (reason = "") => {
+    // No valid connection → bail
     if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN) return;
 
-    // If a response is already running - remember we owe ONE more response after it's done
+    // If a response is already running we don't queue another one here.  The
+    // next caller_final event will set pendingResponseRequest=true if needed.
     if (awaitingResponse) {
-      pendingResponseRequest = true;
-      debug(`[${connTag}] response.request queued (awaitingResponse=true) reason=${reason}`);
+      debug(`[${connTag}] response.request ignored (awaitingResponse=true) reason=${reason}`);
       return;
     }
 
+    // We are free to start a new response. Reset flags.
     awaitingResponse = true;
     pendingResponseRequest = false;
 
-    // Mark that we've requested a response for the current caller final.
-    // This helps avoid requesting multiple responses for the same utterance.
+    // Mark that we've requested a response for the current caller final to prevent
+    // duplicate requests for the same utterance.
     lastRequestedCallerFinal = lastCallerFinal;
+
+    // Build dynamic instructions for this turn. Fallback to master prompt if none.
+    let instructions = proxyInstructions;
+    if (!instructions) {
+      try {
+        instructions = buildProxyInstructions(lastCallerFinal);
+      } catch (_) {
+        instructions = getPrompt(
+          "MASTER_PROMPT",
+          "אתם עוזרת קולית בשם נטע עבור גיל ספורט. דברו קצר, קליל וברור."
+        );
+      }
+    }
 
     debug(`[${connTag}] response.create (reason=${reason})`);
     safeOpenAISend({
       type: "response.create",
-      response: { modalities: ["audio", "text"] }
+      response: {
+        modalities: ["audio", "text"],
+        instructions
+      }
     });
   };
 
@@ -1003,9 +1021,12 @@ wss.on("connection", (twilioWs, req) => {
       error(`[${connTag}] OpenAI error event`, msg);
       const errCode = msg && msg.error && msg.error.code ? String(msg.error.code) : "";
       if (errCode === "conversation_already_has_active_response") {
-        // Treat as still-speaking; queue exactly one response after current finishes
+        // The assistant is still speaking. Do not queue a new response here; the
+        // caller_final handler will decide if another response is needed. We simply
+        // keep awaitingResponse=true to prevent sending another response before
+        // the current one finishes.
         awaitingResponse = true;
-        pendingResponseRequest = true;
+        // Do not set pendingResponseRequest here — rely on new caller_final events.
       }
       return;
     }
