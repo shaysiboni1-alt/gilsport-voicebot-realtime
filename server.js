@@ -496,6 +496,9 @@ wss.on("connection", (twilioWs, req) => {
 
   let lastCallerFinal = "";
   let lastBotFinal = "";
+  // Tracks the last caller utterance for which a response was requested.
+  // This prevents sending multiple assistant responses for the same caller final.
+  let lastRequestedCallerFinal = "";
 
   // Call/session state for webhook + routing + abandoned
   let callSid = null;
@@ -807,6 +810,10 @@ wss.on("connection", (twilioWs, req) => {
     awaitingResponse = true;
     pendingResponseRequest = false;
 
+    // Mark that we've requested a response for the current caller final.
+    // This helps avoid requesting multiple responses for the same utterance.
+    lastRequestedCallerFinal = lastCallerFinal;
+
     debug(`[${connTag}] response.create (reason=${reason})`);
     safeOpenAISend({
       type: "response.create",
@@ -976,7 +983,9 @@ wss.on("connection", (twilioWs, req) => {
         // request another assistant response.
         const before = lastCallerFinal;
         printCallerFinal(String(possible).trim());
-        if (lastCallerFinal !== before) {
+        // Only request a response if this utterance is new compared to both the previous
+        // lastCallerFinal and the last utterance we already requested a response for.
+        if (lastCallerFinal !== before && lastCallerFinal !== lastRequestedCallerFinal) {
           // after we got a new user final, request assistant response (if not already)
           requestAssistantResponse("caller_transcript_done");
         }
