@@ -637,14 +637,18 @@ const buildProxyInstructions = (callerText) => {
 	  }
 
 	  if (route === "delivery") {
-	    parts.push(mustNotLieDelivery);
-	    if (afterHours) {
-	      parts.push("זה אחרי שעות פעילות. תני מספרי מובילים אם יש, קחי הודעה קצרה והבטיחי שיחזרו אליהם בשעות פעילות.");
-	      if (carrierPhones.length) parts.push("מספרי מובילים: " + carrierPhones.join(", "));
-	    } else {
-	      parts.push("אם מבקשים סטטוס משלוח: להסביר שאין סטטוס בזמן אמת ולהציע להשאיר הודעה/פרטים לחזרה.");
-	    }
-	  } else if (route === "support") {
+    parts.push(mustNotLieDelivery);
+    parts.push("אסור לשאול מספר הזמנה ואסור להגיד 'נוכל לבדוק סטטוס'. אין גישה לסטטוס בזמן אמת.");
+    if (afterHours) {
+      parts.push("זה אחרי שעות פעילות. תנו ללקוח מספרי מובילים מהשיטס (אם יש), ואז קחו הודעה קצרה והבטיחו חזרה בשעות הפעילות.");
+      if (carrierPhones.length) parts.push("מספרי מובילים (מהשיטס): " + carrierPhones.join(", "));
+      parts.push("שאלה מקדמת מומלצת: מה השם שלכם, ומה מספר הטלפון לחזרה (אפשר גם המספר המזוהה), ובאיזה עיר/כתובת מדובר?");
+    } else {
+      parts.push("בשעות פעילות: להסביר שאין סטטוס בזמן אמת. אפשר לקחת פרטים ולהעביר לנציג שיחזור אליהם עם עדכון.");
+      if (carrierPhones.length) parts.push("אם הלקוח מבקש במפורש טלפון של המובילים, תנו: " + carrierPhones.join(", "));
+      parts.push("שאלה מקדמת מומלצת: מה השם שלכם והאם נוח שנחזור אליכם למספר המזוהה?");
+    }
+  } else if (route === "support") {
 	    parts.push("מטרה: להבין תקלה בקצרה, פרטי מוצר/מותג/הזמנה, ולסגור עם הבטחה לחזרה.");
 	  } else if (route === "sales") {
 	    parts.push("מטרה: להבין במה מתעניינים (סוג מוצר/דגם/מותג) ואז לקחת פרטי חזרה (אפשר להציע להשתמש במספר המזוהה).");
@@ -904,6 +908,12 @@ const buildProxyInstructions = (callerText) => {
     // Turn boundary events (safe trigger)
     // -----------------------------
     if (msg.type === "input_audio_buffer.speech_stopped") {
+      // IMPORTANT: When transcription is enabled, wait for caller_transcript_done to avoid double response.create
+      // and to prevent the bot from speaking before the caller actually said something.
+      if (MB_ENABLE_TRANSCRIPTION) {
+        debug(`[${connTag}] ignoring speech_stopped (transcription enabled)`);
+        return;
+      }
       requestAssistantResponse("speech_stopped");
       return;
     }
