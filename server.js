@@ -1,1097 +1,270 @@
 // server.js
 // GilSport Realtime VoiceBot – Neta based
-// Render + Twilio Media Streams + OpenAI Realtime
-// Single Source of Truth: Google Sheets
+// Single Source of Truth: EXACT match with uploaded Google Sheets tabs
 
 require("dotenv").config();
 
 const express = require("express");
 const http = require("http");
+const https = require("https");
 const WebSocket = require("ws");
 const { google } = require("googleapis");
-const crypto = require("crypto");
 
 // --------------------------------------------------
-// Helpers
+// ENV & CONFIG
 // --------------------------------------------------
-const envNum = (k, d) => {
-  const v = Number(process.env[k]);
-  return Number.isFinite(v) ? v : d;
-};
-const envBool = (k, d = false) =>
-  ["1", "true", "yes", "on"].includes(String(process.env[k] || "").toLowerCase()) || d;
-
-const PORT = envNum("PORT", 10000);
-
-// --------------------------------------------------
-// ENV (NO EARLY FAILS ❗)
-// --------------------------------------------------
+const PORT = Number(process.env.PORT) || 10000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const OPENAI_REALTIME_MODEL =
-  process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview-2024-12-17";
-
-// Voice normalize to lowercase + validate
-const ALLOWED_VOICES = new Set([
-  "alloy",
-  "ash",
-  "ballad",
-  "coral",
-  "echo",
-  "sage",
-  "shimmer",
-  "verse",
-  "marin",
-  "cedar"
-]);
-function normalizeVoice(v) {
-  const raw = String(v || "").trim();
-  const lower = raw.toLowerCase();
-  if (ALLOWED_VOICES.has(lower)) return lower;
-  return "alloy";
-}
-const OPENAI_VOICE = normalizeVoice(process.env.OPENAI_VOICE || "alloy");
+const OPENAI_REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview-2024-12-17";
+const OPENAI_VOICE = process.env.OPENAI_VOICE || "alloy";
 
 const GSHEET_ID = process.env.GSHEET_ID || "";
 const GOOGLE_SERVICE_ACCOUNT_JSON_B64 = process.env.GOOGLE_SERVICE_ACCOUNT_JSON_B64 || "";
 
 const MB_WEBHOOK_URL = process.env.MB_WEBHOOK_URL || "";
-const MB_DEBUG = envBool("MB_DEBUG", false);
+const MB_DEBUG = ["1", "true"].includes(String(process.env.MB_DEBUG).toLowerCase());
 
-const MB_VAD_THRESHOLD = envNum("MB_VAD_THRESHOLD", 0.65);
-const MB_VAD_SILENCE_MS = envNum("MB_VAD_SILENCE_MS", 900);
-const MB_VAD_PREFIX_MS = envNum("MB_VAD_PREFIX_MS", 200);
-
-const MB_IDLE_WARNING_MS = envNum("MB_IDLE_WARNING_MS", 40000);
-const MB_IDLE_HANGUP_MS = envNum("MB_IDLE_HANGUP_MS", 90000);
-
-const MB_MAX_CALL_MS = envNum("MB_MAX_CALL_MS", 5 * 60 * 1000);
-
-// Transcript/logging flags
-const MB_LOG_TRANSCRIPTS = envBool("MB_LOG_TRANSCRIPTS", true);
-const MB_ENABLE_TRANSCRIPTION = envBool("MB_ENABLE_TRANSCRIPTION", true);
-const MB_TRANSCRIPTION_MODEL = process.env.MB_TRANSCRIPTION_MODEL || "whisper-1";
-const MB_LOG_RAW_OPENAI = envBool("MB_LOG_RAW_OPENAI", false);
-// Public recording proxy (optional)
-const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
-const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
-const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || "";
-const TIME_ZONE = process.env.TIME_ZONE || "Asia/Jerusalem";
-
+const MB_VAD_THRESHOLD = Number(process.env.MB_VAD_THRESHOLD) || 0.65;
+const MB_VAD_SILENCE_MS = Number(process.env.MB_VAD_SILENCE_MS) || 900;
 
 // --------------------------------------------------
 // Logging
 // --------------------------------------------------
 const log = (...a) => console.log("[INFO]", ...a);
-const debug = (...a) => MB_DEBUG && console.log("[DEBUG]", ...a);
 const error = (...a) => console.error("[ERROR]", ...a);
 const always = (...a) => console.log("[ALWAYS]", ...a);
 
-const preview = (s, n = 300) => {
-  const t = String(s || "").replace(/\s+/g, " ").trim();
-  return t.length > n ? t.slice(0, n) + "..." : t;
-
-};
-
 // --------------------------------------------------
-// Webhook (single endpoint) helpers
+// Webhook (Native HTTPS)
 // --------------------------------------------------
-const nowIso = () => new Date().toISOString();
-
-async function sendWebhookEvent(event, payload) {
-  if (!MB_WEBHOOK_URL) return false;
+function callWebhook(payload) {
+  if (!MB_WEBHOOK_URL) return;
+  const data = JSON.stringify({ ...payload, timestamp: new Date().toISOString() });
   try {
-    const body = JSON.stringify({ event, ...payload });
-    const resp = await fetch(MB_WEBHOOK_URL, {
+    const url = new URL(MB_WEBHOOK_URL);
+    const options = {
+      hostname: url.hostname,
+      path: url.pathname + url.search,
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body
-    });
-    if (!resp.ok) {
-      debug("Webhook non-200", event, resp.status);
-    }
-    return true;
-  } catch (e) {
-    error("Webhook send failed", e.message);
-    return false;
-  }
-}
-
-function makeRecordingPublicUrl(callSid) {
-  if (!PUBLIC_BASE_URL) return "";
-  const base = String(PUBLIC_BASE_URL).replace(/\/$/, "");
-  return callSid ? `${base}/recording/${callSid}` : "";
+      headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data) }
+    };
+    const req = https.request(options);
+    req.on("error", (e) => error("Webhook failed", e.message));
+    req.write(data);
+    req.end();
+  } catch (e) { error("Webhook URL error", e.message); }
 }
 
 // --------------------------------------------------
-// Runtime diagnostics
-// --------------------------------------------------
-const RUNTIME = {
-  booted_at: new Date().toISOString(),
-  ws_connections: 0,
-  ws_closed: 0,
-  ws_errors: 0,
-  openai_errors: 0,
-  openai_closed: 0,
-  last_ws_conn_at: null,
-  last_ws_close_at: null
-};
-
-// --------------------------------------------------
-// Sheets (Single Source of Truth)
+// Sheets (Matching uploaded files)
 // --------------------------------------------------
 let SHEETS = {
   loaded_at: null,
-  prompts: {}, // from PROMPTS tab (prompt_id -> content_he)
-  settings: {}, // from SETTINGS tab (key -> value)
-  routingRules: [], // rows from ROUTING_RULES
-  businessInfo: [], // rows from BUSINESS_INFO
-  salesScript: [], // rows from SALES_SCRIPT
-  supportScript: [] // rows from SUPPORT_SCRIPT
+  prompts: {}, 
+  settings: {},
+  kb_facts: [],
+  do_not_say: [],
+  suppliers: [],
+  delivery_contacts: []
 };
 
-function parseTable(rows, keyColName, valColName) {
+function parseTable(rows, keyCol, valCol) {
   const out = {};
-  const headers = (rows.shift() || []).map((h) => String(h || "").trim());
-  const keyIdx = headers.indexOf(keyColName);
-  const valIdx = headers.indexOf(valColName);
-
-  if (keyIdx === -1 || valIdx === -1) return out;
-
-  for (const r of rows) {
-    const k = String(r[keyIdx] || "").trim();
-    const v = String(r[valIdx] || "");
-    if (!k) continue;
-    out[k] = v;
-  }
-  return out;
-
-
-function rowsToObjects(rows) {
-  const out = [];
-  const headers = (rows.shift() || []).map((h) => String(h || "").trim());
-  if (!headers.length) return out;
-  for (const r of rows) {
-    const o = {};
-    headers.forEach((h, i) => (o[h] = r[i] || ""));
-    // drop fully empty rows
-    const hasAny = Object.values(o).some((v) => String(v || "").trim() !== "");
-    if (hasAny) out.push(o);
+  if (!rows || rows.length < 2) return out;
+  const headers = rows[0].map(h => String(h || "").trim());
+  const kIdx = headers.indexOf(keyCol);
+  const vIdx = headers.indexOf(valCol);
+  if (kIdx === -1 || vIdx === -1) return out;
+  for (let i = 1; i < rows.length; i++) {
+    const k = String(rows[i][kIdx] || "").trim();
+    if (k) out[k] = String(rows[i][vIdx] || "").trim();
   }
   return out;
 }
+
+function parseToObjects(rows) {
+  if (!rows || rows.length < 2) return [];
+  const headers = rows[0].map(h => String(h || "").trim());
+  return rows.slice(1).map(r => {
+    const obj = {};
+    headers.forEach((h, i) => { if(h) obj[h] = r[i] || ""; });
+    return obj;
+  });
 }
 
 async function loadSheets() {
   if (!GSHEET_ID || !GOOGLE_SERVICE_ACCOUNT_JSON_B64) return;
-
   try {
-    const json = JSON.parse(
-      Buffer.from(GOOGLE_SERVICE_ACCOUNT_JSON_B64, "base64").toString("utf8")
-    );
-
+    const json = JSON.parse(Buffer.from(GOOGLE_SERVICE_ACCOUNT_JSON_B64, "base64").toString("utf8"));
     const auth = new google.auth.JWT({
       email: json.client_email,
       key: json.private_key,
       scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"]
     });
-
     const sheets = google.sheets({ version: "v4", auth });
 
-    // ✅ load PROMPTS + SETTINGS in one call
-    const res = await sheets.spreadsheets.values.batchGet({
-      spreadsheetId: GSHEET_ID,
-      ranges: ["PROMPTS!A:Z", "SETTINGS!A:Z", "ROUTING_RULES!A:Z", "BUSINESS_INFO!A:Z", "SALES_SCRIPT!A:Z", "SUPPORT_SCRIPT!A:Z"]
-    });
-
-    const valueRanges = res.data.valueRanges || [];
-    const promptsRange = valueRanges.find((vr) => (vr.range || "").startsWith("PROMPTS!"));
-    const settingsRange = valueRanges.find((vr) => (vr.range || "").startsWith("SETTINGS!"));
-
-    const promptsRows = (promptsRange?.values || []).slice();
-    const settingsRows = (settingsRange?.values || []).slice();
-
-    // PROMPTS: expects columns prompt_id + content_he
-    const prompts = {};
-    if (promptsRows.length) {
-      const headers = promptsRows.shift() || [];
-      for (const r of promptsRows) {
-        const row = {};
-        headers.forEach((h, i) => (row[h] = r[i] || ""));
-        if (row.prompt_id && row.content_he) {
-          prompts[String(row.prompt_id).trim()] = String(row.content_he);
-        }
+    // שמות הטאבים כפי שמופיעים בקבצים שהעלית
+    const tabs = ["PROMPTS", "SETTINGS", "KB_FACTS", "DO_NOT_SAY", "SUPPLIERS_IMPORTERS", "DELIVERY_CONTACTS"];
+    
+    const results = await Promise.all(tabs.map(async (tab) => {
+      try {
+        const res = await sheets.spreadsheets.values.get({ spreadsheetId: GSHEET_ID, range: `${tab}!A:Z` });
+        return { tab, values: res.data.values || [] };
+      } catch (e) {
+        error(`Tab ${tab} load error`, e.message);
+        return { tab, values: [] };
       }
-    }
+    }));
 
-    // SETTINGS: expects columns key + value
-    const settings = settingsRows.length ? parseTable(settingsRows, "key", "value") : {};
+    const get = (name) => results.find(r => r.tab === name)?.values || [];
 
-    SHEETS = {
-  loaded_at: new Date().toISOString(),
-  prompts,
-  settings,
-  routingRules: routingRulesRows,
-  businessInfo: businessInfoRows,
-  salesScript: salesScriptRows,
-  supportScript: supportScriptRows
-};
+    SHEETS.prompts = parseTable(get("PROMPTS"), "prompt_id", "content_he");
+    SHEETS.settings = parseTable(get("SETTINGS"), "key", "value");
+    SHEETS.kb_facts = parseToObjects(get("KB_FACTS"));
+    SHEETS.do_not_say = parseToObjects(get("DO_NOT_SAY"));
+    SHEETS.suppliers = parseToObjects(get("SUPPLIERS_IMPORTERS"));
+    SHEETS.delivery_contacts = parseToObjects(get("DELIVERY_CONTACTS"));
 
-    log(
-      `Sheets loaded (prompts=${Object.keys(prompts).length}, settings=${Object.keys(settings).length})`
-    );
-  } catch (e) {
-    error("Sheets load failed", e.message);
-  }
+    SHEETS.loaded_at = new Date().toISOString();
+    log(`Sheets updated from correct tabs at ${SHEETS.loaded_at}`);
+  } catch (e) { error("Critical Sheets error", e.message); }
 }
 
-const getPrompt = (id, fallback = "") => String(SHEETS.prompts[id] || fallback).trim();
-const getSetting = (key, fallback = "") => String(SHEETS.settings[key] || fallback).trim();
+// --------------------------------------------------
+// Proxy Knowledge (Decision Layer)
+// --------------------------------------------------
+function getKnowledgeInjection(callerText) {
+  const text = (callerText || "").toLowerCase();
+  let injection = "";
+
+  // Delivery Policy & Contacts
+  if (text.includes("משלוח") || text.includes("איפה") || text.includes("הזמנה")) {
+    const contacts = SHEETS.delivery_contacts.map(c => `${c.name}: ${c.phone}`).join(", ");
+    injection += `\nמידע משלוחים: לא להבטיח בדיקת סטטוס חי. אם זה אחרי שעות הפעילות, תני את מספרי המובילים: ${contacts}.`;
+  }
+
+  // Do Not Say Enforcement
+  if (SHEETS.do_not_say.length > 0) {
+    const rules = SHEETS.do_not_say.map(r => r.rule || r.content).join(" | ");
+    injection += `\nחוקי "אל תגידי": ${rules}`;
+  }
+
+  // KB Facts
+  const relevantFact = SHEETS.kb_facts.find(f => text.includes(String(f.keyword || "").toLowerCase()));
+  if (relevantFact) injection += `\nעובדה רלוונטית: ${relevantFact.content || relevantFact.fact}`;
+
+  return injection;
+}
 
 // --------------------------------------------------
-// Express
+// Express & Twilio
 // --------------------------------------------------
 const app = express();
 app.use(express.json());
-app.use(express.urlencoded({ extended: false }));
 
-app.get("/health", (_, res) => {
-  res.json({
-    ok: true,
-    sheets_loaded_at: SHEETS.loaded_at,
-    prompts: Object.keys(SHEETS.prompts).length,
-    settings: Object.keys(SHEETS.settings).length
-  });
-});
-
-app.get("/diag/env", (_, res) => {
-  res.json({
-    ok: true,
-    booted_at: RUNTIME.booted_at,
-    has_OPENAI_API_KEY: Boolean(OPENAI_API_KEY),
-    OPENAI_REALTIME_MODEL,
-    OPENAI_VOICE,
-    has_GSHEET_ID: Boolean(GSHEET_ID),
-    has_GOOGLE_SERVICE_ACCOUNT_JSON_B64: Boolean(GOOGLE_SERVICE_ACCOUNT_JSON_B64),
-    has_TWILIO_ACCOUNT_SID: Boolean(TWILIO_ACCOUNT_SID),
-    has_TWILIO_AUTH_TOKEN: Boolean(TWILIO_AUTH_TOKEN),
-    PUBLIC_BASE_URL,
-    TIME_ZONE,
-    MB_DEBUG,
-    MB_LOG_TRANSCRIPTS,
-    MB_ENABLE_TRANSCRIPTION,
-    MB_TRANSCRIPTION_MODEL,
-    MB_LOG_RAW_OPENAI,
-    sheets_loaded_at: SHEETS.loaded_at,
-    prompts_count: Object.keys(SHEETS.prompts).length,
-    settings_count: Object.keys(SHEETS.settings).length
-  });
-});
-
-app.get("/diag/prompts", (_, res) => {
-  const keys = Object.keys(SHEETS.prompts).sort();
-  const sKeys = Object.keys(SHEETS.settings).sort();
-  res.json({
-    ok: true,
-    sheets_loaded_at: SHEETS.loaded_at,
-    prompts_count: keys.length,
-    settings_count: sKeys.length,
-    prompt_ids: keys,
-    setting_keys: sKeys,
-    opening_from_settings_preview: preview(getSetting("OPENING_SCRIPT", "")),
-    master_from_prompts_preview: preview(getPrompt("MASTER_PROMPT", ""))
-  });
-});
-
-app.get("/diag/runtime", (_, res) => {
-  res.json({ ok: true, ...RUNTIME });
-});
-
-app.get("/diag/sheets", (_, res) => {
-  res.json({
-    ok: true,
-    sheets_loaded_at: SHEETS.loaded_at,
-    counts: {
-      prompts: Object.keys(SHEETS.prompts || {}).length,
-      settings: Object.keys(SHEETS.settings || {}).length,
-      routingRules: (SHEETS.routingRules || []).length,
-      businessInfo: (SHEETS.businessInfo || []).length,
-      salesScript: (SHEETS.salesScript || []).length,
-      supportScript: (SHEETS.supportScript || []).length
-    }
-  });
-});
-
-// Public recording proxy (optional). If Twilio creds missing -> 404.
-// Access: ${PUBLIC_BASE_URL}/recording/:callSid   (PUBLIC_BASE_URL should be this server public base)
-app.get("/recording/:callSid", async (req, res) => {
-  try {
-    if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) return res.status(404).send("recording proxy disabled");
-    const callSid = String(req.params.callSid || "").trim();
-    if (!callSid) return res.status(400).send("missing callSid");
-
-    // Fetch latest recording for this call
-    const listUrl = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Recordings.json?CallSid=${encodeURIComponent(
-      callSid
-    )}&PageSize=1`;
-
-    const auth = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64");
-    const listResp = await fetch(listUrl, { headers: { Authorization: `Basic ${auth}` } });
-    if (!listResp.ok) return res.status(404).send("no recording");
-    const listJson = await listResp.json();
-    const rec = (listJson.recordings || [])[0];
-    if (!rec || !rec.sid) return res.status(404).send("no recording");
-
-    // Twilio media (mp3)
-    const mediaUrl = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Recordings/${rec.sid}.mp3`;
-    const mediaResp = await fetch(mediaUrl, { headers: { Authorization: `Basic ${auth}` } });
-    if (!mediaResp.ok) return res.status(404).send("recording not ready");
-
-    res.setHeader("Content-Type", "audio/mpeg");
-    res.setHeader("Cache-Control", "no-store");
-    const buf = Buffer.from(await mediaResp.arrayBuffer());
-    res.status(200).send(buf);
-  } catch (e) {
-    error("recording proxy failed", e.message);
-    res.status(500).send("recording proxy error");
-  }
-});
-
-
-app.post("/sheets/reload", async (_, res) => {
-  await loadSheets();
-  res.json({ ok: true, reloaded: true, at: SHEETS.loaded_at });
-});
-
-// Twilio Voice → Media Stream
 app.post("/twilio-voice", (req, res) => {
   const host = req.headers.host;
-  const wsUrl = `wss://${host}/twilio-media-stream`;
-
-  res.type("text/xml").send(
-    `
+  res.type("text/xml").send(`
 <Response>
   <Connect>
-    <Stream url="${wsUrl}">
+    <Stream url="wss://${host}/twilio-media-stream">
       <Parameter name="caller" value="${req.body.From || ""}" />
-      <Parameter name="called" value="${req.body.To || ""}" />
     </Stream>
   </Connect>
-</Response>
-`.trim()
-  );
+</Response>`.trim());
 });
 
 const server = http.createServer(app);
-
-// --------------------------------------------------
-// WebSocket (Twilio <-> OpenAI)
-// --------------------------------------------------
 const wss = new WebSocket.Server({ server, path: "/twilio-media-stream" });
 
-wss.on("connection", (twilioWs, req) => {
-  RUNTIME.ws_connections += 1;
-  RUNTIME.last_ws_conn_at = new Date().toISOString();
-
-  always("WS connection", {
-    at: RUNTIME.last_ws_conn_at,
-    ip: req?.socket?.remoteAddress || "?",
-    ua: req?.headers?.["user-agent"] || "?",
-    url: req?.url || "/twilio-media-stream",
-    total_ws_connections: RUNTIME.ws_connections
-  });
-
-  let twilioStreamSid = null;
+// --------------------------------------------------
+// Bridge Logic
+// --------------------------------------------------
+wss.on("connection", (twilioWs) => {
+  let streamSid = null;
+  let callerNum = "";
   let openaiReady = false;
-  const pendingAudio = [];
+  let hasTranscripts = false;
+  let lastText = "";
+  let fullTranscript = [];
 
-  const connTag = `conn_${Date.now().toString(36)}_${Math.random().toString(16).slice(2, 6)}`;
-
-  // Try to read Stream <Parameter> values from querystring if present
-  try {
-    const u = new URL(req.url || "", "http://localhost");
-    caller = u.searchParams.get("caller") || "";
-    called = u.searchParams.get("called") || "";
-  } catch (_) {}
-
-
-  let lastCallerFinal = "";
-  let lastBotFinal = "";
-
-
-// Call/session state for webhook + routing + abandoned
-let callSid = null;
-let startedAt = nowIso();
-let endedAt = null;
-let caller = "";
-let called = "";
-let route = "other";
-let language = getSetting("DEFAULT_LANGUAGE", "he") || "he";
-
-let transcriptTurns = []; // {from, text, at}
-
-// Abandoned / ended dedupe guards
-let sentCallEnded = false;
-let sentCallAbandoned = false;
-
-// Proxy decision: dynamic response instructions (no FSM)
-let proxyInstructions = "";
-
-const pushTurn = (from, text) => {
-  const t = String(text || "").trim();
-  if (!t) return;
-  transcriptTurns.push({ from, text: t, at: nowIso() });
-  // cap
-  if (transcriptTurns.length > 400) transcriptTurns = transcriptTurns.slice(-400);
-};
-
-const extractPhoneCandidates = (text) => {
-  const t = String(text || "");
-  const digits = t.replace(/\D+/g, "");
-  // Israeli 9-10 digits typical
-  if (digits.length === 9 || digits.length === 10) return digits;
-  if (digits.length > 10) return digits.slice(-10);
-  return "";
-};
-
-const getBizPhonesByHint = (hint) => {
-  const rows = Array.isArray(SHEETS.businessInfo) ? SHEETS.businessInfo : [];
-  const out = [];
-  const h = String(hint || "").toLowerCase();
-  for (const r of rows) {
-    const values = Object.values(r || {}).map((v) => String(v || ""));
-    const joined = values.join(" ").toLowerCase();
-    if (h && !joined.includes(h)) continue;
-    // try find any phone-like field
-    for (const [k, v] of Object.entries(r || {})) {
-      const key = String(k || "").toLowerCase();
-      const val = String(v || "").trim();
-      if (!val) continue;
-      if (key.includes("phone") || key.includes("טלפון") || key.includes("מספר")) {
-        out.push(val);
-      }
-    }
-  }
-  return Array.from(new Set(out)).slice(0, 10);
-};
-
-const normalizeKeywords = (s) =>
-  String(s || "")
-    .split(/[,;\n\r\t]+/)
-    .map((x) => x.trim())
-    .filter(Boolean);
-
-const pickRouteFromRules = (text) => {
-  const t = String(text || "").toLowerCase();
-  const rules = Array.isArray(SHEETS.routingRules) ? SHEETS.routingRules : [];
-  const scored = [];
-  for (const r of rules) {
-    const routeVal = (r.route || r.intent || r.Route || r.ROUTE || "").toString().trim();
-    const pr = Number(r.priority || r.Priority || r.PRIORITY || 999);
-    // find any keyword field
-    let kws = [];
-    for (const [k, v] of Object.entries(r || {})) {
-      const key = String(k || "").toLowerCase();
-      if (key.includes("keyword") || key.includes("keywords") || key.includes("מילות")) {
-        kws = kws.concat(normalizeKeywords(v));
-      }
-    }
-    kws = kws.map((x) => x.toLowerCase());
-    if (!routeVal || !kws.length) continue;
-    const hit = kws.some((kw) => kw && t.includes(kw));
-    if (hit) scored.push({ route: routeVal, priority: Number.isFinite(pr) ? pr : 999 });
-  }
-  scored.sort((a, b) => a.priority - b.priority);
-  return scored[0]?.route || "";
-};
-
-const parseHours = (s) => {
-  // expects like "09:00-18:00" or "09:00–18:00"
-  const m = String(s || "").match(/(\d{1,2}):(\d{2})\s*[-–]\s*(\d{1,2}):(\d{2})/);
-  if (!m) return null;
-  const aH = Number(m[1]), aM = Number(m[2]), bH = Number(m[3]), bM = Number(m[4]);
-  if (![aH, aM, bH, bM].every((x) => Number.isFinite(x))) return null;
-  return { start: aH * 60 + aM, end: bH * 60 + bM };
-};
-
-const isAfterHours = () => {
-  const hoursStr =
-    getSetting("BUSINESS_HOURS", "") ||
-    getSetting("HOURS", "") ||
-    getSetting("WORKING_HOURS", "") ||
-    "";
-  const parsed = parseHours(hoursStr);
-  if (!parsed) return false; // if unknown, do not force after-hours
-  // Use local time in TIME_ZONE
-  const now = new Date();
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone: TIME_ZONE,
-    hour12: false,
-    hour: "2-digit",
-    minute: "2-digit"
-  }).formatToParts(now);
-  const hh = Number(parts.find((p) => p.type === "hour")?.value || 0);
-  const mm = Number(parts.find((p) => p.type === "minute")?.value || 0);
-  const cur = hh * 60 + mm;
-  return cur < parsed.start || cur > parsed.end;
-};
-
-const buildProxyInstructions = (callerText) => {
-  const t = String(callerText || "").trim();
-  if (!t) return "";
-
-  // Decide route by rules (soft) + heuristics
-  const byRules = pickRouteFromRules(t);
-  if (byRules) route = String(byRules).toLowerCase();
-  else {
-    const low = t.toLowerCase();
-    if (/(אחריות|תקלה|בעיה|שירות|החלפה|החזרה|לא עובד|תקול)/.test(low)) route = "support";
-    else if (/(משלוח|אספקה|שליח|הזמנה|הגיע|לא הגיע|מוביל)/.test(low)) route = "delivery";
-    else if (/(מחיר|לקנות|רכישה|מוצר|דגם|מידה|צבע|מלאי|כמה עולה|מבצע)/.test(low)) route = "sales";
-    else route = "other";
-  }
-
-  const doNotSay = getPrompt("DO_NOT_SAY", "") || getSetting("DO_NOT_SAY", "");
-  const mustNotLieDelivery =
-    "אין לך גישה לסטטוס משלוח אמיתי. אסור להגיד 'בדקתי סטטוס' או להבטיח שראית מערכת משלוחים.";
-
-  // Pull script snippets (soft, not FSM)
-  const salesBlocks = Array.isArray(SHEETS.salesScript) ? SHEETS.salesScript : [];
-  const supportBlocks = Array.isArray(SHEETS.supportScript) ? SHEETS.supportScript : [];
-
-  const pickTopScriptLines = (rows, max = 6) => {
-    const out = [];
-    for (const r of rows) {
-      const v = r.content_he || r.text_he || r.text || r.he || "";
-      const s = String(v || "").trim();
-      if (s) out.push(s);
-      if (out.length >= max) break;
-    }
-    return out;
-  };
-
-  const salesHints = pickTopScriptLines(salesBlocks, 6);
-  const supportHints = pickTopScriptLines(supportBlocks, 6);
-
-  const carrierPhones = getBizPhonesByHint("מוביל").concat(getBizPhonesByHint("carrier"));
-
-  const afterHours = route === "delivery" && isAfterHours();
-
-  const baseStyle =
-    "סגנון: נטע. תשובות קצרות, ענייניות, אנושיות. משפט-שניים ואז שאלה מקדמת.";
-
-  let inst = "";
-  inst += baseStyle + "\n";
-  inst += "תעדיפי ידע מהשיטס (BUSINESS_INFO/ROUTING_RULES/SALES_SCRIPT/SUPPORT_SCRIPT) על פני המצאות.\n";
-
-  if (doNotSay) {
-    inst += "DO_NOT_SAY (אסור להגיד/להבטיח):\n" + doNotSay + "\n";
-  }
-
-  if (route === "delivery") {
-    inst += mustNotLieDelivery + "\n";
-    if (afterHours) {
-      inst += "זה אחרי שעות פעילות. תני ללקוח מספרי מובילים אם יש, קחי הודעה קצרה והבטיחי שיחזרו אליהם בשעות פעילות.\n";
-      if (carrierPhones.length) {
-        inst += "מספרי מובילים זמינים: " + carrierPhones.join(", ") + "\n";
-      } else {
-        inst += "אם אין מספרי מובילים בשיטס, בקשי מהלקוח פרטים והודעה והבטיחי חזרה.\n";
-      }
-    } else {
-      inst += "אם הלקוח מבקש סטטוס, הסבירי שאין גישה לסטטוס בזמן אמת והציעי להעביר פנייה לנציג/לחזור אליהם.\n";
-    }
-  } else if (route === "support") {
-    if (supportHints.length) {
-      inst += "תסריט תמיכה (רמזים מהשיטס):\n- " + supportHints.join("\n- ") + "\n";
-    }
-    inst += "מטרה: להבין תקלה בקצרה, פרטי הזמנה/מוצר, ולסגור עם הבטחה לחזרה.\n";
-  } else if (route === "sales") {
-    if (salesHints.length) {
-      inst += "תסריט מכירה (רמזים מהשיטס):\n- " + salesHints.join("\n- ") + "\n";
-    }
-    inst += "מטרה: לאסוף עניין (סוג מוצר/דגם/מותג) ואז פרטי חזרה (אפשר להציע להשתמש במספר המזוהה).\n";
-  } else {
-    inst += "אם לא ברור, תשאלי שאלה אחת להבהרה (מכירה/שירות/משלוח).\n";
-  }
-
-  // If we detect phone digits, acknowledge and proceed
-  const phone = extractPhoneCandidates(t);
-  if (phone) inst += `זוהה מספר בטקסט: ${phone}. אל תחזרי עליו אם לא צריך.\n`;
-
-  return inst.trim();
-};
-
-  const printCallerFinal = (text) => {
-    const t = String(text || "").trim();
-    if (!t) return;
-    if (t === lastCallerFinal) return;
-    lastCallerFinal = t;
-    pushTurn("caller", t);
-    // Update proxy instructions for next response (Option B)
-    proxyInstructions = buildProxyInstructions(t);
-    always(`[CALLER][${connTag}]`, t);
-  };
-
-  const printBotFinal = (text) => {
-    const t = String(text || "").trim();
-    if (!t) return;
-    if (t === lastBotFinal) return;
-    lastBotFinal = t;
-    pushTurn("bot", t);
-    always(`[BOT][${connTag}]`, t);
-  };
-
-  // NOTE: declare openaiWs variable early so closures can reference safely
-  let openaiWs = null;
-
-  const safeOpenAISend = (obj) => {
-    try {
-      if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
-        openaiWs.send(JSON.stringify(obj));
-        return true;
-      }
-      return false;
-    } catch (e) {
-      error("OpenAI send failed", e.message);
-      return false;
-    }
-  };
-
-  const safeTwilioSend = (obj) => {
-    try {
-      if (twilioWs && twilioWs.readyState === WebSocket.OPEN) {
-        twilioWs.send(JSON.stringify(obj));
-        return true;
-      }
-      return false;
-    } catch (e) {
-      error("Twilio send failed", e.message);
-      return false;
-    }
-  };
-
-  if (!OPENAI_API_KEY) {
-    error("OPENAI_API_KEY missing — closing call");
-    try {
-      twilioWs.close();
-    } catch (_) {}
-    return;
-  }
-
-  // -----------------------------
-  // Anti-overlap: only ONE active response at a time
-  // -----------------------------
-  let awaitingResponse = false;
-  let pendingResponseRequest = false;
-
-  const requestAssistantResponse = (reason = "") => {
-    if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN) return;
-
-    // If a response is already running - remember we owe ONE more response after it's done
-    if (awaitingResponse) {
-      pendingResponseRequest = true;
-      debug(`[${connTag}] response.request queued (awaitingResponse=true) reason=${reason}`);
-      return;
-    }
-
-    awaitingResponse = true;
-    pendingResponseRequest = false;
-
-    debug(`[${connTag}] response.create (reason=${reason})`);
-    safeOpenAISend({
-      type: "response.create",
-      response: { modalities: ["audio", "text"] }
-    });
-  };
-
-  debug(`[${connTag}] Creating OpenAI WS... model=${OPENAI_REALTIME_MODEL} voice=${OPENAI_VOICE}`);
-
-  openaiWs = new WebSocket(
-    `wss://api.openai.com/v1/realtime?model=${OPENAI_REALTIME_MODEL}`,
-    {
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        "OpenAI-Beta": "realtime=v1"
-      }
-    }
-  );
+  const openaiWs = new WebSocket(`wss://api.openai.com/v1/realtime?model=${OPENAI_REALTIME_MODEL}`, {
+    headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "OpenAI-Beta": "realtime=v1" }
+  });
 
   openaiWs.on("open", async () => {
-    debug(`[${connTag}] OpenAI connected`);
     openaiReady = true;
+    if (!SHEETS.loaded_at) await loadSheets();
+    
+    const master = SHEETS.prompts["MASTER_PROMPT"] || "את נטע מגיל ספורט.";
+    const opening = SHEETS.settings["OPENING_SCRIPT"] || "שלום, מדברת נטע.";
 
-    // Ensure sheets loaded before config
-    if (!SHEETS.loaded_at) {
-      debug(`[${connTag}] Sheets not loaded yet. Loading now...`);
-      await loadSheets();
-    }
-
-    // ✅ Master prompt stays in PROMPTS
-    const masterPrompt = getPrompt(
-      "MASTER_PROMPT",
-      "אתם עוזרת קולית בשם נטע עבור גיל ספורט. דברו קצר, קליל וברור."
-    );
-
-    // ✅ Opening script comes from SETTINGS
-    const openingScript = getSetting("OPENING_SCRIPT", "שלום, מדברת נטע מגיל ספורט.");
-
-    always(`[${connTag}] SOURCES`, {
-      sheets_loaded_at: SHEETS.loaded_at,
-      opening_from: "SETTINGS.OPENING_SCRIPT",
-      master_from: "PROMPTS.MASTER_PROMPT",
-      opening_preview: preview(openingScript, 220),
-      master_preview: preview(masterPrompt, 220)
-    });
-
-    const session = {
-      modalities: ["audio", "text"],
-      voice: OPENAI_VOICE,
-      input_audio_format: "g711_ulaw",
-      output_audio_format: "g711_ulaw",
-      turn_detection: {
-        type: "server_vad",
-        threshold: MB_VAD_THRESHOLD,
-        silence_duration_ms: MB_VAD_SILENCE_MS,
-        prefix_padding_ms: MB_VAD_PREFIX_MS
-      },
-      instructions: masterPrompt
-    };
-
-    // ✅ enable caller transcription
-    if (MB_ENABLE_TRANSCRIPTION) {
-      session.input_audio_transcription = { model: MB_TRANSCRIPTION_MODEL };
-    }
-
-    safeOpenAISend({ type: "session.update", session });
-
-    // ✅ Make the bot SAY the opening verbatim (one-time override)
-    awaitingResponse = true;
-    pendingResponseRequest = false;
-
-    safeOpenAISend({
-      type: "response.create",
-      response: {
-        modalities: ["audio", "text"],
-        instructions:
-          `תגידי עכשיו בדיוק את המשפט הבא מילה במילה, ללא תוספות וללא שאלות:\n` +
-          `${openingScript}`
+    openaiWs.send(JSON.stringify({
+      type: "session.update",
+      session: {
+        voice: OPENAI_VOICE,
+        instructions: master,
+        turn_detection: { type: "server_vad", threshold: MB_VAD_THRESHOLD, silence_duration_ms: MB_VAD_SILENCE_MS }
       }
-    });
+    }));
 
-    // Flush buffered audio
-    while (pendingAudio.length > 0 && openaiWs && openaiWs.readyState === WebSocket.OPEN) {
-      const audio = pendingAudio.shift();
-      safeOpenAISend({ type: "input_audio_buffer.append", audio });
-    }
-  });
-
-  openaiWs.on("error", (e) => {
-    RUNTIME.openai_errors += 1;
-    error(`[${connTag}] OpenAI websocket error`, e?.message || e);
-    try {
-      twilioWs.close();
-    } catch (_) {}
-  });
-
-  openaiWs.on("close", () => {
-    RUNTIME.openai_closed += 1;
-    debug(`[${connTag}] OpenAI closed`);
-    try {
-      twilioWs.close();
-    } catch (_) {}
+    openaiWs.send(JSON.stringify({
+      type: "response.create",
+      response: { modalities: ["audio", "text"], instructions: `תגידי בדיוק: ${opening}` }
+    }));
+    callWebhook({ event: "call_started", caller: callerNum });
   });
 
   openaiWs.on("message", (data) => {
-    let msg;
-    try {
-      msg = JSON.parse(data.toString());
-    } catch (e) {
-      error(`[${connTag}] OpenAI message JSON parse failed`, e.message);
-      return;
+    const msg = JSON.parse(data.toString());
+    if (msg.type === "response.audio_transcript.done") {
+      fullTranscript.push(`Bot: ${msg.transcript}`);
     }
-
-    // RAW dump when needed
-    if (MB_LOG_RAW_OPENAI) {
-      const small = { type: msg.type, event_id: msg.event_id };
-      if (msg.delta) small.delta_len = String(msg.delta).length;
-      if (msg.transcript) small.transcript = preview(msg.transcript, 200);
-      if (msg.text) small.text = preview(msg.text, 200);
-      always(`[RAW_OPENAI][${connTag}]`, JSON.stringify(small));
-    }
-
-    if (msg.type === "error") {
-      error(`[${connTag}] OpenAI error event`, msg);
-      return;
-    }
-
-    // -----------------------------
-    // BOT FINAL (clean)
-    // -----------------------------
-    if (MB_LOG_TRANSCRIPTS && msg.type === "response.audio_transcript.done") {
-      const t = String(msg.transcript || "").trim();
-      if (t) printBotFinal(t);
-      return;
-    }
-
-    // -----------------------------
-    // CALLER FINAL (robust)
-    // -----------------------------
-    if (MB_LOG_TRANSCRIPTS) {
-      const type = String(msg.type || "");
-      const doneLike = type.includes("done") || type.includes("completed");
-
-      const possible =
-        msg.transcript ||
-        msg.text ||
-        msg?.item?.content?.[0]?.transcript ||
-        msg?.item?.content?.[0]?.text ||
-        "";
-
-      const isInputTranscript =
-        type.includes("input_audio_transcription") ||
-        type.includes("input_audio_transcript") ||
-        type.includes("conversation.item.input_audio_transcription");
-
-      if (doneLike && isInputTranscript && possible) {
-        printCallerFinal(String(possible).trim());
-        // after we got user final, request assistant response (if not already)
-        requestAssistantResponse("caller_transcript_done");
-        return;
+    if (msg.type === "conversation.item.input_audio_transcription.completed") {
+      const t = msg.transcript?.trim();
+      if (t) {
+        lastText = t;
+        fullTranscript.push(`User: ${t}`);
+        hasTranscripts = true;
+        const inj = getKnowledgeInjection(t);
+        if (inj) {
+          openaiWs.send(JSON.stringify({
+            type: "conversation.item.create",
+            item: { type: "message", role: "system", content: [{ type: "input_text", text: inj }] }
+          }));
+        }
+        openaiWs.send(JSON.stringify({ type: "response.create" }));
       }
     }
-
-    // -----------------------------
-    // Turn boundary events (safe trigger)
-    // -----------------------------
-    if (msg.type === "input_audio_buffer.speech_stopped") {
-      requestAssistantResponse("speech_stopped");
-      return;
-    }
-
-    // -----------------------------
-    // response lifecycle
-    // -----------------------------
-    if (msg.type === "response.done") {
-      awaitingResponse = false;
-
-      // If something arrived while we were speaking - do exactly ONE next response
-      if (pendingResponseRequest) {
-        debug(`[${connTag}] response.done -> draining pendingResponseRequest`);
-        // drain once
-        pendingResponseRequest = false;
-        requestAssistantResponse("pending_after_done");
-      }
-      return;
-    }
-
-    // -----------------------------
-    // AUDIO back to Twilio
-    // -----------------------------
-    if (msg.type === "response.audio.delta") {
-      if (!twilioStreamSid) return;
-
-      safeTwilioSend({
-        event: "media",
-        streamSid: twilioStreamSid,
-        media: { payload: msg.delta || "" }
-      });
-      return;
+    if (msg.type === "response.audio.delta" && streamSid) {
+      twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload: msg.delta } }));
     }
   });
 
   twilioWs.on("message", (data) => {
-    let msg;
-    try {
-      msg = JSON.parse(data.toString());
-    } catch (e) {
-      error(`[${connTag}] Twilio message JSON parse failed`, e.message);
-      return;
+    const msg = JSON.parse(data.toString());
+    if (msg.event === "start") {
+      streamSid = msg.start.streamSid;
+      callerNum = msg.start.customParameters?.caller || "";
     }
-
-    if (msg.event === "start" && msg.start?.streamSid) {
-      twilioStreamSid = msg.start.streamSid;
-      callSid = msg.start?.callSid || callSid;
-      startedAt = startedAt || nowIso();
-      // call_started webhook (once)
-      sendWebhookEvent("call_started", {
-        callSid,
-        streamSid: twilioStreamSid,
-        caller,
-        called,
-        started_at: startedAt,
-        language,
-        route
-      });
-      always(
-        `[TWILIO_START][${connTag}]`,
-        JSON.stringify({
-          streamSid: twilioStreamSid,
-          callSid: msg.start?.callSid,
-          tracks: msg.start?.tracks,
-          mediaFormat: msg.start?.mediaFormat
-        })
-      );
-      return;
+    if (msg.event === "media" && openaiReady) {
+      openaiWs.send(JSON.stringify({ type: "input_audio_buffer.append", audio: msg.media.payload }));
     }
-
-    if (msg.event === "media" && msg.media?.payload) {
-      const payload = msg.media.payload;
-
-      if (!openaiReady || !openaiWs || openaiWs.readyState !== WebSocket.OPEN) {
-        pendingAudio.push(payload);
-        if (pendingAudio.length > 400) pendingAudio.splice(0, pendingAudio.length - 400);
-        return;
-      }
-
-      safeOpenAISend({
-        type: "input_audio_buffer.append",
-        audio: payload
-      });
-      return;
-    }
-
-    if (msg.event === "stop") {
-      always(`[TWILIO_STOP][${connTag}]`, "stream stopped");
-
-      endedAt = nowIso();
-      const recording_url_public = makeRecordingPublicUrl(callSid);
-
-      if (!sentCallEnded) {
-        sentCallEnded = true;
-        // send route-specific event snapshot before call_ended
-        if (route === "sales") {
-          sendWebhookEvent("sales_lead", {
-            callSid,
-            streamSid: twilioStreamSid,
-            caller,
-            called,
-            started_at: startedAt,
-            ended_at: endedAt,
-            language,
-            route,
-            caller_last_utterance: lastCallerFinal,
-            bot_last_utterance: lastBotFinal,
-            transcript: transcriptTurns,
-            recording_url_public
-          });
-        } else if (route === "support") {
-          sendWebhookEvent("support_ticket", {
-            callSid,
-            streamSid: twilioStreamSid,
-            caller,
-            called,
-            started_at: startedAt,
-            ended_at: endedAt,
-            language,
-            route,
-            caller_last_utterance: lastCallerFinal,
-            bot_last_utterance: lastBotFinal,
-            transcript: transcriptTurns,
-            recording_url_public
-          });
-        } else if (route === "delivery" && isAfterHours()) {
-          sendWebhookEvent("delivery_after_hours", {
-            callSid,
-            streamSid: twilioStreamSid,
-            caller,
-            called,
-            started_at: startedAt,
-            ended_at: endedAt,
-            language,
-            route,
-            caller_last_utterance: lastCallerFinal,
-            bot_last_utterance: lastBotFinal,
-            transcript: transcriptTurns,
-            recording_url_public
-          });
-        }
-
-        // Always send call_ended
-        sendWebhookEvent("call_ended", {
-          callSid,
-          streamSid: twilioStreamSid,
-          caller,
-          called,
-          started_at: startedAt,
-          ended_at: endedAt,
-          language,
-          route,
-          caller_last_utterance: lastCallerFinal,
-          bot_last_utterance: lastBotFinal,
-          transcript: transcriptTurns,
-          recording_url_public
-        });
-      }
-
-      try {
-        if (openaiWs) openaiWs.close();
-      } catch (_) {}
-      return;
-    }
-  });
-
-  twilioWs.on("error", (e) => {
-    RUNTIME.ws_errors += 1;
-    error(`[${connTag}] Twilio websocket error`, e?.message || e);
-    try {
-      if (openaiWs) openaiWs.close();
-    } catch (_) {}
   });
 
   twilioWs.on("close", () => {
-    RUNTIME.ws_closed += 1;
-    RUNTIME.last_ws_close_at = new Date().toISOString();
-    always(`[TWILIO_CLOSE][${connTag}]`, "socket closed");
-
-// If socket closed unexpectedly and we never sent call_ended -> abandoned
-if (!sentCallEnded && !sentCallAbandoned) {
-  sentCallAbandoned = true;
-  endedAt = endedAt || nowIso();
-  const recording_url_public = makeRecordingPublicUrl(callSid);
-  sendWebhookEvent("call_abandoned", {
-    callSid,
-    streamSid: twilioStreamSid,
-    caller,
-    called,
-    started_at: startedAt,
-    ended_at: endedAt,
-    language,
-    route,
-    caller_last_utterance: lastCallerFinal,
-    bot_last_utterance: lastBotFinal,
-    transcript: transcriptTurns,
-    recording_url_public
-  });
-}
-
-    try {
-      if (openaiWs) openaiWs.close();
-    } catch (_) {}
+    callWebhook({
+      event: hasTranscripts ? "call_ended" : "call_abandoned",
+      callSid: streamSid,
+      caller: callerNum,
+      transcript: fullTranscript.join("\n"),
+      recording_url_public: `https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_ACCOUNT_SID}/Recordings/${streamSid}`
+    });
+    if (openaiWs) openaiWs.close();
   });
 });
 
-// --------------------------------------------------
-// Start
-// --------------------------------------------------
 server.listen(PORT, () => {
-  log(`GilSport VoiceBot running on port ${PORT}`);
+  log(`Server listening on port ${PORT}`);
   loadSheets();
-
-  always("BOOT", {
-    at: RUNTIME.booted_at,
-    port: PORT,
-    MB_DEBUG,
-    has_OPENAI_API_KEY: Boolean(OPENAI_API_KEY),
-    OPENAI_REALTIME_MODEL,
-    OPENAI_VOICE,
-    has_GSHEET_ID: Boolean(GSHEET_ID),
-    has_GOOGLE_SERVICE_ACCOUNT_JSON_B64: Boolean(GOOGLE_SERVICE_ACCOUNT_JSON_B64),
-    has_TWILIO_ACCOUNT_SID: Boolean(TWILIO_ACCOUNT_SID),
-    has_TWILIO_AUTH_TOKEN: Boolean(TWILIO_AUTH_TOKEN),
-    PUBLIC_BASE_URL,
-    TIME_ZONE,
-    MB_LOG_TRANSCRIPTS,
-    MB_ENABLE_TRANSCRIPTION,
-    MB_TRANSCRIPTION_MODEL,
-    MB_LOG_RAW_OPENAI
-  });
 });
