@@ -686,7 +686,17 @@ wss.on("connection", (twilioWs, req) => {
     }
 
     // After-hours check (uses SETTINGS hours if present; if unknown -> false)
-    const afterHours = route === "delivery" && isAfterHours();
+    // We also treat phrases like "אחרי שעות" or "אחרי שעות הפעילות" in the caller text as hints
+    // that the caller expects information outside of business hours. This allows the assistant
+    // to offer after-hours delivery options even if the current time is within working hours.
+    let afterHours = false;
+    if (route === "delivery") {
+      // detect explicit mentions of being after hours in the caller's utterance
+      const afterHoursHint = /(אחרי\s+שעות|אחרי\s+שעות\s+הפעילות|לאחר\s+שעות\s+הפעילות|מחוץ\s+לשעות\s+הפעילות)/.test(
+        low
+      );
+      afterHours = isAfterHours() || afterHoursHint;
+    }
 
     const baseStyle =
       "סגנון: נטע. תשובות קצרות, ענייניות, אנושיות. משפט-שניים ואז שאלה מקדמת. לא לחפור, לא לחזור על עצמך.";
@@ -698,18 +708,35 @@ wss.on("connection", (twilioWs, req) => {
     );
     // Always instruct the assistant to read numbers digit by digit and repeat phone numbers exactly as given
     parts.push(
-      "כאשר את מציינת מספר טלפון או קוד (כמו קוד קופון), הקריאי כל ספרה בנפרד – למשל: 5 5 5 5. אם את חוזרת על מספר טלפון שנאמר, הקריאי אותו בדיוק כפי שהלקוח אמר, ספרה־ספרה, ללא חזרות או השמטה. אל תקראי מספרים ברצף אחד. אם מתאים – ניתן גם להגיד שהטלפון נרשם בלי לחזור עליו, במקום לקרוא אותו שוב."
+      "כאשר את מציינת מספר טלפון או קוד (כמו קוד קופון), הקריאי כל ספרה בנפרד – למשל: 5 5 5 5. " +
+        "אם את חוזרת על מספר טלפון שנאמר, הקריאי אותו בדיוק כפי שהלקוח אמר, ספרה־ספרה, ללא חזרות או השמטה. " +
+        "אל תקראי מספרים ברצף אחד. אם מתאים – ניתן גם להגיד שהטלפון נרשם בלי לחזור עליו, במקום לקרוא אותו שוב."
+    );
+
+    // Never claim that information is unavailable for coupon queries. This prevents the phrase
+    // "אין לי מידע מדויק" from appearing. If you do not have specific info, tell the caller
+    // שהמידע לא נמצא בגיליון ותוכלי להשאיר פרטים לחזרה.
+    parts.push(
+      "אסור לומר 'אין לי מידע' או 'אין לי מידע מדויק'. במקום זאת, אם המידע לא נמצא בשיטס – אמרי שכרגע אין נתון זמין ותציעי להשאיר פרטים לחזרה."
     );
 
     // If caller asks about coupon codes, inject the coupon instruction early so the assistant does not claim missing info
     try {
-      const couponKeywordsEarly = ["קופון", "קוד קופון", "קוד הנחה", "הנחה", "קופון לאתר", "קוד להנחה"];
+      const couponKeywordsEarly = [
+        "קופון",
+        "קוד קופון",
+        "קוד הנחה",
+        "הנחה",
+        "קופון לאתר",
+        "קוד להנחה"
+      ];
       if (couponKeywordsEarly.some((kw) => low.includes(kw))) {
         const couponVal = String(getSetting("SALES_COUPON_CODE", "")).trim();
         if (couponVal) {
           const spacedCouponEarly = couponVal.replace(/\D/g, "").split("").join(" ");
           parts.push(
-            `אם נשאלת על קוד קופון או קוד הנחה, תשיבי מיד: קוד הקופון לרכישה באתר הוא ${spacedCouponEarly}. אל תגידי שאין לך מידע בנושא, מפני שהמידע נמצא בשיטס. אל תמציאי קוד אחר.`
+            `אם שואלים על קופון או על קוד קופון – תשיבי במשפט אחד ובאופן חד-משמעי: קוד הקופון לרכישה באתר הוא ${spacedCouponEarly}. ` +
+              `אל תגידי שאין לך מידע בנושא (המידע נמצא בשיטס), ואל תמציאי קוד אחר. לא להוסיף משפט מקדים לפני הקוד.`
           );
         }
       }
@@ -782,19 +809,27 @@ wss.on("connection", (twilioWs, req) => {
       } catch (_) {}
       parts.push(mustNotLieDelivery);
       if (afterHours) {
+        // Use KB fact row for after-hours same-day delivery queries
         parts.push(
-          "זה אחרי שעות פעילות. תני מספרי מובילים אם יש, קחי הודעה קצרה והבטיחי שיחזרו אליהם בשעות הפעילות."
+          "מבינה. אם האספקה תואמה להיום לאחר שעות הפעילות – אוכל למסור לכם את מספר המוביל."
         );
         if (carrierPhones.length) {
           parts.push(
             "מספרי מובילים: " +
               carrierPhones.join(", ") +
-              ". אל תמציא/י מספרים או שמות מובילים שלא קיימים."
+              ". אל תמציאי מספרים או שמות מובילים שלא קיימים."
+          );
+          // After giving the numbers, instruct to ask if the caller wants to leave a message
+          parts.push(
+            "לאחר מתן מספרי המובילים, שאלי אם תרצו שאעביר קריאה למשרד. אם כן, בקשי שם מלא ומספר טלפון כנדרש; אם לא – ניתן לסיים את השיחה, אך עדיין לשלוח webhook עם הערת סיכום על אספקה להיום."
           );
         } else {
           // fallback when no carrier phones available
           parts.push(
-            "אין לי מספר מוביל זמין כרגע, אוכל להעביר בקשה לחזרה. אל תמציא מספרים."
+            "אין לי מספר מוביל זמין כרגע, אוכל להעביר בקשה לחזרה. אל תמציאי מספרים."
+          );
+          parts.push(
+            "שאלי אם תרצו שאעביר הודעה למשרד. אם כן, קחי שם מלא ומספר טלפון כנדרש; אם לא – ניתן לסיים את השיחה, אך עדיין לשלוח webhook עם הערת סיכום על אספקה להיום."
           );
         }
       } else {
