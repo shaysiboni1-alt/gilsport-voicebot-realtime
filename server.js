@@ -716,6 +716,19 @@ wss.on("connection", (twilioWs, req) => {
       );
     }
 
+    // Sales coupon: if the caller mentions coupon-related words, include the coupon code
+    try {
+      const couponKeywords = ["קופון", "קוד קופון", "קוד הנחה", "הנחה"];
+      if (couponKeywords.some((kw) => low.includes(kw))) {
+        const coupon = String(getSetting("SALES_COUPON_CODE", "")).trim();
+        if (coupon) {
+          parts.push(
+            `לרכישה באתר, ניתן להשתמש בקוד קופון ${coupon}. אל תמציא קוד אחר.`
+          );
+        }
+      }
+    } catch (_) {}
+
     if (route === "delivery") {
       // Include the delivery prompt from the sheet when available
       try {
@@ -728,10 +741,16 @@ wss.on("connection", (twilioWs, req) => {
           "זה אחרי שעות פעילות. תני מספרי מובילים אם יש, קחי הודעה קצרה והבטיחי שיחזרו אליהם בשעות הפעילות."
         );
         if (carrierPhones.length) {
-          parts.push("מספרי מובילים: " + carrierPhones.join(", "));
+          parts.push(
+            "מספרי מובילים: " +
+              carrierPhones.join(", ") +
+              ". אל תמציא/י מספרים או שמות מובילים שלא קיימים."
+          );
         } else {
           // fallback when no carrier phones available
-          parts.push("אין לי מספר מוביל זמין כרגע, אוכל להעביר בקשה לחזרה.");
+          parts.push(
+            "אין לי מספר מוביל זמין כרגע, אוכל להעביר בקשה לחזרה. אל תמציא מספרים."
+          );
         }
       } else {
         parts.push(
@@ -775,7 +794,9 @@ wss.on("connection", (twilioWs, req) => {
         }
         if (brandPhones.length) {
           parts.push(
-            "מספרי יבואנים למותג התקלה: " + brandPhones.join(", ")
+            "מספרי יבואנים למותג התקלה: " +
+              brandPhones.join(", ") +
+              ". אל תמציא/י מספרים או שמות יבואנים."
           );
         }
       } catch (_) {
@@ -1072,10 +1093,17 @@ wss.on("connection", (twilioWs, req) => {
         type.includes("input_audio_transcript") ||
         type.includes("conversation.item.input_audio_transcription");
       if (doneLike && isInputTranscript && possible) {
-        // Update caller final and queue a response if this is a new utterance
-        const before = lastCallerFinal;
-        printCallerFinal(String(possible).trim());
-        if (lastCallerFinal !== before && lastCallerFinal !== lastRequestedCallerFinal) {
+        const utterance = String(possible).trim();
+        // Ignore very short utterances (single word or one syllable) which are often noise
+        const wordCount = utterance.split(/\s+/).filter(Boolean).length;
+        printCallerFinal(utterance);
+        if (
+          wordCount >= 2 &&
+          lastCallerFinal !== lastRequestedCallerFinal &&
+          lastCallerFinal === utterance
+        ) {
+          // Only queue a response when the utterance has at least two words and
+          // we haven't responded to it yet.
           pendingResponseRequest = true;
         }
         return;
