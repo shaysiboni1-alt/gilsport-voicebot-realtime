@@ -721,6 +721,7 @@ wss.on("connection", (twilioWs, req) => {
     );
 
     // If caller asks about coupon codes, inject the coupon instruction early so the assistant does not claim missing info
+    let isCouponQuery = false;
     try {
       const couponKeywordsEarly = [
         "קופון",
@@ -730,7 +731,8 @@ wss.on("connection", (twilioWs, req) => {
         "קופון לאתר",
         "קוד להנחה"
       ];
-      if (couponKeywordsEarly.some((kw) => low.includes(kw))) {
+      isCouponQuery = couponKeywordsEarly.some((kw) => low.includes(kw));
+      if (isCouponQuery) {
         const couponVal = String(getSetting("SALES_COUPON_CODE", "")).trim();
         if (couponVal) {
           const spacedCouponEarly = couponVal.replace(/\D/g, "").split("").join(" ");
@@ -780,9 +782,10 @@ wss.on("connection", (twilioWs, req) => {
       parts.push("DO_NOT_SAY (כללים מחייבים):\n" + doNotSayText);
     }
 
-    if (matchFacts.length) {
+    if (matchFacts.length && !isCouponQuery) {
       parts.push(
-        "עובדות רלוונטיות מהשיטס (להשתמש רק אם מתאים לשאלה):\n" + matchFacts.join("\n")
+        "עובדות רלוונטיות מהשיטס (להשתמש רק אם מתאים לשאלה):\n" +
+          matchFacts.join("\n")
       );
     }
 
