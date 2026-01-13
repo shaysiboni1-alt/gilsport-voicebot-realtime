@@ -687,6 +687,15 @@ wss.on("connection", (twilioWs, req) => {
       "תעדיפי מידע מהשיטס (KB_FACTS/DELIVERY_CONTACTS/DO_NOT_SAY/SUPPLIERS_IMPORTERS) על פני המצאות."
     );
 
+    // Include guardrails and routing prompts if available
+    try {
+      const ps = SHEETS.prompts || {};
+      const guardrailsPrompt = ps.GUARDRAILS_PROMPT || "";
+      const routingPrompt = ps.ROUTING_PROMPT || "";
+      if (guardrailsPrompt) parts.push(guardrailsPrompt.trim());
+      if (routingPrompt) parts.push(routingPrompt.trim());
+    } catch (_) {}
+
     if (doNotSayText) {
       parts.push("DO_NOT_SAY (כללים מחייבים):\n" + doNotSayText);
     }
@@ -698,6 +707,11 @@ wss.on("connection", (twilioWs, req) => {
     }
 
     if (route === "delivery") {
+      // Include the delivery prompt from the sheet when available
+      try {
+        const dp = (SHEETS.prompts || {}).DELIVERY_PROMPT || "";
+        if (dp) parts.push(String(dp).trim());
+      } catch (_) {}
       parts.push(mustNotLieDelivery);
       if (afterHours) {
         parts.push(
@@ -715,6 +729,11 @@ wss.on("connection", (twilioWs, req) => {
         );
       }
     } else if (route === "support") {
+      // Include the support prompt from the sheet when available
+      try {
+        const sp = (SHEETS.prompts || {}).SUPPORT_PROMPT || "";
+        if (sp) parts.push(String(sp).trim());
+      } catch (_) {}
       parts.push(
         "מטרה: להבין תקלה בקצרה, פרטי מוצר/מותג/הזמנה, ולסגור עם הבטחה לחזרה."
       );
@@ -753,10 +772,20 @@ wss.on("connection", (twilioWs, req) => {
         /* ignore brand detection errors */
       }
     } else if (route === "sales") {
+      // Include the sales prompt from the sheet when available
+      try {
+        const sp = (SHEETS.prompts || {}).SALES_PROMPT || "";
+        if (sp) parts.push(String(sp).trim());
+      } catch (_) {}
       parts.push(
         "מטרה: להבין במה מתעניינים (סוג מוצר/דגם/מותג) ואז לקחת פרטי חזרה (אפשר להציע להשתמש במספר המזוהה)."
       );
     } else {
+      // Unknown route: include message-to-manager prompt if available and ask clarifying question
+      try {
+        const mp = (SHEETS.prompts || {}).MESSAGE_TO_MANAGER_PROMPT || "";
+        if (mp) parts.push(String(mp).trim());
+      } catch (_) {}
       parts.push("אם לא ברור, תשאלי שאלה אחת להבהרה: מכירה / שירות / משלוח.");
     }
 
