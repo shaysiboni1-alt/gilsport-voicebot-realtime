@@ -1034,6 +1034,10 @@ wss.on("connection", (twilioWs, req) => {
   // utterance (final transcript). It is consumed on the next response.done.
   let pendingResponseRequest = false;
 
+  // When flushing buffered audio frames back to OpenAI after the assistant
+  // finishes speaking, we temporarily ignore any resulting transcripts.
+  let isFlushingBufferedAudio = false;
+
   const requestAssistantResponse = (reason = "") => {
     // Only send a response if the OpenAI WS is ready
     if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN) return;
@@ -1246,6 +1250,14 @@ wss.on("connection", (twilioWs, req) => {
         const normalized = normalizeTranscript(utterance);
         // Count meaningful words in the normalized text
         const wordCount = normalized.split(/\s+/).filter(Boolean).length;
+        // If we are currently flushing buffered audio, ignore any transcripts generated
+        // by the flush. These partial echoes of prior audio should not trigger new responses.
+        if (isFlushingBufferedAudio) {
+          // still update lastCallerNormalized for diagnostics, but do not queue a response
+          lastCallerNormalized = normalized;
+          lastCallerFinal = utterance;
+          return;
+        }
         printCallerFinal(utterance);
         // Update latest normalized utterance
         lastCallerNormalized = normalized;
@@ -1280,12 +1292,44 @@ wss.on("connection", (twilioWs, req) => {
           "קניה"
         ];
         const hasKeyword = keywordList.some((kw) => normalized.includes(kw));
-        if (
-          normalized &&
-          normalized !== lastRequestedCallerNormalized &&
-          (wordCount >= 4 || hasKeyword)
-        ) {
-          pendingResponseRequest = true;
+        if (normalized) {
+          let isDup = false;
+          // Consider it a duplicate if the new normalized utterance is identical to the
+          // last one we responded to, or one contains the other. This avoids
+          // triggering multiple responses for slight transcription differences.
+          if (lastRequestedCallerNormalized) {
+            if (normalized === lastRequestedCallerNormalized) {
+              isDup = true;
+            } else if (normalized.startsWith(lastRequestedCallerNormalized)) {
+              isDup = true;
+            } else if (lastRequestedCallerNormalized.startsWith(normalized)) {
+              isDup = true;
+            }
+          }
+          // Also treat as duplicate if the utterance contains only filler acknowledgements
+          const fillerPhrases = [
+            "תודה",
+            "תודה רבה",
+            "כן",
+            "סבבה",
+            "בבקשה",
+            "תודה על הקופון",
+            "בסדר"
+          ];
+          if (!isDup) {
+            for (const fp of fillerPhrases) {
+              if (normalized === fp || normalized.startsWith(fp + " ") || normalized.endsWith(" " + fp)) {
+                isDup = true;
+                break;
+              }
+            }
+          }
+          if (!isDup && (wordCount >= 4 || hasKeyword)) {
+            // require at least 5 meaningful words or a keyword to trigger a new response
+            if (wordCount >= 5 || hasKeyword) {
+              pendingResponseRequest = true;
+            }
+          }
         }
         return;
       }
@@ -1303,12 +1347,20 @@ wss.on("connection", (twilioWs, req) => {
     // response lifecycle
     if (msg.type === "response.done") {
       awaitingResponse = false;
-      // Flush any buffered audio frames that arrived while assistant was speaking
+      // Flush any buffered audio frames that arrived while assistant was speaking.
+      // We mark that we are flushing so that any resulting transcriptions do not
+      // trigger a new response inadvertently.
       if (Array.isArray(pausedAudioBuffer) && pausedAudioBuffer.length > 0) {
+        isFlushingBufferedAudio = true;
         while (pausedAudioBuffer.length > 0) {
           const audioFrame = pausedAudioBuffer.shift();
           safeOpenAISend({ type: "input_audio_buffer.append", audio: audioFrame });
         }
+        // give OpenAI some time to process the flush before accepting new transcripts
+        // we don't await here, but we reset the flag on the next tick
+        setTimeout(() => {
+          isFlushingBufferedAudio = false;
+        }, 50);
       }
       // If we have a pending caller utterance, and we haven't already
       // responded to it, send one response now. We rely on the check
