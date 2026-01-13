@@ -100,7 +100,14 @@ const nowIso = () => new Date().toISOString();
 async function sendWebhookEvent(event, payload) {
   if (!MB_WEBHOOK_URL) return false;
   try {
-    const body = JSON.stringify({ event, ...payload });
+    const callSid = payload && payload.callSid ? String(payload.callSid) : "";
+    const recording_url_public =
+      payload && Object.prototype.hasOwnProperty.call(payload, "recording_url_public")
+        ? payload.recording_url_public
+        : makeRecordingPublicUrl(callSid);
+
+    // Recording link must be present on EVERY webhook message (including abandoned).
+    const body = JSON.stringify({ event, ...payload, recording_url_public });
     const resp = await fetch(MB_WEBHOOK_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -316,14 +323,14 @@ app.get("/diag/sheets", (_, res) => {
     ok: true,
     sheets_loaded_at: SHEETS.loaded_at,
     counts: {
-  prompts: Object.keys(SHEETS.prompts || {}).length,
-  settings: Object.keys(SHEETS.settings || {}).length,
-  kbFacts: (SHEETS.kbFacts || []).length,
-  doNotSay: (SHEETS.doNotSay || []).length,
-  suppliersImporters: (SHEETS.suppliersImporters || []).length,
-  deliveryContacts: (SHEETS.deliveryContacts || []).length
-}
-);
+      prompts: Object.keys(SHEETS.prompts || {}).length,
+      settings: Object.keys(SHEETS.settings || {}).length,
+      kbFacts: (SHEETS.kbFacts || []).length,
+      doNotSay: (SHEETS.doNotSay || []).length,
+      suppliersImporters: (SHEETS.suppliersImporters || []).length,
+      deliveryContacts: (SHEETS.deliveryContacts || []).length
+    }
+  });
 });
 
 // Public recording proxy (optional). If Twilio creds missing -> 404.
@@ -565,8 +572,7 @@ const buildProxyInstructions = (callerText) => {
     })
     .filter(Boolean)
     .slice(0, 20)
-    .join("
-");
+	    .join("\n");
 
   const mustNotLieDelivery =
     "אין לך גישה לסטטוס משלוח אמיתי. אסור להגיד 'בדקתי סטטוס' או להבטיח שראית מערכת משלוחים.";
@@ -576,9 +582,7 @@ const buildProxyInstructions = (callerText) => {
   const carrierPhones = deliveryRows
     .filter((r) => {
       const ck = String(r.condition_keywords || "").toLowerCase();
-      return !ck || ck.split(/[,;
-
-	]+/).some((kw) => kw.trim() && low.includes(kw.trim()));
+	      return !ck || ck.split(/[,;\n\r\t]+/).some((kw) => kw.trim() && low.includes(kw.trim()));
     })
     .map((r) => String(r.phone_e164 || r.phone || "").trim())
     .filter(Boolean)
@@ -590,9 +594,7 @@ const buildProxyInstructions = (callerText) => {
   for (const r of factsRows) {
     const kw = String(r.keywords || "").toLowerCase();
     if (!kw) continue;
-    const kws = kw.split(/[,;
-
-	]+/).map((x) => x.trim()).filter(Boolean);
+	    const kws = kw.split(/[,;\n\r\t]+/).map((x) => x.trim()).filter(Boolean);
     if (!kws.length) continue;
     if (kws.some((k) => k && low.includes(k))) {
       const ans = String(r.answer_he || "").trim();
@@ -607,51 +609,38 @@ const buildProxyInstructions = (callerText) => {
   const baseStyle =
     "סגנון: נטע. תשובות קצרות, ענייניות, אנושיות. משפט-שניים ואז שאלה מקדמת. לא לחפור, לא לחזור על עצמך.";
 
-  let inst = "";
-  inst += baseStyle + "
-";
-  inst += "תעדיפי מידע מהשיטס (KB_FACTS/DELIVERY_CONTACTS/DO_NOT_SAY/SUPPLIERS_IMPORTERS) על פני המצאות.
-";
+	  const parts = [];
+	  parts.push(baseStyle);
+	  parts.push("תעדיפי מידע מהשיטס (KB_FACTS/DELIVERY_CONTACTS/DO_NOT_SAY/SUPPLIERS_IMPORTERS) על פני המצאות.");
 
-  if (doNotSayText) {
-    inst += "DO_NOT_SAY (כללים מחייבים):
-" + doNotSayText + "
-";
-  }
+	  if (doNotSayText) {
+	    parts.push("DO_NOT_SAY (כללים מחייבים):\n" + doNotSayText);
+	  }
 
-  if (matchFacts.length) {
-    inst += "עובדות רלוונטיות מהשיטס (להשתמש רק אם מתאים לשאלה):
-" + matchFacts.join("
-") + "
-";
-  }
+	  if (matchFacts.length) {
+	    parts.push("עובדות רלוונטיות מהשיטס (להשתמש רק אם מתאים לשאלה):\n" + matchFacts.join("\n"));
+	  }
 
-  if (route === "delivery") {
-    inst += mustNotLieDelivery + "
-";
-    if (afterHours) {
-      inst += "זה אחרי שעות פעילות. תני מספרי מובילים אם יש, קחי הודעה קצרה והבטיחי שיחזרו אליהם בשעות פעילות.
-";
-      if (carrierPhones.length) inst += "מספרי מובילים: " + carrierPhones.join(", ") + "
-";
-    } else {
-      inst += "אם מבקשים סטטוס משלוח: להסביר שאין סטטוס בזמן אמת ולהציע להשאיר הודעה/פרטים לחזרה.
-";
-    }
-  } else if (route === "support") {
-    inst += "מטרה: להבין תקלה בקצרה, פרטי מוצר/מותג/הזמנה, ולסגור עם הבטחה לחזרה.
-";
-  } else if (route === "sales") {
-    inst += "מטרה: להבין במה מתעניינים (סוג מוצר/דגם/מותג) ואז לקחת פרטי חזרה (אפשר להציע להשתמש במספר המזוהה).
-";
-  } else {
-    inst += "אם לא ברור, תשאלי שאלה אחת להבהרה: מכירה / שירות / משלוח.
-";
-  }
+	  if (route === "delivery") {
+	    parts.push(mustNotLieDelivery);
+	    if (afterHours) {
+	      parts.push("זה אחרי שעות פעילות. תני מספרי מובילים אם יש, קחי הודעה קצרה והבטיחי שיחזרו אליהם בשעות פעילות.");
+	      if (carrierPhones.length) parts.push("מספרי מובילים: " + carrierPhones.join(", "));
+	    } else {
+	      parts.push("אם מבקשים סטטוס משלוח: להסביר שאין סטטוס בזמן אמת ולהציע להשאיר הודעה/פרטים לחזרה.");
+	    }
+	  } else if (route === "support") {
+	    parts.push("מטרה: להבין תקלה בקצרה, פרטי מוצר/מותג/הזמנה, ולסגור עם הבטחה לחזרה.");
+	  } else if (route === "sales") {
+	    parts.push("מטרה: להבין במה מתעניינים (סוג מוצר/דגם/מותג) ואז לקחת פרטי חזרה (אפשר להציע להשתמש במספר המזוהה).");
+	  } else {
+	    parts.push("אם לא ברור, תשאלי שאלה אחת להבהרה: מכירה / שירות / משלוח.");
+	  }
+
+	  let inst = parts.join("\n\n");
 
   const phone = extractPhoneCandidates(t);
-  if (phone) inst += `זוהה מספר בטקסט: ${phone}. אל תחזרי עליו אם לא צריך.
-`;
+	  if (phone) inst += `זוהה מספר בטקסט: ${phone}. אל תחזרי עליו אם לא צריך.\n`;
 
   return inst.trim();
 };
