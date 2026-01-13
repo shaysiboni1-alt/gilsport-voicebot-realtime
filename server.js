@@ -726,9 +726,11 @@ wss.on("connection", (twilioWs, req) => {
       const couponKeywords = ["קופון", "קוד קופון", "קוד הנחה", "הנחה"];
       if (couponKeywords.some((kw) => low.includes(kw))) {
         const coupon = String(getSetting("SALES_COUPON_CODE", "")).trim();
-        if (coupon) {
+      if (coupon) {
+          // Insert spaces between digits to ensure the assistant reads them one by one
+          const spacedCoupon = coupon.replace(/\D/g, "").split("").join(" ");
           parts.push(
-            `לרכישה באתר, ניתן להשתמש בקוד קופון ${coupon}. אל תמציא קוד אחר.`
+            `לרכישה באתר, ניתן להשתמש בקוד קופון ${spacedCoupon}. אל תמציא קוד אחר.`
           );
         }
       }
@@ -833,6 +835,49 @@ wss.on("connection", (twilioWs, req) => {
     return inst.trim();
   };
 
+  /**
+   * Normalize an input transcript for duplicate detection.
+   * This helper removes common greetings and filler words,
+   * strips punctuation and extra whitespace, and lowercases the result.
+   * It allows us to compare two caller utterances for semantic equality
+   * even if they differ slightly in casing or punctuation. We define
+   * greetings that should not trigger a new response (e.g. "היי", "שלום", "ביי").
+   */
+  const normalizeTranscript = (s) => {
+    try {
+      let t = String(s || "").toLowerCase();
+      // Remove punctuation
+      t = t.replace(/[\.,!?\-–—;:'"\u05be]/g, " ");
+      // Replace multiple spaces
+      t = t.replace(/\s+/g, " ").trim();
+      // Remove common greetings and filler words at start or end
+      const greetings = [
+        "היי",
+        "הי",
+        "שלום",
+        "ביי",
+        "היי שלום",
+        "היי, שלום",
+        "היי שלום לך",
+        "שלום לך",
+        "ביי שלום",
+        "ביי, שלום"
+      ];
+      // Remove greeting phrases from beginning
+      for (const g of greetings) {
+        if (t.startsWith(g + " ")) t = t.slice(g.length).trim();
+        if (t === g) return "";
+      }
+      return t;
+    } catch (_) {
+      return String(s || "").trim().toLowerCase();
+    }
+  };
+
+  // Keep track of normalized caller utterances to prevent duplicate responses
+  let lastCallerNormalized = "";
+  let lastRequestedCallerNormalized = "";
+
   const printCallerFinal = (text) => {
     const t = String(text || "").trim();
     if (!t) return;
@@ -917,6 +962,7 @@ wss.on("connection", (twilioWs, req) => {
 
     // Mark that we've responded to the most recent caller utterance
     lastRequestedCallerFinal = lastCallerFinal;
+    lastRequestedCallerNormalized = lastCallerNormalized;
 
     // Build dynamic instructions for this turn. If proxyInstructions is empty,
     // fall back to master prompt. We rebuild instructions here because the
@@ -1099,16 +1145,20 @@ wss.on("connection", (twilioWs, req) => {
         type.includes("conversation.item.input_audio_transcription");
       if (doneLike && isInputTranscript && possible) {
         const utterance = String(possible).trim();
-        // Ignore very short utterances (single word or one syllable) which are often noise
-        const wordCount = utterance.split(/\s+/).filter(Boolean).length;
+        // Normalize the utterance to remove greetings/punctuation for duplicate detection
+        const normalized = normalizeTranscript(utterance);
+        // Count meaningful words in the normalized text
+        const wordCount = normalized.split(/\s+/).filter(Boolean).length;
         printCallerFinal(utterance);
+        // Update latest normalized utterance
+        lastCallerNormalized = normalized;
+        // Only queue a response when the normalized utterance has at least two words,
+        // and we haven't responded to a semantically equivalent utterance yet
         if (
-          wordCount >= 2 &&
-          lastCallerFinal !== lastRequestedCallerFinal &&
-          lastCallerFinal === utterance
+          wordCount >= 3 &&
+          normalized &&
+          normalized !== lastRequestedCallerNormalized
         ) {
-          // Only queue a response when the utterance has at least two words and
-          // we haven't responded to it yet.
           pendingResponseRequest = true;
         }
         return;
