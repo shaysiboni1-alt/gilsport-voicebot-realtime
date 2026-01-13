@@ -500,6 +500,13 @@ wss.on("connection", (twilioWs, req) => {
   // This prevents sending multiple assistant responses for the same caller final.
   let lastRequestedCallerFinal = "";
 
+  // Speech segment tracking. Each time VAD reports speech stopped, we
+  // increment currentSpeechSegmentIndex. lastRespondedSegmentIndex tracks the
+  // segment index we have already responded to. This helps avoid multiple
+  // responses for the same caller turn.
+  let currentSpeechSegmentIndex = 0;
+  let lastRespondedSegmentIndex = 0;
+
   // Call/session state for webhook + routing + abandoned
   let callSid = null;
   let startedAt = nowIso();
@@ -1057,17 +1064,10 @@ wss.on("connection", (twilioWs, req) => {
         type.includes("input_audio_transcript") ||
         type.includes("conversation.item.input_audio_transcription");
       if (doneLike && isInputTranscript && possible) {
-        // Track if the caller final utterance actually changed. Without this check,
-        // multiple identical final transcription events can trigger duplicate
-        // assistant responses. We compare lastCallerFinal before and after printing;
-        // if it changed and wasn't already requested, mark that a response is needed.
-        const before = lastCallerFinal;
+        // Update caller final but do not queue a response here. The response
+        // will be triggered by speech_stopped event (VAD) to ensure we respond
+        // once per speech segment.
         printCallerFinal(String(possible).trim());
-        if (lastCallerFinal !== before && lastCallerFinal !== lastRequestedCallerFinal) {
-          // Do not call response.create immediately. Instead, flag that we owe a
-          // response, which will be sent after the current response finishes.
-          pendingResponseRequest = true;
-        }
         return;
       }
     }
@@ -1076,7 +1076,11 @@ wss.on("connection", (twilioWs, req) => {
     // Turn boundary events (safe trigger)
     // -----------------------------
     if (msg.type === "input_audio_buffer.speech_stopped") {
-      // Do not trigger responses on speech_stopped; we rely on final transcription only.
+      // When server VAD reports that the caller stopped speaking, mark that
+      // a new speech segment has ended and a response is required. We only
+      // respond once per segment after the assistant finishes speaking.
+      currentSpeechSegmentIndex += 1;
+      pendingResponseRequest = true;
       return;
     }
 
@@ -1085,10 +1089,13 @@ wss.on("connection", (twilioWs, req) => {
       awaitingResponse = false;
       // If something arrived while we were speaking - do exactly ONE next response
       if (pendingResponseRequest) {
-        debug(`[${connTag}] response.done -> draining pendingResponseRequest`);
-        // drain once
-        pendingResponseRequest = false;
-        requestAssistantResponse("pending_after_done");
+        // Only respond if we haven't yet responded to this speech segment.
+        if (currentSpeechSegmentIndex > lastRespondedSegmentIndex) {
+          debug(`[${connTag}] response.done -> draining pendingResponseRequest`);
+          pendingResponseRequest = false;
+          lastRespondedSegmentIndex = currentSpeechSegmentIndex;
+          requestAssistantResponse("pending_after_done");
+        }
       }
       return;
     }
