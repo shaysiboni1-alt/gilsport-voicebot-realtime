@@ -90,6 +90,7 @@ const preview = (s, n = 300) => {
   const t = String(s || "").replace(/\s+/g, " ").trim();
   return t.length > n ? t.slice(0, n) + "..." : t;
 
+};
 
 // --------------------------------------------------
 // Webhook (single endpoint) helpers
@@ -120,7 +121,6 @@ function makeRecordingPublicUrl(callSid) {
   const base = String(PUBLIC_BASE_URL).replace(/\/$/, "");
   return callSid ? `${base}/recording/${callSid}` : "";
 }
-};
 
 // --------------------------------------------------
 // Runtime diagnostics
@@ -1022,11 +1022,6 @@ const buildProxyInstructions = (callerText) => {
         });
       }
 
-      try {
-        if (openaiWs) openaiWs.close();
-      } catch (_) {}
-      return;
-    }
       try {
         if (openaiWs) openaiWs.close();
       } catch (_) {}
