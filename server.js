@@ -154,6 +154,8 @@ let SHEETS = {
   doNotSay: [], // DO_NOT_SAY rows
   suppliersImporters: [], // SUPPLIERS_IMPORTERS rows
   deliveryContacts: [] // DELIVERY_CONTACTS rows
+  ,routingRules: [] // (legacy/compat)
+  ,businessInfo: [] // (legacy/compat)
 };
 
 
@@ -172,7 +174,7 @@ function parseTable(rows, keyColName, valColName) {
     out[k] = v;
   }
   return out;
-
+}
 
 function rowsToObjects(rows) {
   const out = [];
@@ -181,12 +183,10 @@ function rowsToObjects(rows) {
   for (const r of rows) {
     const o = {};
     headers.forEach((h, i) => (o[h] = r[i] || ""));
-    // drop fully empty rows
     const hasAny = Object.values(o).some((v) => String(v || "").trim() !== "");
     if (hasAny) out.push(o);
   }
   return out;
-}
 }
 
 async function loadSheets() {
@@ -253,6 +253,8 @@ const deliveryContactsRows = rowsToObjects((deliveryContactsRange?.values || [])
   doNotSay: doNotSayRows,
   suppliersImporters: suppliersImportersRows,
   deliveryContacts: deliveryContactsRows
+  ,routingRules: []
+  ,businessInfo: []
 };
 
 
@@ -429,6 +431,10 @@ wss.on("connection", (twilioWs, req) => {
 
   const connTag = `conn_${Date.now().toString(36)}_${Math.random().toString(16).slice(2, 6)}`;
 
+  // Stream parameters (set early to avoid TDZ issues)
+  let caller = "";
+  let called = "";
+
   // Try to read Stream <Parameter> values from querystring if present
   try {
     const u = new URL(req.url || "", "http://localhost");
@@ -445,8 +451,6 @@ wss.on("connection", (twilioWs, req) => {
 let callSid = null;
 let startedAt = nowIso();
 let endedAt = null;
-let caller = "";
-let called = "";
 let route = "other";
 let language = getSetting("DEFAULT_LANGUAGE", "he") || "he";
 
