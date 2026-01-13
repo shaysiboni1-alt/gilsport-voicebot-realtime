@@ -636,7 +636,7 @@ wss.on("connection", (twilioWs, req) => {
 
     // Route heuristics (no FSM)
     if (/(אחריות|תקלה|בעיה|שירות|החלפה|החזרה|לא עובד|תקול)/.test(low)) route = "support";
-    else if (/(משלוח|אספקה|שליח|הזמנה|הגיע|לא הגיע|מוביל)/.test(low)) route = "delivery";
+    else if (/(משלוח|אספקה|עסקה|הספקה|אספקת|שליח|הזמנה|הגיע|לא הגיע|מוביל)/.test(low)) route = "delivery";
     else if (/(מחיר|לקנות|רכישה|מוצר|דגם|מידה|צבע|מלאי|כמה עולה|מבצע)/.test(low)) route = "sales";
     else route = route || "other";
 
@@ -696,11 +696,26 @@ wss.on("connection", (twilioWs, req) => {
     parts.push(
       "תעדיפי מידע מהשיטס (KB_FACTS/DELIVERY_CONTACTS/DO_NOT_SAY/SUPPLIERS_IMPORTERS) על פני המצאות."
     );
-
-    // Instruct the assistant to read numbers digit by digit rather than as a whole number
+    // Always instruct the assistant to read numbers digit by digit and repeat phone numbers exactly as given
     parts.push(
-      "כאשר את מציינת מספר טלפון או קוד (כמו קוד קופון), הקריאי כל ספרה בנפרד – למשל: 5 5 5 5. אל תקראי מספרים ברצף אחד."
+      "כאשר את מציינת מספר טלפון או קוד (כמו קוד קופון), הקריאי כל ספרה בנפרד – למשל: 5 5 5 5. אם את חוזרת על מספר טלפון שנאמר, הקריאי אותו בדיוק כפי שהלקוח אמר, ספרה־ספרה, ללא חזרות או השמטה. אל תקראי מספרים ברצף אחד. אם מתאים – ניתן גם להגיד שהטלפון נרשם בלי לחזור עליו, במקום לקרוא אותו שוב."
     );
+
+    // If caller asks about coupon codes, inject the coupon instruction early so the assistant does not claim missing info
+    try {
+      const couponKeywordsEarly = ["קופון", "קוד קופון", "קוד הנחה", "הנחה", "קופון לאתר", "קוד להנחה"];
+      if (couponKeywordsEarly.some((kw) => low.includes(kw))) {
+        const couponVal = String(getSetting("SALES_COUPON_CODE", "")).trim();
+        if (couponVal) {
+          const spacedCouponEarly = couponVal.replace(/\D/g, "").split("").join(" ");
+          parts.push(
+            `אם נשאלת על קוד קופון או קוד הנחה, תשיבי מיד: קוד הקופון לרכישה באתר הוא ${spacedCouponEarly}. אל תגידי שאין לך מידע בנושא.`
+          );
+        }
+      }
+    } catch (_) {
+      /* ignore coupon lookup errors */
+    }
 
     // Include guardrails and routing prompts if available
     try {
@@ -1107,6 +1122,15 @@ wss.on("connection", (twilioWs, req) => {
       if (msg.transcript) small.transcript = preview(msg.transcript, 200);
       if (msg.text) small.text = preview(msg.text, 200);
       always(`[RAW_OPENAI][${connTag}]`, JSON.stringify(small));
+    }
+
+    // Optional: log intermediate bot transcript parts if provided. This can help debug misread numbers.
+    try {
+      if (MB_LOG_TRANSCRIPTS && msg && typeof msg.transcript === "string" && msg.type && String(msg.type).startsWith("response.audio_transcript.delta")) {
+        always(`[BOT_PART][${connTag}]`, msg.transcript.trim());
+      }
+    } catch (_) {
+      /* ignore logging errors */
     }
 
     if (msg.type === "error") {
