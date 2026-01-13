@@ -697,6 +697,11 @@ wss.on("connection", (twilioWs, req) => {
       "תעדיפי מידע מהשיטס (KB_FACTS/DELIVERY_CONTACTS/DO_NOT_SAY/SUPPLIERS_IMPORTERS) על פני המצאות."
     );
 
+    // Instruct the assistant to read numbers digit by digit rather than as a whole number
+    parts.push(
+      "כאשר את מציינת מספר טלפון או קוד (כמו קוד קופון), הקריאי כל ספרה בנפרד – למשל: 5 5 5 5. אל תקראי מספרים ברצף אחד."
+    );
+
     // Include guardrails and routing prompts if available
     try {
       const ps = SHEETS.prompts || {};
