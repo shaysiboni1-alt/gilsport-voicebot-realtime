@@ -1009,16 +1009,14 @@ wss.on("connection", (twilioWs, req) => {
       if (doneLike && isInputTranscript && possible) {
         // Track if the caller final utterance actually changed. Without this check,
         // multiple identical final transcription events can trigger duplicate
-        // assistant responses, leading to overlapping responses. We compare
-        // lastCallerFinal before and after printing; only if it changed do we
-        // request another assistant response.
+        // assistant responses. We compare lastCallerFinal before and after printing;
+        // if it changed and wasn't already requested, mark that a response is needed.
         const before = lastCallerFinal;
         printCallerFinal(String(possible).trim());
-        // Only request a response if this utterance is new compared to both the previous
-        // lastCallerFinal and the last utterance we already requested a response for.
         if (lastCallerFinal !== before && lastCallerFinal !== lastRequestedCallerFinal) {
-          // after we got a new user final, request assistant response (if not already)
-          requestAssistantResponse("caller_transcript_done");
+          // Do not call response.create immediately. Instead, flag that we owe a
+          // response, which will be sent after the current response finishes.
+          pendingResponseRequest = true;
         }
         return;
       }
