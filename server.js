@@ -79,7 +79,6 @@ const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || "";
 const TIME_ZONE = process.env.TIME_ZONE || "Asia/Jerusalem";
 
-
 // --------------------------------------------------
 // Logging
 // --------------------------------------------------
@@ -91,7 +90,6 @@ const always = (...a) => console.log("[ALWAYS]", ...a);
 const preview = (s, n = 300) => {
   const t = String(s || "").replace(/\s+/g, " ").trim();
   return t.length > n ? t.slice(0, n) + "..." : t;
-
 };
 
 // --------------------------------------------------
@@ -107,7 +105,9 @@ async function twilioHasRecording(callSid) {
     const listUrl = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Recordings.json?CallSid=${encodeURIComponent(
       callSid
     )}&PageSize=1`;
-    const auth = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64");
+    const auth = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString(
+      "base64"
+    );
     const resp = await fetch(listUrl, { headers: { Authorization: `Basic ${auth}` } });
     if (!resp.ok) return false;
     const data = await resp.json();
@@ -191,11 +191,10 @@ let SHEETS = {
   kbFacts: [], // KB_FACTS rows
   doNotSay: [], // DO_NOT_SAY rows
   suppliersImporters: [], // SUPPLIERS_IMPORTERS rows
-  deliveryContacts: [] // DELIVERY_CONTACTS rows
-  ,routingRules: [] // (legacy/compat)
-  ,businessInfo: [] // (legacy/compat)
+  deliveryContacts: [], // DELIVERY_CONTACTS rows
+  routingRules: [], // (legacy/compat)
+  businessInfo: [] // (legacy/compat)
 };
-
 
 function parseTable(rows, keyColName, valColName) {
   const out = {};
@@ -246,7 +245,14 @@ async function loadSheets() {
     // ✅ load PROMPTS + SETTINGS in one call
     const res = await sheets.spreadsheets.values.batchGet({
       spreadsheetId: GSHEET_ID,
-      ranges: ["PROMPTS!A:Z", "SETTINGS!A:Z", "KB_FACTS!A:Z", "DO_NOT_SAY!A:Z", "SUPPLIERS_IMPORTERS!A:Z", "DELIVERY_CONTACTS!A:Z"]
+      ranges: [
+        "PROMPTS!A:Z",
+        "SETTINGS!A:Z",
+        "KB_FACTS!A:Z",
+        "DO_NOT_SAY!A:Z",
+        "SUPPLIERS_IMPORTERS!A:Z",
+        "DELIVERY_CONTACTS!A:Z"
+      ]
     });
 
     const valueRanges = res.data.valueRanges || [];
@@ -256,16 +262,21 @@ async function loadSheets() {
     const promptsRows = (promptsRange?.values || []).slice();
     const settingsRows = (settingsRange?.values || []).slice();
 
-const kbFactsRange = valueRanges.find((vr) => (vr.range || "").startsWith("KB_FACTS!"));
-const doNotSayRange = valueRanges.find((vr) => (vr.range || "").startsWith("DO_NOT_SAY!"));
-const suppliersImportersRange = valueRanges.find((vr) => (vr.range || "").startsWith("SUPPLIERS_IMPORTERS!"));
-const deliveryContactsRange = valueRanges.find((vr) => (vr.range || "").startsWith("DELIVERY_CONTACTS!"));
+    const kbFactsRange = valueRanges.find((vr) => (vr.range || "").startsWith("KB_FACTS!"));
+    const doNotSayRange = valueRanges.find((vr) => (vr.range || "").startsWith("DO_NOT_SAY!"));
+    const suppliersImportersRange = valueRanges.find(
+      (vr) => (vr.range || "").startsWith("SUPPLIERS_IMPORTERS!")
+    );
+    const deliveryContactsRange = valueRanges.find(
+      (vr) => (vr.range || "").startsWith("DELIVERY_CONTACTS!")
+    );
 
-const kbFactsRows = rowsToObjects((kbFactsRange?.values || []).slice());
-const doNotSayRows = rowsToObjects((doNotSayRange?.values || []).slice());
-const suppliersImportersRows = rowsToObjects((suppliersImportersRange?.values || []).slice());
-const deliveryContactsRows = rowsToObjects((deliveryContactsRange?.values || []).slice());
-
+    const kbFactsRows = rowsToObjects((kbFactsRange?.values || []).slice());
+    const doNotSayRows = rowsToObjects((doNotSayRange?.values || []).slice());
+    const suppliersImportersRows = rowsToObjects(
+      (suppliersImportersRange?.values || []).slice()
+    );
+    const deliveryContactsRows = rowsToObjects((deliveryContactsRange?.values || []).slice());
 
     // PROMPTS: expects columns prompt_id + content_he
     const prompts = {};
@@ -284,19 +295,20 @@ const deliveryContactsRows = rowsToObjects((deliveryContactsRange?.values || [])
     const settings = settingsRows.length ? parseTable(settingsRows, "key", "value") : {};
 
     SHEETS = {
-  loaded_at: new Date().toISOString(),
-  prompts,
-  settings,
-  kbFacts: kbFactsRows,
-  doNotSay: doNotSayRows,
-  suppliersImporters: suppliersImportersRows,
-  deliveryContacts: deliveryContactsRows
-  ,routingRules: []
-  ,businessInfo: []
-};
+      loaded_at: new Date().toISOString(),
+      prompts,
+      settings,
+      kbFacts: kbFactsRows,
+      doNotSay: doNotSayRows,
+      suppliersImporters: suppliersImportersRows,
+      deliveryContacts: deliveryContactsRows,
+      routingRules: [],
+      businessInfo: []
+    };
 
-
-    log(`Sheets loaded (prompts=${Object.keys(prompts).length}, settings=${Object.keys(settings).length}, kbFacts=${kbFactsRows.length}, doNotSay=${doNotSayRows.length}, suppliersImporters=${suppliersImportersRows.length}, deliveryContacts=${deliveryContactsRows.length})`);
+    log(
+      `Sheets loaded (prompts=${Object.keys(prompts).length}, settings=${Object.keys(settings).length}, kbFacts=${kbFactsRows.length}, doNotSay=${doNotSayRows.length}, suppliersImporters=${suppliersImportersRows.length}, deliveryContacts=${deliveryContactsRows.length})`
+    );
   } catch (e) {
     error("Sheets load failed", e.message);
   }
@@ -388,7 +400,8 @@ app.get("/diag/sheets", (_, res) => {
 // Access: ${PUBLIC_BASE_URL}/recording/:callSid   (PUBLIC_BASE_URL should be this server public base)
 app.get("/recording/:callSid", async (req, res) => {
   try {
-    if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) return res.status(404).send("recording proxy disabled");
+    if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN)
+      return res.status(404).send("recording proxy disabled");
     const callSid = String(req.params.callSid || "").trim();
     if (!callSid) return res.status(400).send("missing callSid");
 
@@ -397,7 +410,9 @@ app.get("/recording/:callSid", async (req, res) => {
       callSid
     )}&PageSize=1`;
 
-    const auth = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64");
+    const auth = Buffer.from(
+      `${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`
+    ).toString("base64");
     const listResp = await fetch(listUrl, { headers: { Authorization: `Basic ${auth}` } });
     if (!listResp.ok) return res.status(404).send("no recording");
     const listJson = await listResp.json();
@@ -418,7 +433,6 @@ app.get("/recording/:callSid", async (req, res) => {
     res.status(500).send("recording proxy error");
   }
 });
-
 
 app.post("/sheets/reload", async (_, res) => {
   await loadSheets();
@@ -480,224 +494,242 @@ wss.on("connection", (twilioWs, req) => {
     called = u.searchParams.get("called") || "";
   } catch (_) {}
 
-
   let lastCallerFinal = "";
   let lastBotFinal = "";
 
+  // Call/session state for webhook + routing + abandoned
+  let callSid = null;
+  let startedAt = nowIso();
+  let endedAt = null;
+  let route = "other";
+  let language = getSetting("DEFAULT_LANGUAGE", "he") || "he";
 
-// Call/session state for webhook + routing + abandoned
-let callSid = null;
-let startedAt = nowIso();
-let endedAt = null;
-let route = "other";
-let language = getSetting("DEFAULT_LANGUAGE", "he") || "he";
+  let transcriptTurns = []; // {from, text, at}
 
-let transcriptTurns = []; // {from, text, at}
+  // Abandoned / ended dedupe guards
+  let sentCallEnded = false;
+  let sentCallAbandoned = false;
 
-// Abandoned / ended dedupe guards
-let sentCallEnded = false;
-let sentCallAbandoned = false;
+  // Proxy decision: dynamic response instructions (no FSM)
+  let proxyInstructions = "";
 
-// Proxy decision: dynamic response instructions (no FSM)
-let proxyInstructions = "";
+  const pushTurn = (from, text) => {
+    const t = String(text || "").trim();
+    if (!t) return;
+    transcriptTurns.push({ from, text: t, at: nowIso() });
+    // cap
+    if (transcriptTurns.length > 400) transcriptTurns = transcriptTurns.slice(-400);
+  };
 
-const pushTurn = (from, text) => {
-  const t = String(text || "").trim();
-  if (!t) return;
-  transcriptTurns.push({ from, text: t, at: nowIso() });
-  // cap
-  if (transcriptTurns.length > 400) transcriptTurns = transcriptTurns.slice(-400);
-};
+  const extractPhoneCandidates = (text) => {
+    const t = String(text || "");
+    const digits = t.replace(/\D+/g, "");
+    // Israeli 9-10 digits typical
+    if (digits.length === 9 || digits.length === 10) return digits;
+    if (digits.length > 10) return digits.slice(-10);
+    return "";
+  };
 
-const extractPhoneCandidates = (text) => {
-  const t = String(text || "");
-  const digits = t.replace(/\D+/g, "");
-  // Israeli 9-10 digits typical
-  if (digits.length === 9 || digits.length === 10) return digits;
-  if (digits.length > 10) return digits.slice(-10);
-  return "";
-};
-
-const getBizPhonesByHint = (hint) => {
-  const rows = Array.isArray(SHEETS.businessInfo) ? SHEETS.businessInfo : [];
-  const out = [];
-  const h = String(hint || "").toLowerCase();
-  for (const r of rows) {
-    const values = Object.values(r || {}).map((v) => String(v || ""));
-    const joined = values.join(" ").toLowerCase();
-    if (h && !joined.includes(h)) continue;
-    // try find any phone-like field
-    for (const [k, v] of Object.entries(r || {})) {
-      const key = String(k || "").toLowerCase();
-      const val = String(v || "").trim();
-      if (!val) continue;
-      if (key.includes("phone") || key.includes("טלפון") || key.includes("מספר")) {
-        out.push(val);
+  const getBizPhonesByHint = (hint) => {
+    const rows = Array.isArray(SHEETS.businessInfo) ? SHEETS.businessInfo : [];
+    const out = [];
+    const h = String(hint || "").toLowerCase();
+    for (const r of rows) {
+      const values = Object.values(r || {}).map((v) => String(v || ""));
+      const joined = values.join(" ").toLowerCase();
+      if (h && !joined.includes(h)) continue;
+      // try find any phone-like field
+      for (const [k, v] of Object.entries(r || {})) {
+        const key = String(k || "").toLowerCase();
+        const val = String(v || "").trim();
+        if (!val) continue;
+        if (key.includes("phone") || key.includes("טלפון") || key.includes("מספר")) {
+          out.push(val);
+        }
       }
     }
-  }
-  return Array.from(new Set(out)).slice(0, 10);
-};
+    return Array.from(new Set(out)).slice(0, 10);
+  };
 
-const normalizeKeywords = (s) =>
-  String(s || "")
-    .split(/[,;\n\r\t]+/)
-    .map((x) => x.trim())
-    .filter(Boolean);
+  const normalizeKeywords = (s) =>
+    String(s || "")
+      .split(/[,;\n\r\t]+/)
+      .map((x) => x.trim())
+      .filter(Boolean);
 
-const pickRouteFromRules = (text) => {
-  const t = String(text || "").toLowerCase();
-  const rules = Array.isArray(SHEETS.routingRules) ? SHEETS.routingRules : [];
-  const scored = [];
-  for (const r of rules) {
-    const routeVal = (r.route || r.intent || r.Route || r.ROUTE || "").toString().trim();
-    const pr = Number(r.priority || r.Priority || r.PRIORITY || 999);
-    // find any keyword field
-    let kws = [];
-    for (const [k, v] of Object.entries(r || {})) {
-      const key = String(k || "").toLowerCase();
-      if (key.includes("keyword") || key.includes("keywords") || key.includes("מילות")) {
-        kws = kws.concat(normalizeKeywords(v));
+  const pickRouteFromRules = (text) => {
+    const t = String(text || "").toLowerCase();
+    const rules = Array.isArray(SHEETS.routingRules) ? SHEETS.routingRules : [];
+    const scored = [];
+    for (const r of rules) {
+      const routeVal = (r.route || r.intent || r.Route || r.ROUTE || "").toString().trim();
+      const pr = Number(r.priority || r.Priority || r.PRIORITY || 999);
+      // find any keyword field
+      let kws = [];
+      for (const [k, v] of Object.entries(r || {})) {
+        const key = String(k || "").toLowerCase();
+        if (key.includes("keyword") || key.includes("keywords") || key.includes("מילות")) {
+          kws = kws.concat(normalizeKeywords(v));
+        }
       }
+      kws = kws.map((x) => x.toLowerCase());
+      if (!routeVal || !kws.length) continue;
+      const hit = kws.some((kw) => kw && t.includes(kw));
+      if (hit) scored.push({ route: routeVal, priority: Number.isFinite(pr) ? pr : 999 });
     }
-    kws = kws.map((x) => x.toLowerCase());
-    if (!routeVal || !kws.length) continue;
-    const hit = kws.some((kw) => kw && t.includes(kw));
-    if (hit) scored.push({ route: routeVal, priority: Number.isFinite(pr) ? pr : 999 });
-  }
-  scored.sort((a, b) => a.priority - b.priority);
-  return scored[0]?.route || "";
-};
+    scored.sort((a, b) => a.priority - b.priority);
+    return scored[0]?.route || "";
+  };
 
-const parseHours = (s) => {
-  // expects like "09:00-18:00" or "09:00–18:00"
-  const m = String(s || "").match(/(\d{1,2}):(\d{2})\s*[-–]\s*(\d{1,2}):(\d{2})/);
-  if (!m) return null;
-  const aH = Number(m[1]), aM = Number(m[2]), bH = Number(m[3]), bM = Number(m[4]);
-  if (![aH, aM, bH, bM].every((x) => Number.isFinite(x))) return null;
-  return { start: aH * 60 + aM, end: bH * 60 + bM };
-};
+  const parseHours = (s) => {
+    // expects like "09:00-18:00" or "09:00–18:00"
+    const m = String(s || "").match(/(\d{1,2}):(\d{2})\s*[-–]\s*(\d{1,2}):(\d{2})/);
+    if (!m) return null;
+    const aH = Number(m[1]),
+      aM = Number(m[2]),
+      bH = Number(m[3]),
+      bM = Number(m[4]);
+    if (![aH, aM, bH, bM].every((x) => Number.isFinite(x))) return null;
+    return { start: aH * 60 + aM, end: bH * 60 + bM };
+  };
 
-const isAfterHours = () => {
-  const hoursStr =
-    getSetting("BUSINESS_HOURS", "") ||
-    getSetting("HOURS", "") ||
-    getSetting("WORKING_HOURS", "") ||
-    "";
-  const parsed = parseHours(hoursStr);
-  if (!parsed) return false; // if unknown, do not force after-hours
-  // Use local time in TIME_ZONE
-  const now = new Date();
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone: TIME_ZONE,
-    hour12: false,
-    hour: "2-digit",
-    minute: "2-digit"
-  }).formatToParts(now);
-  const hh = Number(parts.find((p) => p.type === "hour")?.value || 0);
-  const mm = Number(parts.find((p) => p.type === "minute")?.value || 0);
-  const cur = hh * 60 + mm;
-  return cur < parsed.start || cur > parsed.end;
-};
+  const isAfterHours = () => {
+    const hoursStr =
+      getSetting("BUSINESS_HOURS", "") ||
+      getSetting("HOURS", "") ||
+      getSetting("WORKING_HOURS", "") ||
+      "";
+    const parsed = parseHours(hoursStr);
+    if (!parsed) return false; // if unknown, do not force after-hours
+    // Use local time in TIME_ZONE
+    const now = new Date();
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: TIME_ZONE,
+      hour12: false,
+      hour: "2-digit",
+      minute: "2-digit"
+    }).formatToParts(now);
+    const hh = Number(parts.find((p) => p.type === "hour")?.value || 0);
+    const mm = Number(parts.find((p) => p.type === "minute")?.value || 0);
+    const cur = hh * 60 + mm;
+    return cur < parsed.start || cur > parsed.end;
+  };
 
+  const buildProxyInstructions = (callerText) => {
+    const t = String(callerText || "").trim();
+    if (!t) return "";
 
-const buildProxyInstructions = (callerText) => {
-  const t = String(callerText || "").trim();
-  if (!t) return "";
+    const low = t.toLowerCase();
 
-  const low = t.toLowerCase();
+    // Route heuristics (no FSM)
+    if (/(אחריות|תקלה|בעיה|שירות|החלפה|החזרה|לא עובד|תקול)/.test(low)) route = "support";
+    else if (/(משלוח|אספקה|שליח|הזמנה|הגיע|לא הגיע|מוביל)/.test(low)) route = "delivery";
+    else if (/(מחיר|לקנות|רכישה|מוצר|דגם|מידה|צבע|מלאי|כמה עולה|מבצע)/.test(low)) route = "sales";
+    else route = route || "other";
 
-  // Route heuristics (no FSM)
-  if (/(אחריות|תקלה|בעיה|שירות|החלפה|החזרה|לא עובד|תקול)/.test(low)) route = "support";
-  else if (/(משלוח|אספקה|שליח|הזמנה|הגיע|לא הגיע|מוביל)/.test(low)) route = "delivery";
-  else if (/(מחיר|לקנות|רכישה|מוצר|דגם|מידה|צבע|מלאי|כמה עולה|מבצע)/.test(low)) route = "sales";
-  else route = route || "other";
+    // DO_NOT_SAY: rows in DO_NOT_SAY tab (enforce via instruction)
+    const dnsRows = Array.isArray(SHEETS.doNotSay) ? SHEETS.doNotSay : [];
+    const doNotSayText = dnsRows
+      .map((r) => {
+        const a = String(r.forbidden_topic || "").trim();
+        const b = String(r.trigger_examples || "").trim();
+        const c = String(r.safe_response_he || "").trim();
+        const parts = [a && `נושא: ${a}`, b && `טריגרים: ${b}`, c && `תגובה בטוחה: ${c}`].filter(
+          Boolean
+        );
+        return parts.join(" | ");
+      })
+      .filter(Boolean)
+      .slice(0, 20)
+      .join("\n");
 
-  // DO_NOT_SAY: rows in DO_NOT_SAY tab (enforce via instruction)
-  const dnsRows = Array.isArray(SHEETS.doNotSay) ? SHEETS.doNotSay : [];
-  const doNotSayText = dnsRows
-    .map((r) => {
-      const a = String(r.forbidden_topic || "").trim();
-      const b = String(r.trigger_examples || "").trim();
-      const c = String(r.safe_response_he || "").trim();
-      const parts = [a && `נושא: ${a}`, b && `טריגרים: ${b}`, c && `תגובה בטוחה: ${c}`].filter(Boolean);
-      return parts.join(" | ");
-    })
-    .filter(Boolean)
-    .slice(0, 20)
-	    .join("\n");
+    const mustNotLieDelivery =
+      "אין לך גישה לסטטוס משלוח אמיתי. אסור להגיד 'בדקתי סטטוס' או להבטיח שראית מערכת משלוחים.";
 
-  const mustNotLieDelivery =
-    "אין לך גישה לסטטוס משלוח אמיתי. אסור להגיד 'בדקתי סטטוס' או להבטיח שראית מערכת משלוחים.";
+    // DELIVERY_CONTACTS: provide carrier contacts when needed
+    const deliveryRows = Array.isArray(SHEETS.deliveryContacts) ? SHEETS.deliveryContacts : [];
+    const carrierPhones = deliveryRows
+      .filter((r) => {
+        const ck = String(r.condition_keywords || "").toLowerCase();
+        return !ck || ck.split(/[,;\n\r\t]+/).some((kw) => kw.trim() && low.includes(kw.trim()));
+      })
+      .map((r) => String(r.phone_e164 || r.phone || "").trim())
+      .filter(Boolean)
+      .slice(0, 10);
 
-  // DELIVERY_CONTACTS: provide carrier contacts when needed
-  const deliveryRows = Array.isArray(SHEETS.deliveryContacts) ? SHEETS.deliveryContacts : [];
-  const carrierPhones = deliveryRows
-    .filter((r) => {
-      const ck = String(r.condition_keywords || "").toLowerCase();
-	      return !ck || ck.split(/[,;\n\r\t]+/).some((kw) => kw.trim() && low.includes(kw.trim()));
-    })
-    .map((r) => String(r.phone_e164 || r.phone || "").trim())
-    .filter(Boolean)
-    .slice(0, 10);
-
-  // KB_FACTS: soft facts injection (only a few)
-  const factsRows = Array.isArray(SHEETS.kbFacts) ? SHEETS.kbFacts : [];
-  const matchFacts = [];
-  for (const r of factsRows) {
-    const kw = String(r.keywords || "").toLowerCase();
-    if (!kw) continue;
-	    const kws = kw.split(/[,;\n\r\t]+/).map((x) => x.trim()).filter(Boolean);
-    if (!kws.length) continue;
-    if (kws.some((k) => k && low.includes(k))) {
-      const ans = String(r.answer_he || "").trim();
-      if (ans) matchFacts.push(`• ${ans}`);
+    // KB_FACTS: soft facts injection (only a few)
+    const factsRows = Array.isArray(SHEETS.kbFacts) ? SHEETS.kbFacts : [];
+    const matchFacts = [];
+    for (const r of factsRows) {
+      const kw = String(r.keywords || "").toLowerCase();
+      if (!kw) continue;
+      const kws = kw.split(/[,;\n\r\t]+/).map((x) => x.trim()).filter(Boolean);
+      if (!kws.length) continue;
+      if (kws.some((k) => k && low.includes(k))) {
+        const ans = String(r.answer_he || "").trim();
+        if (ans) matchFacts.push(`• ${ans}`);
+      }
+      if (matchFacts.length >= 5) break;
     }
-    if (matchFacts.length >= 5) break;
-  }
 
-  // After-hours check (uses SETTINGS hours if present; if unknown -> false)
-  const afterHours = route === "delivery" && isAfterHours();
+    // After-hours check (uses SETTINGS hours if present; if unknown -> false)
+    const afterHours = route === "delivery" && isAfterHours();
 
-  const baseStyle =
-    "סגנון: נטע. תשובות קצרות, ענייניות, אנושיות. משפט-שניים ואז שאלה מקדמת. לא לחפור, לא לחזור על עצמך.";
+    const baseStyle =
+      "סגנון: נטע. תשובות קצרות, ענייניות, אנושיות. משפט-שניים ואז שאלה מקדמת. לא לחפור, לא לחזור על עצמך.";
 
-	  const parts = [];
-	  parts.push(baseStyle);
-	  parts.push("תעדיפי מידע מהשיטס (KB_FACTS/DELIVERY_CONTACTS/DO_NOT_SAY/SUPPLIERS_IMPORTERS) על פני המצאות.");
+    const parts = [];
+    parts.push(baseStyle);
+    parts.push(
+      "תעדיפי מידע מהשיטס (KB_FACTS/DELIVERY_CONTACTS/DO_NOT_SAY/SUPPLIERS_IMPORTERS) על פני המצאות."
+    );
 
-	  if (doNotSayText) {
-	    parts.push("DO_NOT_SAY (כללים מחייבים):\n" + doNotSayText);
-	  }
+    if (doNotSayText) {
+      parts.push("DO_NOT_SAY (כללים מחייבים):\n" + doNotSayText);
+    }
 
-	  if (matchFacts.length) {
-	    parts.push("עובדות רלוונטיות מהשיטס (להשתמש רק אם מתאים לשאלה):\n" + matchFacts.join("\n"));
-	  }
+    if (matchFacts.length) {
+      parts.push(
+        "עובדות רלוונטיות מהשיטס (להשתמש רק אם מתאים לשאלה):\n" + matchFacts.join("\n")
+      );
+    }
 
-	  if (route === "delivery") {
-	    parts.push(mustNotLieDelivery);
-	    if (afterHours) {
-	      parts.push("זה אחרי שעות פעילות. תני מספרי מובילים אם יש, קחי הודעה קצרה והבטיחי שיחזרו אליהם בשעות פעילות.");
-	      if (carrierPhones.length) parts.push("מספרי מובילים: " + carrierPhones.join(", "));
-	    } else {
-	      parts.push("אם מבקשים סטטוס משלוח: להסביר שאין סטטוס בזמן אמת ולהציע להשאיר הודעה/פרטים לחזרה.");
-	    }
-	  } else if (route === "support") {
-	    parts.push("מטרה: להבין תקלה בקצרה, פרטי מוצר/מותג/הזמנה, ולסגור עם הבטחה לחזרה.");
-	  } else if (route === "sales") {
-	    parts.push("מטרה: להבין במה מתעניינים (סוג מוצר/דגם/מותג) ואז לקחת פרטי חזרה (אפשר להציע להשתמש במספר המזוהה).");
-	  } else {
-	    parts.push("אם לא ברור, תשאלי שאלה אחת להבהרה: מכירה / שירות / משלוח.");
-	  }
+    if (route === "delivery") {
+      parts.push(mustNotLieDelivery);
+      if (afterHours) {
+        parts.push(
+          "זה אחרי שעות פעילות. תני מספרי מובילים אם יש, קחי הודעה קצרה והבטיחי שיחזרו אליהם בשעות הפעילות."
+        );
+        if (carrierPhones.length) {
+          parts.push("מספרי מובילים: " + carrierPhones.join(", "));
+        } else {
+          // fallback when no carrier phones available
+          parts.push("אין לי מספר מוביל זמין כרגע, אוכל להעביר בקשה לחזרה.");
+        }
+      } else {
+        parts.push(
+          "אם מבקשים סטטוס משלוח: להסביר שאין סטטוס בזמן אמת ולהציע להשאיר הודעה/פרטים לחזרה."
+        );
+      }
+    } else if (route === "support") {
+      parts.push(
+        "מטרה: להבין תקלה בקצרה, פרטי מוצר/מותג/הזמנה, ולסגור עם הבטחה לחזרה."
+      );
+    } else if (route === "sales") {
+      parts.push(
+        "מטרה: להבין במה מתעניינים (סוג מוצר/דגם/מותג) ואז לקחת פרטי חזרה (אפשר להציע להשתמש במספר המזוהה)."
+      );
+    } else {
+      parts.push("אם לא ברור, תשאלי שאלה אחת להבהרה: מכירה / שירות / משלוח.");
+    }
 
-	  let inst = parts.join("\n\n");
+    let inst = parts.join("\n\n");
 
-  const phone = extractPhoneCandidates(t);
-	  if (phone) inst += `זוהה מספר בטקסט: ${phone}. אל תחזרי עליו אם לא צריך.\n`;
+    const phone = extractPhoneCandidates(t);
+    if (phone) inst += `זוהה מספר בטקסט: ${phone}. אל תחזרי עליו אם לא צריך.\n`;
 
-  return inst.trim();
-};
-
+    return inst.trim();
+  };
 
   const printCallerFinal = (text) => {
     const t = String(text || "").trim();
@@ -937,9 +969,17 @@ const buildProxyInstructions = (callerText) => {
         type.includes("conversation.item.input_audio_transcription");
 
       if (doneLike && isInputTranscript && possible) {
+        // Track if the caller final utterance actually changed. Without this check,
+        // multiple identical final transcription events can trigger duplicate
+        // assistant responses, leading to overlapping responses. We compare
+        // lastCallerFinal before and after printing; only if it changed do we
+        // request another assistant response.
+        const before = lastCallerFinal;
         printCallerFinal(String(possible).trim());
-        // after we got user final, request assistant response (if not already)
-        requestAssistantResponse("caller_transcript_done");
+        if (lastCallerFinal !== before) {
+          // after we got a new user final, request assistant response (if not already)
+          requestAssistantResponse("caller_transcript_done");
+        }
         return;
       }
     }
@@ -951,12 +991,10 @@ const buildProxyInstructions = (callerText) => {
       // Do not trigger responses on speech_stopped; we rely on final transcription only.
       return;
     }
-// -----------------------------
+
     // response lifecycle
-    // -----------------------------
     if (msg.type === "response.done") {
       awaitingResponse = false;
-
       // If something arrived while we were speaking - do exactly ONE next response
       if (pendingResponseRequest) {
         debug(`[${connTag}] response.done -> draining pendingResponseRequest`);
@@ -967,9 +1005,7 @@ const buildProxyInstructions = (callerText) => {
       return;
     }
 
-    // -----------------------------
     // AUDIO back to Twilio
-    // -----------------------------
     if (msg.type === "response.audio.delta") {
       if (!twilioStreamSid) return;
 
@@ -1022,13 +1058,11 @@ const buildProxyInstructions = (callerText) => {
 
     if (msg.event === "media" && msg.media?.payload) {
       const payload = msg.media.payload;
-
       if (!openaiReady || !openaiWs || openaiWs.readyState !== WebSocket.OPEN) {
         pendingAudio.push(payload);
         if (pendingAudio.length > 400) pendingAudio.splice(0, pendingAudio.length - 400);
         return;
       }
-
       safeOpenAISend({
         type: "input_audio_buffer.append",
         audio: payload
@@ -1038,13 +1072,11 @@ const buildProxyInstructions = (callerText) => {
 
     if (msg.event === "stop") {
       always(`[TWILIO_STOP][${connTag}]`, "stream stopped");
-
       endedAt = nowIso();
       const recording_url_public = makeRecordingPublicUrl(callSid);
 
       if (!sentCallEnded) {
         sentCallEnded = true;
-
         // ONE final webhook (by route when possible) - always wait for recording (best effort)
         const finalEvent =
           route === "sales"
@@ -1056,7 +1088,6 @@ const buildProxyInstructions = (callerText) => {
             : route === "message"
             ? "message_taken"
             : "call_ended";
-
         await sendWebhookEvent(
           finalEvent,
           {
@@ -1069,13 +1100,12 @@ const buildProxyInstructions = (callerText) => {
             language,
             route,
             caller_last_utterance: lastCallerFinal,
-            bot_last_utterance: lastBotText,
+            bot_last_utterance: lastBotFinal,
             transcript: transcriptTurns
           },
           { wait_for_recording: true }
         );
       }
-
       try {
         if (openaiWs) openaiWs.close();
       } catch (_) {}
@@ -1095,28 +1125,30 @@ const buildProxyInstructions = (callerText) => {
     RUNTIME.ws_closed += 1;
     RUNTIME.last_ws_close_at = new Date().toISOString();
     always(`[TWILIO_CLOSE][${connTag}]`, "socket closed");
-
-// If socket closed unexpectedly and we never sent call_ended -> abandoned
-if (!sentCallEnded && !sentCallAbandoned) {
-  sentCallAbandoned = true;
-  endedAt = endedAt || nowIso();
-  const recording_url_public = makeRecordingPublicUrl(callSid);
-  sendWebhookEvent("call_abandoned", {
-    callSid,
-    streamSid: twilioStreamSid,
-    caller,
-    called,
-    started_at: startedAt,
-    ended_at: endedAt,
-    language,
-    route,
-    caller_last_utterance: lastCallerFinal,
-    bot_last_utterance: lastBotFinal,
-    transcript: transcriptTurns,
-    recording_url_public
-  }, { wait_for_recording: true });
-}
-
+    // If socket closed unexpectedly and we never sent call_ended -> abandoned
+    if (!sentCallEnded && !sentCallAbandoned) {
+      sentCallAbandoned = true;
+      endedAt = endedAt || nowIso();
+      const recording_url_public = makeRecordingPublicUrl(callSid);
+      sendWebhookEvent(
+        "call_abandoned",
+        {
+          callSid,
+          streamSid: twilioStreamSid,
+          caller,
+          called,
+          started_at: startedAt,
+          ended_at: endedAt,
+          language,
+          route,
+          caller_last_utterance: lastCallerFinal,
+          bot_last_utterance: lastBotFinal,
+          transcript: transcriptTurns,
+          recording_url_public
+        },
+        { wait_for_recording: true }
+      );
+    }
     try {
       if (openaiWs) openaiWs.close();
     } catch (_) {}
@@ -1129,7 +1161,6 @@ if (!sentCallEnded && !sentCallAbandoned) {
 server.listen(PORT, () => {
   log(`GilSport VoiceBot running on port ${PORT}`);
   loadSheets();
-
   always("BOOT", {
     at: RUNTIME.booted_at,
     port: PORT,
