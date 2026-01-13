@@ -950,7 +950,7 @@ wss.on("connection", (twilioWs, req) => {
     // -----------------------------
     // BOT FINAL (clean)
     // -----------------------------
-    if (MB_LOG_TRANSCRIPTS && msg.type === "response.audio_transcript.done") {
+    if (msg.type === "response.audio_transcript.done") {
       const t = String(msg.transcript || "").trim();
       if (t) printBotFinal(t);
       return;
@@ -959,22 +959,19 @@ wss.on("connection", (twilioWs, req) => {
     // -----------------------------
     // CALLER FINAL (robust)
     // -----------------------------
-    if (MB_LOG_TRANSCRIPTS) {
+    {
       const type = String(msg.type || "");
       const doneLike = type.includes("done") || type.includes("completed");
-
       const possible =
         msg.transcript ||
         msg.text ||
         msg?.item?.content?.[0]?.transcript ||
         msg?.item?.content?.[0]?.text ||
         "";
-
       const isInputTranscript =
         type.includes("input_audio_transcription") ||
         type.includes("input_audio_transcript") ||
         type.includes("conversation.item.input_audio_transcription");
-
       if (doneLike && isInputTranscript && possible) {
         // Track if the caller final utterance actually changed. Without this check,
         // multiple identical final transcription events can trigger duplicate
