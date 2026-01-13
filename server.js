@@ -55,6 +55,8 @@ const GSHEET_ID = process.env.GSHEET_ID || "";
 const GOOGLE_SERVICE_ACCOUNT_JSON_B64 = process.env.GOOGLE_SERVICE_ACCOUNT_JSON_B64 || "";
 
 const MB_WEBHOOK_URL = process.env.MB_WEBHOOK_URL || "";
+const MB_FINAL_WEBHOOK_ONLY = envBool("MB_FINAL_WEBHOOK_ONLY", true);
+const MB_RECORDING_WAIT_MS = envNum("MB_RECORDING_WAIT_MS", 8000);
 const MB_DEBUG = envBool("MB_DEBUG", false);
 
 const MB_VAD_THRESHOLD = envNum("MB_VAD_THRESHOLD", 0.65);
@@ -95,18 +97,54 @@ const preview = (s, n = 300) => {
 // --------------------------------------------------
 // Webhook (single endpoint) helpers
 // --------------------------------------------------
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function twilioHasRecording(callSid) {
+  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) return false;
+  if (!callSid) return false;
+  try {
+    const listUrl = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Recordings.json?CallSid=${encodeURIComponent(
+      callSid
+    )}&PageSize=1`;
+    const auth = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64");
+    const resp = await fetch(listUrl, { headers: { Authorization: `Basic ${auth}` } });
+    if (!resp.ok) return false;
+    const data = await resp.json();
+    return Array.isArray(data.recordings) && data.recordings.length > 0;
+  } catch (e) {
+    return false;
+  }
+}
+
+async function waitForRecording(callSid, waitMs) {
+  const deadline = Date.now() + Math.max(0, Number(waitMs) || 0);
+  // Quick path
+  if (await twilioHasRecording(callSid)) return true;
+  // Poll (1s)
+  while (Date.now() < deadline) {
+    await sleep(1000);
+    if (await twilioHasRecording(callSid)) return true;
+  }
+  return false;
+}
+
 const nowIso = () => new Date().toISOString();
 
-async function sendWebhookEvent(event, payload) {
+async function sendWebhookEvent(event, payload, opts = {}) {
   if (!MB_WEBHOOK_URL) return false;
   try {
     const callSid = payload && payload.callSid ? String(payload.callSid) : "";
+    // If caller requires recording link, wait a bit for Twilio to generate it.
+    if (callSid && (opts.wait_for_recording || opts.waitForRecording)) {
+      await waitForRecording(callSid, MB_RECORDING_WAIT_MS);
+    }
+
     const recording_url_public =
       payload && Object.prototype.hasOwnProperty.call(payload, "recording_url_public")
         ? payload.recording_url_public
         : makeRecordingPublicUrl(callSid);
 
-    // Recording link must be present on EVERY webhook message (including abandoned).
     const body = JSON.stringify({ event, ...payload, recording_url_public });
     const resp = await fetch(MB_WEBHOOK_URL, {
       method: "POST",
@@ -118,7 +156,7 @@ async function sendWebhookEvent(event, payload) {
     }
     return true;
   } catch (e) {
-    error("Webhook send failed", e.message);
+    debug("Webhook failed", event, e && e.message ? e.message : e);
     return false;
   }
 }
@@ -637,18 +675,14 @@ const buildProxyInstructions = (callerText) => {
 	  }
 
 	  if (route === "delivery") {
-    parts.push(mustNotLieDelivery);
-    parts.push("אסור לשאול מספר הזמנה ואסור להגיד 'נוכל לבדוק סטטוס'. אין גישה לסטטוס בזמן אמת.");
-    if (afterHours) {
-      parts.push("זה אחרי שעות פעילות. תנו ללקוח מספרי מובילים מהשיטס (אם יש), ואז קחו הודעה קצרה והבטיחו חזרה בשעות הפעילות.");
-      if (carrierPhones.length) parts.push("מספרי מובילים (מהשיטס): " + carrierPhones.join(", "));
-      parts.push("שאלה מקדמת מומלצת: מה השם שלכם, ומה מספר הטלפון לחזרה (אפשר גם המספר המזוהה), ובאיזה עיר/כתובת מדובר?");
-    } else {
-      parts.push("בשעות פעילות: להסביר שאין סטטוס בזמן אמת. אפשר לקחת פרטים ולהעביר לנציג שיחזור אליהם עם עדכון.");
-      if (carrierPhones.length) parts.push("אם הלקוח מבקש במפורש טלפון של המובילים, תנו: " + carrierPhones.join(", "));
-      parts.push("שאלה מקדמת מומלצת: מה השם שלכם והאם נוח שנחזור אליכם למספר המזוהה?");
-    }
-  } else if (route === "support") {
+	    parts.push(mustNotLieDelivery);
+	    if (afterHours) {
+	      parts.push("זה אחרי שעות פעילות. תני מספרי מובילים אם יש, קחי הודעה קצרה והבטיחי שיחזרו אליהם בשעות פעילות.");
+	      if (carrierPhones.length) parts.push("מספרי מובילים: " + carrierPhones.join(", "));
+	    } else {
+	      parts.push("אם מבקשים סטטוס משלוח: להסביר שאין סטטוס בזמן אמת ולהציע להשאיר הודעה/פרטים לחזרה.");
+	    }
+	  } else if (route === "support") {
 	    parts.push("מטרה: להבין תקלה בקצרה, פרטי מוצר/מותג/הזמנה, ולסגור עם הבטחה לחזרה.");
 	  } else if (route === "sales") {
 	    parts.push("מטרה: להבין במה מתעניינים (סוג מוצר/דגם/מותג) ואז לקחת פרטי חזרה (אפשר להציע להשתמש במספר המזוהה).");
@@ -865,6 +899,12 @@ const buildProxyInstructions = (callerText) => {
 
     if (msg.type === "error") {
       error(`[${connTag}] OpenAI error event`, msg);
+      const errCode = msg && msg.error && msg.error.code ? String(msg.error.code) : "";
+      if (errCode === "conversation_already_has_active_response") {
+        // Treat as still-speaking; queue exactly one response after current finishes
+        awaitingResponse = true;
+        pendingResponseRequest = true;
+      }
       return;
     }
 
@@ -908,17 +948,10 @@ const buildProxyInstructions = (callerText) => {
     // Turn boundary events (safe trigger)
     // -----------------------------
     if (msg.type === "input_audio_buffer.speech_stopped") {
-      // IMPORTANT: When transcription is enabled, wait for caller_transcript_done to avoid double response.create
-      // and to prevent the bot from speaking before the caller actually said something.
-      if (MB_ENABLE_TRANSCRIPTION) {
-        debug(`[${connTag}] ignoring speech_stopped (transcription enabled)`);
-        return;
-      }
-      requestAssistantResponse("speech_stopped");
+      // Do not trigger responses on speech_stopped; we rely on final transcription only.
       return;
     }
-
-    // -----------------------------
+// -----------------------------
     // response lifecycle
     // -----------------------------
     if (msg.type === "response.done") {
@@ -949,7 +982,7 @@ const buildProxyInstructions = (callerText) => {
     }
   });
 
-  twilioWs.on("message", (data) => {
+  twilioWs.on("message", async (data) => {
     let msg;
     try {
       msg = JSON.parse(data.toString());
@@ -962,16 +995,19 @@ const buildProxyInstructions = (callerText) => {
       twilioStreamSid = msg.start.streamSid;
       callSid = msg.start?.callSid || callSid;
       startedAt = startedAt || nowIso();
-      // call_started webhook (once)
-      sendWebhookEvent("call_started", {
-        callSid,
-        streamSid: twilioStreamSid,
-        caller,
-        called,
-        started_at: startedAt,
-        language,
-        route
-      });
+      // call_started webhook suppressed (final-only mode)
+      if (!MB_FINAL_WEBHOOK_ONLY) {
+        sendWebhookEvent("call_started", {
+          callSid,
+          streamSid: twilioStreamSid,
+          caller,
+          called,
+          started_at: startedAt,
+          language,
+          route,
+          recording_url_public: makeRecordingPublicUrl(callSid)
+        });
+      }
       always(
         `[TWILIO_START][${connTag}]`,
         JSON.stringify({
@@ -1008,69 +1044,36 @@ const buildProxyInstructions = (callerText) => {
 
       if (!sentCallEnded) {
         sentCallEnded = true;
-        // send route-specific event snapshot before call_ended
-        if (route === "sales") {
-          sendWebhookEvent("sales_lead", {
-            callSid,
-            streamSid: twilioStreamSid,
-            caller,
-            called,
-            started_at: startedAt,
-            ended_at: endedAt,
-            language,
-            route,
-            caller_last_utterance: lastCallerFinal,
-            bot_last_utterance: lastBotFinal,
-            transcript: transcriptTurns,
-            recording_url_public
-          });
-        } else if (route === "support") {
-          sendWebhookEvent("support_ticket", {
-            callSid,
-            streamSid: twilioStreamSid,
-            caller,
-            called,
-            started_at: startedAt,
-            ended_at: endedAt,
-            language,
-            route,
-            caller_last_utterance: lastCallerFinal,
-            bot_last_utterance: lastBotFinal,
-            transcript: transcriptTurns,
-            recording_url_public
-          });
-        } else if (route === "delivery" && isAfterHours()) {
-          sendWebhookEvent("delivery_after_hours", {
-            callSid,
-            streamSid: twilioStreamSid,
-            caller,
-            called,
-            started_at: startedAt,
-            ended_at: endedAt,
-            language,
-            route,
-            caller_last_utterance: lastCallerFinal,
-            bot_last_utterance: lastBotFinal,
-            transcript: transcriptTurns,
-            recording_url_public
-          });
-        }
 
-        // Always send call_ended
-        sendWebhookEvent("call_ended", {
-          callSid,
-          streamSid: twilioStreamSid,
-          caller,
-          called,
-          started_at: startedAt,
-          ended_at: endedAt,
-          language,
-          route,
-          caller_last_utterance: lastCallerFinal,
-          bot_last_utterance: lastBotFinal,
-          transcript: transcriptTurns,
-          recording_url_public
-        });
+        // ONE final webhook (by route when possible) - always wait for recording (best effort)
+        const finalEvent =
+          route === "sales"
+            ? "sales_lead"
+            : route === "support"
+            ? "support_ticket"
+            : route === "delivery"
+            ? "delivery_after_hours"
+            : route === "message"
+            ? "message_taken"
+            : "call_ended";
+
+        await sendWebhookEvent(
+          finalEvent,
+          {
+            callSid,
+            streamSid: twilioStreamSid,
+            caller,
+            called,
+            started_at: startedAt,
+            ended_at: endedAt,
+            language,
+            route,
+            caller_last_utterance: lastCallerFinal,
+            bot_last_utterance: lastBotText,
+            transcript: transcriptTurns
+          },
+          { wait_for_recording: true }
+        );
       }
 
       try {
@@ -1111,7 +1114,7 @@ if (!sentCallEnded && !sentCallAbandoned) {
     bot_last_utterance: lastBotFinal,
     transcript: transcriptTurns,
     recording_url_public
-  });
+  }, { wait_for_recording: true });
 }
 
     try {
