@@ -77,6 +77,8 @@ const MB_WEBHOOK_URL = process.env.MB_WEBHOOK_URL || "";
 const MB_FINAL_WEBHOOK_ONLY = envBool("MB_FINAL_WEBHOOK_ONLY", true);
 const MB_RECORDING_WAIT_MS = envNum("MB_RECORDING_WAIT_MS", 8000);
 const MB_DEBUG = envBool("MB_DEBUG", false);
+const MB_WEBHOOK_RETRY_ATTEMPTS = envNum("MB_WEBHOOK_RETRY_ATTEMPTS", 3);
+const MB_WEBHOOK_RETRY_BACKOFF_MS = envNum("MB_WEBHOOK_RETRY_BACKOFF_MS", 750);
 
 const MB_VAD_THRESHOLD = envNum("MB_VAD_THRESHOLD", 0.65);
 const MB_VAD_SILENCE_MS = envNum("MB_VAD_SILENCE_MS", 900);
@@ -116,6 +118,13 @@ const preview = (s, n = 300) => {
 // --------------------------------------------------
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+let didLogWebhookDisabled = false;
+
+const formatDigitsForSpeech = (input, minLen = 9) => {
+  const digits = String(input || "").replace(/\D+/g, "");
+  if (digits.length < minLen) return "";
+  return digits.split("").join(" ");
+};
 
 async function twilioHasRecording(callSid) {
   if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) return false;
@@ -151,7 +160,13 @@ async function waitForRecording(callSid, waitMs) {
 const nowIso = () => new Date().toISOString();
 
 async function sendWebhookEvent(event, payload, opts = {}) {
-  if (!MB_WEBHOOK_URL) return false;
+  if (!MB_WEBHOOK_URL) {
+    if (!didLogWebhookDisabled) {
+      didLogWebhookDisabled = true;
+      always("[WEBHOOK] MB_WEBHOOK_URL is not set; skipping webhook delivery.");
+    }
+    return false;
+  }
   try {
     const callSid = payload && payload.callSid ? String(payload.callSid) : "";
     // If caller requires recording link, wait a bit for Twilio to generate it.
@@ -165,15 +180,21 @@ async function sendWebhookEvent(event, payload, opts = {}) {
         : makeRecordingPublicUrl(callSid);
 
     const body = JSON.stringify({ event, ...payload, recording_url_public });
-    const resp = await fetch(MB_WEBHOOK_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body
-    });
-    if (!resp.ok) {
-      debug("Webhook non-200", event, resp.status);
+    const maxAttempts = Math.max(1, MB_WEBHOOK_RETRY_ATTEMPTS);
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      const resp = await fetch(MB_WEBHOOK_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body
+      });
+      if (resp.ok) return true;
+      debug("Webhook non-200", event, resp.status, `attempt=${attempt}`);
+      if (attempt < maxAttempts) {
+        await sleep(MB_WEBHOOK_RETRY_BACKOFF_MS);
+      }
     }
-    return true;
+    always("[WEBHOOK] Failed to deliver after retries", { event });
+    return false;
   } catch (e) {
     debug("Webhook failed", event, e && e.message ? e.message : e);
     return false;
@@ -367,6 +388,7 @@ app.get("/diag/env", (_, res) => {
     has_GOOGLE_SERVICE_ACCOUNT_JSON_B64: Boolean(GOOGLE_SERVICE_ACCOUNT_JSON_B64),
     has_TWILIO_ACCOUNT_SID: Boolean(TWILIO_ACCOUNT_SID),
     has_TWILIO_AUTH_TOKEN: Boolean(TWILIO_AUTH_TOKEN),
+    has_MB_WEBHOOK_URL: Boolean(MB_WEBHOOK_URL),
     PUBLIC_BASE_URL,
     TIME_ZONE,
     MB_DEBUG,
@@ -785,14 +807,20 @@ wss.on("connection", (twilioWs, req) => {
           digits = "0" + digits.slice(3);
         }
         // insert spaces to ensure the model reads each digit separately
-        const spacedCaller = digits.split("").join(" ");
-        parts.push(
-          `המספר ממנו התקשרתם הוא ${spacedCaller}. ברירת המחדל היא לחזור למספר זה. שאלי תמיד אם נוח לכם שנחזור למספר הזה או אם יש מספר אחר. אל תמציאי מספרים.`
-        );
-        // Also instruct to collect full name and confirm number for all routes
-        parts.push(
-          `בכל שיחה, קחי שם מלא של הלקוח ושאלי האם נוח לחזור למספר המזוהה (${spacedCaller}) או שמעדיף מספר אחר. אם נמסר מספר, הקראי אותו ספרה־ספרה ללא השמטה או תוספת, ובמידת הצורך הודיעי שהמספר נרשם בלי לקרוא אותו שוב.`
-        );
+        const spacedCaller = formatDigitsForSpeech(digits);
+        if (spacedCaller) {
+          parts.push(
+            `המספר ממנו התקשרתם הוא ${spacedCaller}. ברירת המחדל היא לחזור למספר זה. שאלי תמיד אם נוח לכם שנחזור למספר הזה או אם יש מספר אחר. אל תמציאי מספרים.`
+          );
+          // Also instruct to collect full name and confirm number for all routes
+          parts.push(
+            `בכל שיחה, קחי שם מלא של הלקוח ושאלי האם נוח לחזור למספר המזוהה (${spacedCaller}) או שמעדיף מספר אחר. אם נמסר מספר, הקראי אותו ספרה־ספרה ללא השמטה או תוספת, ובמידת הצורך הודיעי שהמספר נרשם בלי לקרוא אותו שוב.`
+          );
+        } else {
+          parts.push(
+            "המספר המזוהה קצר או חלקי. אל תקריאי אותו. בקשי מהלקוח למסור מספר מלא לחזרה ואשרי אותו ספרה־ספרה."
+          );
+        }
       }
     } catch (_) {
       /* ignore caller number errors */
@@ -966,7 +994,15 @@ wss.on("connection", (twilioWs, req) => {
     let inst = parts.join("\n\n");
 
     const phone = extractPhoneCandidates(t);
-    if (phone) inst += `זוהה מספר בטקסט: ${phone}. אל תחזרי עליו אם לא צריך.\n`;
+    if (phone) {
+      const spacedPhone = formatDigitsForSpeech(phone);
+      inst +=
+        `זוהה מספר בטקסט: ${phone}. ` +
+        (spacedPhone
+          ? `אם צריך לחזור על המספר, הקראי כך: ${spacedPhone}.`
+          : "אם צריך לחזור על המספר, בקשי מהלקוח למסור אותו שוב בצורה ברורה.") +
+        "\n";
+    }
 
     return inst.trim();
   };
@@ -1723,6 +1759,7 @@ server.listen(PORT, () => {
     has_GOOGLE_SERVICE_ACCOUNT_JSON_B64: Boolean(GOOGLE_SERVICE_ACCOUNT_JSON_B64),
     has_TWILIO_ACCOUNT_SID: Boolean(TWILIO_ACCOUNT_SID),
     has_TWILIO_AUTH_TOKEN: Boolean(TWILIO_AUTH_TOKEN),
+    has_MB_WEBHOOK_URL: Boolean(MB_WEBHOOK_URL),
     PUBLIC_BASE_URL,
     TIME_ZONE,
     MB_LOG_TRANSCRIPTS,
