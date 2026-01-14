@@ -51,6 +51,25 @@ function normalizeVoice(v) {
 }
 const OPENAI_VOICE = normalizeVoice(process.env.OPENAI_VOICE || "alloy");
 
+// Optional voice style and speaking rate controls. These environment variables
+// allow operators to adjust the tone and speed of the synthetic voice without
+// changing code. If OPENAI_VOICE_STYLE is set, it will be passed to the
+// realtime API as the voice style. OPENAI_SPEAKING_RATE should be a number
+// (e.g. 1.0 for normal speed, 0.9 for slower, 1.1 for faster). If not set,
+// defaults are used. Note: the realtime API may ignore unknown styles or
+// unsupported rates.
+const OPENAI_VOICE_STYLE = process.env.OPENAI_VOICE_STYLE || "";
+const OPENAI_SPEAKING_RATE = (() => {
+  const rate = parseFloat(process.env.OPENAI_SPEAKING_RATE);
+  return Number.isFinite(rate) && rate > 0 ? rate : 1.0;
+})();
+
+// Base style override. Operators can define MB_BASE_STYLE in the
+// environment to change the overall tone/phrasing of the assistant (e.g.
+// "טון מקצועי ורשמי" או "טון קליל ומזמין"). This will be appended to the
+// dynamic instructions for every turn.
+const MB_BASE_STYLE = process.env.MB_BASE_STYLE || "";
+
 const GSHEET_ID = process.env.GSHEET_ID || "";
 const GOOGLE_SERVICE_ACCOUNT_JSON_B64 = process.env.GOOGLE_SERVICE_ACCOUNT_JSON_B64 || "";
 
@@ -520,6 +539,12 @@ wss.on("connection", (twilioWs, req) => {
   // Proxy decision: dynamic response instructions (no FSM)
   let proxyInstructions = "";
 
+  // Keep track of all phone numbers provided by the caller during this call. When
+  // the caller mentions a phone number in their utterance, we extract the
+  // digits and store them here. These numbers will be sent in the final
+  // webhook payload under recognized_phones. The array is deduplicated.
+  let recognizedPhones = [];
+
   // Buffer audio frames when the assistant is speaking. When awaitingResponse is
   // true, we temporarily store incoming caller audio and send it only after
   // the assistant finishes speaking. This prevents the model from listening
@@ -698,8 +723,12 @@ wss.on("connection", (twilioWs, req) => {
       afterHours = isAfterHours() || afterHoursHint;
     }
 
+    // Use the operator-defined base style if provided; otherwise fall back to a default tone.
     const baseStyle =
-      "סגנון: נטע. תשובות קצרות, ענייניות, אנושיות. משפט-שניים ואז שאלה מקדמת. לא לחפור, לא לחזור על עצמך.";
+      MB_BASE_STYLE && MB_BASE_STYLE.trim()
+        ? MB_BASE_STYLE.trim()
+        :
+          "סגנון: נטע. תשובות קצרות, ענייניות, אנושיות. משפט-שניים ואז שאלה מקדמת. לא לחפור, לא לחזור על עצמך.";
 
     const parts = [];
     parts.push(baseStyle);
@@ -769,13 +798,18 @@ wss.on("connection", (twilioWs, req) => {
       /* ignore caller number errors */
     }
 
-    // Include guardrails and routing prompts if available
+    // Include guardrails prompt always; include routing prompt only when route is unknown
     try {
       const ps = SHEETS.prompts || {};
       const guardrailsPrompt = ps.GUARDRAILS_PROMPT || "";
       const routingPrompt = ps.ROUTING_PROMPT || "";
       if (guardrailsPrompt) parts.push(guardrailsPrompt.trim());
-      if (routingPrompt) parts.push(routingPrompt.trim());
+      // Only add the routing prompt if the current route is still 'other'. When we
+      // already detected a sales/support/delivery route from keywords, we skip
+      // the clarifying question to avoid asking unnecessary “האם מדובר ברכישה…”
+      if (routingPrompt && route === "other") {
+        parts.push(routingPrompt.trim());
+      }
     } catch (_) {}
 
     if (doNotSayText) {
@@ -817,9 +851,28 @@ wss.on("connection", (twilioWs, req) => {
           "מבינה. אם האספקה תואמה להיום לאחר שעות הפעילות – אוכל למסור לכם את מספר המוביל."
         );
         if (carrierPhones.length) {
+          // Build carrier descriptions with names and spaced phone digits. Use local format for Israeli numbers.
+          const carrierDescriptions = deliveryRows
+            .filter((r) => {
+              const ck = String(r.condition_keywords || "").toLowerCase();
+              return (
+                !ck ||
+                ck.split(/[,;\n\r\t]+/).some((kw) => kw.trim() && low.includes(kw.trim()))
+              );
+            })
+            .map((r) => {
+              let p = String(r.phone_e164 || r.phone || "").replace(/\D+/g, "");
+              if (p.startsWith("972") && p.length > 3) {
+                p = "0" + p.slice(3);
+              }
+              const spaced = p.split("").join(" ");
+              const name = String(r.name || "").trim();
+              return name ? `${name} – ${spaced}` : spaced;
+            })
+            .filter(Boolean);
           parts.push(
             "מספרי מובילים: " +
-              carrierPhones.join(", ") +
+              carrierDescriptions.join(", ") +
               ". אל תמציאי מספרים או שמות מובילים שלא קיימים."
           );
           // After giving the numbers, instruct to ask if the caller wants to leave a message
@@ -876,10 +929,17 @@ wss.on("connection", (twilioWs, req) => {
           }
         }
         if (brandPhones.length) {
+          // Format importer numbers as spaced digits to ensure proper reading.
+          const importerTexts = brandPhones.map((p) => p.split("").join(" "));
           parts.push(
             "מספרי יבואנים למותג התקלה: " +
-              brandPhones.join(", ") +
+              importerTexts.join(", ") +
               ". אל תמציא/י מספרים או שמות יבואנים."
+          );
+        } else {
+          // No matching importer found. Instruct not to invent names and ask to take details.
+          parts.push(
+            "אין לי מידע על יבואן למותג זה. אל תמציא/י שם או מספר יבואן. הציעי לקחת שם מלא ומספר טלפון כדי שנציג שירות יחזור אליכם."
           );
         }
       } catch (_) {
@@ -956,6 +1016,33 @@ wss.on("connection", (twilioWs, req) => {
         if (t.startsWith(g + " ")) t = t.slice(g.length).trim();
         if (t === g) return "";
       }
+      // Remove filler words commonly used as acknowledgements
+      // such as 'תודה', 'כן', 'טוב', 'סבבה', 'אוקיי', 'בסדר', 'תודה רבה'.
+      const filler = [
+        "תודה",
+        "תודה רבה",
+        "תודה לך",
+        "כן",
+        "כן תודה",
+        "טוב",
+        "טוב בסדר",
+        "סבבה",
+        "בבקשה",
+        "אוקיי",
+        "אוקי",
+        "אוקיי תודה",
+        "אוקי תודה",
+        "בסדר",
+        "בסדר גמור",
+        "אין בעיה",
+        "הבנתי"
+      ];
+      for (const f of filler) {
+        if (t === f) return "";
+        // If the phrase appears at the beginning or end separated by space, trim it
+        if (t.startsWith(f + " ")) t = t.slice(f.length).trim();
+        if (t.endsWith(" " + f)) t = t.slice(0, -f.length).trim();
+      }
       return t;
     } catch (_) {
       return String(s || "").trim().toLowerCase();
@@ -975,6 +1062,19 @@ wss.on("connection", (twilioWs, req) => {
     // Update proxy instructions for next response (Option B)
     proxyInstructions = buildProxyInstructions(t);
     always(`[CALLER][${connTag}]`, t);
+
+    // Extract any phone numbers mentioned in the caller's utterance. If a
+    // number is present, normalize it to digits and add it to the
+    // recognizedPhones array. Deduplication is handled by checking
+    // existence before pushing.
+    try {
+      const digits = extractPhoneCandidates(t);
+      if (digits && !recognizedPhones.includes(digits)) {
+        recognizedPhones.push(digits);
+      }
+    } catch (_) {
+      /* ignore phone extraction errors */
+    }
   };
 
   const printBotFinal = (text) => {
@@ -1120,9 +1220,23 @@ wss.on("connection", (twilioWs, req) => {
       master_preview: preview(masterPrompt, 220)
     });
 
+    // Prepare the realtime session settings. We allow specifying a voice
+    // style and speaking rate via environment variables. If a style is
+    // provided, we pass an object with name, style and rate to the API.
+    // Construct session parameters for OpenAI. The voice parameter must include
+    // an "id" field when style or rate are provided. If neither style nor a
+    // non-default rate are set, pass the voice as a simple string. Note: The
+    // realtime API requires `session.voice.id` when specifying a voice object.
     const session = {
       modalities: ["audio", "text"],
-      voice: OPENAI_VOICE,
+      voice:
+        OPENAI_VOICE_STYLE || OPENAI_SPEAKING_RATE !== 1.0
+          ? {
+              id: OPENAI_VOICE,
+              ...(OPENAI_VOICE_STYLE ? { style: OPENAI_VOICE_STYLE } : {}),
+              ...(OPENAI_SPEAKING_RATE !== 1.0 ? { rate: OPENAI_SPEAKING_RATE } : {})
+            }
+          : OPENAI_VOICE,
       input_audio_format: "g711_ulaw",
       output_audio_format: "g711_ulaw",
       turn_detection: {
@@ -1324,9 +1438,11 @@ wss.on("connection", (twilioWs, req) => {
               }
             }
           }
-          if (!isDup && (wordCount >= 4 || hasKeyword)) {
-            // require at least 5 meaningful words or a keyword to trigger a new response
-            if (wordCount >= 5 || hasKeyword) {
+          if (!isDup && (wordCount >= 5 || hasKeyword)) {
+            // require at least 7 meaningful words or a keyword to trigger a new response. This higher
+            // threshold prevents the assistant from reacting to short confirmations like "כן", "תודה" או
+            // "אוקיי". Only meaningful sentences (≥7 מילים) או שאלות עם מילות מפתח יגררו תשובה.
+            if (hasKeyword || wordCount >= 7) {
               pendingResponseRequest = true;
             }
           }
@@ -1362,11 +1478,12 @@ wss.on("connection", (twilioWs, req) => {
           isFlushingBufferedAudio = false;
         }, 50);
       }
-      // If we have a pending caller utterance, and we haven't already
-      // responded to it, send one response now. We rely on the check
-      // lastCallerFinal !== lastRequestedCallerFinal to ensure we respond
-      // exactly once per caller utterance.
-      if (pendingResponseRequest && lastCallerFinal !== lastRequestedCallerFinal) {
+      // If we have a pending caller utterance and have not already responded
+      // to the same normalized utterance, send one response now. We rely on the
+      // check lastCallerNormalized !== lastRequestedCallerNormalized to ensure
+      // we respond exactly once per meaningful caller utterance and avoid
+      // differences due to minor transcription variations (e.g. punctuation).
+      if (pendingResponseRequest && lastCallerNormalized !== lastRequestedCallerNormalized) {
         debug(`[${connTag}] response.done -> draining pendingResponseRequest`);
         pendingResponseRequest = false;
         requestAssistantResponse("pending_after_done");
@@ -1468,23 +1585,60 @@ wss.on("connection", (twilioWs, req) => {
             : route === "message"
             ? "message_taken"
             : "call_ended";
-        await sendWebhookEvent(
-          finalEvent,
-          {
-            callSid,
-            streamSid: twilioStreamSid,
-            caller,
-            called,
-            started_at: startedAt,
-            ended_at: endedAt,
-            language,
-            route,
-            caller_last_utterance: lastCallerFinal,
-            bot_last_utterance: lastBotFinal,
-            transcript: transcriptTurns
-          },
-          { wait_for_recording: true }
-        );
+        {
+          // Always include the caller's default number as a fallback if no recognized phones were found
+          const phones = [...recognizedPhones];
+          try {
+            if (!phones.length && caller) {
+              let digits = String(caller).replace(/\D+/g, "");
+              if (digits.startsWith("972") && digits.length > 3) {
+                digits = "0" + digits.slice(3);
+              }
+              if (digits && !phones.includes(digits)) {
+                phones.push(digits);
+              }
+            }
+          } catch (_) {}
+          // Derive a human-friendly call subject based on the route and last caller utterance. If
+          // the route is known, prefix the subject accordingly. Otherwise, use the bot's
+          // last utterance as a fallback.
+          let callSubject = "";
+          try {
+            if (route === "sales") {
+              callSubject = `פנייה לרכישה – ${lastCallerFinal}`;
+            } else if (route === "support") {
+              callSubject = `תקלה/שירות – ${lastCallerFinal}`;
+            } else if (route === "delivery") {
+              callSubject = `בירור אספקה – ${lastCallerFinal}`;
+            } else if (route === "message") {
+              callSubject = `הודעה למנהל – ${lastCallerFinal}`;
+            } else {
+              callSubject = lastBotFinal || lastCallerFinal;
+            }
+          } catch (_) {
+            callSubject = lastBotFinal || lastCallerFinal;
+          }
+          await sendWebhookEvent(
+            finalEvent,
+            {
+              callSid,
+              streamSid: twilioStreamSid,
+              caller,
+              called,
+              started_at: startedAt,
+              ended_at: endedAt,
+              language,
+              route,
+              caller_last_utterance: lastCallerFinal,
+              bot_last_utterance: lastBotFinal,
+              transcript: transcriptTurns,
+              recognized_phones: phones,
+              call_reason: route,
+              call_subject: callSubject
+            },
+            { wait_for_recording: true }
+          );
+        }
       }
       try {
         if (openaiWs) openaiWs.close();
@@ -1510,6 +1664,23 @@ wss.on("connection", (twilioWs, req) => {
       sentCallAbandoned = true;
       endedAt = endedAt || nowIso();
       const recording_url_public = makeRecordingPublicUrl(callSid);
+      // Construct a call subject for abandoned calls based on the route and last utterance
+      let callSubject = "";
+      try {
+        if (route === "sales") {
+          callSubject = `פנייה לרכישה – ${lastCallerFinal}`;
+        } else if (route === "support") {
+          callSubject = `תקלה/שירות – ${lastCallerFinal}`;
+        } else if (route === "delivery") {
+          callSubject = `בירור אספקה – ${lastCallerFinal}`;
+        } else if (route === "message") {
+          callSubject = `הודעה למנהל – ${lastCallerFinal}`;
+        } else {
+          callSubject = lastBotFinal || lastCallerFinal;
+        }
+      } catch (_) {
+        callSubject = lastBotFinal || lastCallerFinal;
+      }
       sendWebhookEvent(
         "call_abandoned",
         {
@@ -1524,7 +1695,10 @@ wss.on("connection", (twilioWs, req) => {
           caller_last_utterance: lastCallerFinal,
           bot_last_utterance: lastBotFinal,
           transcript: transcriptTurns,
-          recording_url_public
+          recording_url_public,
+          recognized_phones: recognizedPhones,
+          call_reason: route,
+          call_subject: callSubject
         },
         { wait_for_recording: true }
       );
