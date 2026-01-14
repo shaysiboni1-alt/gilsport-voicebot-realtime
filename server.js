@@ -238,1092 +238,472 @@ function rowsToObjects(rows) {
   if (!headers.length) return out;
   for (const r of rows) {
     const o = {};
-    headers.forEach((h, i) => (o[h] = r[i] || ""));
-    const hasAny = Object.values(o).some((v) => String(v || "").trim() !== "");
-    if (hasAny) out.push(o);
+    headers.forEach((h, i) => {
+      o[h] = r[i];
+    });
+    out.push(o);
+  }
+  return out;
+}
+
+function parseArray(rows, keyColName, valColName) {
+  const out = [];
+  const headers = (rows.shift() || []).map((h) => String(h || "").trim());
+  const keyIdx = headers.indexOf(keyColName);
+  const valIdx = headers.indexOf(valColName);
+  if (keyIdx === -1 || valIdx === -1) return out;
+
+  for (const r of rows) {
+    const k = String(r[keyIdx] || "").trim();
+    const v = String(r[valIdx] || "");
+    if (!k && !v) continue;
+    out.push({ key: k, value: v });
   }
   return out;
 }
 
 async function loadSheets() {
-  if (!GSHEET_ID || !GOOGLE_SERVICE_ACCOUNT_JSON_B64) return;
-
-  try {
-    const json = JSON.parse(
-      Buffer.from(GOOGLE_SERVICE_ACCOUNT_JSON_B64, "base64").toString("utf8")
-    );
-
-    const auth = new google.auth.JWT({
-      email: json.client_email,
-      key: json.private_key,
-      scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"]
-    });
-
-    const sheets = google.sheets({ version: "v4", auth });
-
-    // ✅ load PROMPTS + SETTINGS in one call
-    const res = await sheets.spreadsheets.values.batchGet({
-      spreadsheetId: GSHEET_ID,
-      ranges: [
-        "PROMPTS!A:Z",
-        "SETTINGS!A:Z",
-        "KB_FACTS!A:Z",
-        "DO_NOT_SAY!A:Z",
-        "SUPPLIERS_IMPORTERS!A:Z",
-        "DELIVERY_CONTACTS!A:Z"
-      ]
-    });
-
-    const valueRanges = res.data.valueRanges || [];
-    const promptsRange = valueRanges.find((vr) => (vr.range || "").startsWith("PROMPTS!"));
-    const settingsRange = valueRanges.find((vr) => (vr.range || "").startsWith("SETTINGS!"));
-
-    const promptsRows = (promptsRange?.values || []).slice();
-    const settingsRows = (settingsRange?.values || []).slice();
-
-    const kbFactsRange = valueRanges.find((vr) => (vr.range || "").startsWith("KB_FACTS!"));
-    const doNotSayRange = valueRanges.find((vr) => (vr.range || "").startsWith("DO_NOT_SAY!"));
-    const suppliersImportersRange = valueRanges.find(
-      (vr) => (vr.range || "").startsWith("SUPPLIERS_IMPORTERS!")
-    );
-    const deliveryContactsRange = valueRanges.find(
-      (vr) => (vr.range || "").startsWith("DELIVERY_CONTACTS!")
-    );
-
-    const kbFactsRows = rowsToObjects((kbFactsRange?.values || []).slice());
-    const doNotSayRows = rowsToObjects((doNotSayRange?.values || []).slice());
-    const suppliersImportersRows = rowsToObjects(
-      (suppliersImportersRange?.values || []).slice()
-    );
-    const deliveryContactsRows = rowsToObjects((deliveryContactsRange?.values || []).slice());
-
-    // PROMPTS: expects columns prompt_id + content_he
-    const prompts = {};
-    if (promptsRows.length) {
-      const headers = promptsRows.shift() || [];
-      for (const r of promptsRows) {
-        const row = {};
-        headers.forEach((h, i) => (row[h] = r[i] || ""));
-        if (row.prompt_id && row.content_he) {
-          prompts[String(row.prompt_id).trim()] = String(row.content_he);
-        }
-      }
-    }
-
-    // SETTINGS: expects columns key + value
-    const settings = settingsRows.length ? parseTable(settingsRows, "key", "value") : {};
-
-    SHEETS = {
-      loaded_at: new Date().toISOString(),
-      prompts,
-      settings,
-      kbFacts: kbFactsRows,
-      doNotSay: doNotSayRows,
-      suppliersImporters: suppliersImportersRows,
-      deliveryContacts: deliveryContactsRows,
-      routingRules: [],
-      businessInfo: []
-    };
-
-    log(
-      `Sheets loaded (prompts=${Object.keys(prompts).length}, settings=${Object.keys(settings).length}, kbFacts=${kbFactsRows.length}, doNotSay=${doNotSayRows.length}, suppliersImporters=${suppliersImportersRows.length}, deliveryContacts=${deliveryContactsRows.length})`
-    );
-  } catch (e) {
-    error("Sheets load failed", e.message);
-  }
-}
-
-const getPrompt = (id, fallback = "") => String(SHEETS.prompts[id] || fallback).trim();
-const getSetting = (key, fallback = "") => String(SHEETS.settings[key] || fallback).trim();
-
-// --------------------------------------------------
-// Express
-// --------------------------------------------------
-const app = express();
-app.use(express.json());
-app.use(express.urlencoded({ extended: false }));
-
-app.get("/health", (_, res) => {
-  res.json({
-    ok: true,
-    sheets_loaded_at: SHEETS.loaded_at,
-    prompts: Object.keys(SHEETS.prompts).length,
-    settings: Object.keys(SHEETS.settings).length,
-    kbFacts: (SHEETS.kbFacts || []).length,
-    doNotSay: (SHEETS.doNotSay || []).length,
-    suppliersImporters: (SHEETS.suppliersImporters || []).length,
-    deliveryContacts: (SHEETS.deliveryContacts || []).length
-  });
-});
-
-app.get("/diag/env", (_, res) => {
-  res.json({
-    ok: true,
-    booted_at: RUNTIME.booted_at,
-    has_OPENAI_API_KEY: Boolean(OPENAI_API_KEY),
-    OPENAI_REALTIME_MODEL,
-    OPENAI_VOICE,
-    has_GSHEET_ID: Boolean(GSHEET_ID),
-    has_GOOGLE_SERVICE_ACCOUNT_JSON_B64: Boolean(GOOGLE_SERVICE_ACCOUNT_JSON_B64),
-    has_TWILIO_ACCOUNT_SID: Boolean(TWILIO_ACCOUNT_SID),
-    has_TWILIO_AUTH_TOKEN: Boolean(TWILIO_AUTH_TOKEN),
-    PUBLIC_BASE_URL,
-    TIME_ZONE,
-    MB_DEBUG,
-    MB_LOG_TRANSCRIPTS,
-    MB_ENABLE_TRANSCRIPTION,
-    MB_TRANSCRIPTION_MODEL,
-    MB_LOG_RAW_OPENAI,
-    sheets_loaded_at: SHEETS.loaded_at,
-    prompts_count: Object.keys(SHEETS.prompts).length,
-    settings_count: Object.keys(SHEETS.settings).length
-  });
-});
-
-app.get("/diag/prompts", (_, res) => {
-  const keys = Object.keys(SHEETS.prompts).sort();
-  const sKeys = Object.keys(SHEETS.settings).sort();
-  res.json({
-    ok: true,
-    sheets_loaded_at: SHEETS.loaded_at,
-    prompts_count: keys.length,
-    settings_count: sKeys.length,
-    prompt_ids: keys,
-    setting_keys: sKeys,
-    opening_from_settings_preview: preview(getSetting("OPENING_SCRIPT", "")),
-    master_from_prompts_preview: preview(getPrompt("MASTER_PROMPT", "")),
-    do_not_say_rows: (SHEETS.doNotSay || []).length
-  });
-});
-
-app.get("/diag/runtime", (_, res) => {
-  res.json({ ok: true, ...RUNTIME });
-});
-
-app.get("/diag/sheets", (_, res) => {
-  res.json({
-    ok: true,
-    sheets_loaded_at: SHEETS.loaded_at,
-    counts: {
-      prompts: Object.keys(SHEETS.prompts || {}).length,
-      settings: Object.keys(SHEETS.settings || {}).length,
-      kbFacts: (SHEETS.kbFacts || []).length,
-      doNotSay: (SHEETS.doNotSay || []).length,
-      suppliersImporters: (SHEETS.suppliersImporters || []).length,
-      deliveryContacts: (SHEETS.deliveryContacts || []).length
-    }
-  });
-});
-
-// Public recording proxy (optional). If Twilio creds missing -> 404.
-// Access: ${PUBLIC_BASE_URL}/recording/:callSid   (PUBLIC_BASE_URL should be this server public base)
-app.get("/recording/:callSid", async (req, res) => {
-  try {
-    if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN)
-      return res.status(404).send("recording proxy disabled");
-    const callSid = String(req.params.callSid || "").trim();
-    if (!callSid) return res.status(400).send("missing callSid");
-
-    // Fetch latest recording for this call
-    const listUrl = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Recordings.json?CallSid=${encodeURIComponent(
-      callSid
-    )}&PageSize=1`;
-
-    const auth = Buffer.from(
-      `${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`
-    ).toString("base64");
-    const listResp = await fetch(listUrl, { headers: { Authorization: `Basic ${auth}` } });
-    if (!listResp.ok) return res.status(404).send("no recording");
-    const listJson = await listResp.json();
-    const rec = (listJson.recordings || [])[0];
-    if (!rec || !rec.sid) return res.status(404).send("no recording");
-
-    // Twilio media (mp3)
-    const mediaUrl = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Recordings/${rec.sid}.mp3`;
-    const mediaResp = await fetch(mediaUrl, { headers: { Authorization: `Basic ${auth}` } });
-    if (!mediaResp.ok) return res.status(404).send("recording not ready");
-
-    res.setHeader("Content-Type", "audio/mpeg");
-    res.setHeader("Cache-Control", "no-store");
-    const buf = Buffer.from(await mediaResp.arrayBuffer());
-    res.status(200).send(buf);
-  } catch (e) {
-    error("recording proxy failed", e.message);
-    res.status(500).send("recording proxy error");
-  }
-});
-
-app.post("/sheets/reload", async (_, res) => {
-  await loadSheets();
-  res.json({ ok: true, reloaded: true, at: SHEETS.loaded_at });
-});
-
-// Twilio Voice → Media Stream
-app.post("/twilio-voice", (req, res) => {
-  const host = req.headers.host;
-  const wsUrl = `wss://${host}/twilio-media-stream`;
-
-  res.type("text/xml").send(
-    `
-<Response>
-  <Connect>
-    <Stream url="${wsUrl}">
-      <Parameter name="caller" value="${req.body.From || ""}" />
-      <Parameter name="called" value="${req.body.To || ""}" />
-    </Stream>
-  </Connect>
-</Response>
-`.trim()
-  );
-});
-
-const server = http.createServer(app);
-
-// --------------------------------------------------
-// WebSocket (Twilio <-> OpenAI)
-// --------------------------------------------------
-const wss = new WebSocket.Server({ server, path: "/twilio-media-stream" });
-
-wss.on("connection", (twilioWs, req) => {
-  RUNTIME.ws_connections += 1;
-  RUNTIME.last_ws_conn_at = new Date().toISOString();
-
-  always("WS connection", {
-    at: RUNTIME.last_ws_conn_at,
-    ip: req?.socket?.remoteAddress || "?",
-    ua: req?.headers?.["user-agent"] || "?",
-    url: req?.url || "/twilio-media-stream",
-    total_ws_connections: RUNTIME.ws_connections
-  });
-
-  let twilioStreamSid = null;
-  let openaiReady = false;
-  const pendingAudio = [];
-
-  const connTag = `conn_${Date.now().toString(36)}_${Math.random().toString(16).slice(2, 6)}`;
-
-  // Stream parameters (set early to avoid TDZ issues)
-  let caller = "";
-  let called = "";
-
-  // Try to read Stream <Parameter> values from querystring if present
-  try {
-    const u = new URL(req.url || "", "http://localhost");
-    caller = u.searchParams.get("caller") || "";
-    called = u.searchParams.get("called") || "";
-  } catch (_) {}
-
-  let lastCallerFinal = "";
-  let lastBotFinal = "";
-  // Tracks the last caller utterance for which a response was requested.
-  // This prevents sending multiple assistant responses for the same caller final.
-  let lastRequestedCallerFinal = "";
-
-  // Internal flags for response management.  We no longer track speech
-  // segments; instead, we queue responses based on new caller final
-  // transcriptions (see message handlers below).
-
-  // Call/session state for webhook + routing + abandoned
-  let callSid = null;
-  let startedAt = nowIso();
-  let endedAt = null;
-  let route = "other";
-  let language = getSetting("DEFAULT_LANGUAGE", "he") || "he";
-
-  let transcriptTurns = []; // {from, text, at}
-
-  // Abandoned / ended dedupe guards
-  let sentCallEnded = false;
-  let sentCallAbandoned = false;
-
-  // Proxy decision: dynamic response instructions (no FSM)
-  let proxyInstructions = "";
-
-  // Keep track of all phone numbers provided by the caller during this call. When
-  // the caller mentions a phone number in their utterance, we extract the
-  // digits and store them here. These numbers will be sent in the final
-  // webhook payload under recognized_phones. The array is deduplicated.
-  let recognizedPhones = [];
-
-  // Buffer audio frames when the assistant is speaking. When awaitingResponse is
-  // true, we temporarily store incoming caller audio and send it only after
-  // the assistant finishes speaking. This prevents the model from listening
-  // and reacting to noise or speech while it's talking.
-  let pausedAudioBuffer = [];
-
-  const pushTurn = (from, text) => {
-    const t = String(text || "").trim();
-    if (!t) return;
-    transcriptTurns.push({ from, text: t, at: nowIso() });
-    // cap
-    if (transcriptTurns.length > 400) transcriptTurns = transcriptTurns.slice(-400);
-  };
-
-  const extractPhoneCandidates = (text) => {
-    const t = String(text || "");
-    const digits = t.replace(/\D+/g, "");
-    // Israeli 9-10 digits typical
-    if (digits.length === 9 || digits.length === 10) return digits;
-    if (digits.length > 10) return digits.slice(-10);
-    return "";
-  };
-
-  const formatSpacedDigits = (digits) => String(digits || "").split("").join(" ");
-
-  const normalizePhoneDigits = (raw) => {
-    let digits = String(raw || "").replace(/\D+/g, "");
-    if (digits.startsWith("972") && digits.length > 3) {
-      digits = "0" + digits.slice(3);
-    }
-    return digits;
-  };
-
-  const isValidPhoneDigits = (digits) => {
-    const d = String(digits || "").replace(/\D+/g, "");
-    return d.length === 9 || d.length === 10;
-  };
-
-  const isYes = (text) =>
-    /(כן|כן כן|נכון|מאשר|אישור|yes|yep|yeah|ok|בסדר|סבבה|מוסכם)/i.test(
-      String(text || "").trim()
-    );
-
-  const isNo = (text) =>
-    /(לא|לא תודה|לא זה|לא נכון|no|nope|לא מעוניין|לא מסכים)/i.test(
-      String(text || "").trim()
-    );
-
-  const extractBrandModel = (text) => {
-    const t = String(text || "");
-    const brandMatch = t.match(/מותג\s+([^,.\n\r]+)/);
-    const modelMatch = t.match(/דגם\s+([^,.\n\r]+)/);
-    return {
-      brand: brandMatch ? brandMatch[1].trim() : "",
-      model: modelMatch ? modelMatch[1].trim() : ""
-    };
-  };
-
-  const extractRoute = (text) => {
-    const low = String(text || "").toLowerCase();
-    if (/(אחריות|תקלה|בעיה|שירות|החלפה|החזרה|לא עובד|תקול)/.test(low)) return "support";
-    if (/(משלוח|אספקה|עסקה|הספקה|אספקת|שליח|הזמנה|הגיע|לא הגיע|מוביל)/.test(low))
-      return "delivery";
-    if (/(מחיר|לקנות|רכישה|מוצר|דגם|מידה|צבע|מלאי|כמה עולה|מבצע)/.test(low))
-      return "sales";
-    if (/(הודעה|מנהל|עובד|לחזור אלי|השארת הודעה)/.test(low)) return "message";
-    return "";
-  };
-
-  const parseHours = (s) => {
-    // expects like "09:00-18:00" or "09:00–18:00"
-    const m = String(s || "").match(/(\d{1,2}):(\d{2})\s*[-–]\s*(\d{1,2}):(\d{2})/);
-    if (!m) return null;
-    const aH = Number(m[1]),
-      aM = Number(m[2]),
-      bH = Number(m[3]),
-      bM = Number(m[4]);
-    if (![aH, aM, bH, bM].every((x) => Number.isFinite(x))) return null;
-    return { start: aH * 60 + aM, end: bH * 60 + bM };
-  };
-
-  const isAfterHours = () => {
-    const hoursStr =
-      getSetting("BUSINESS_HOURS", "") ||
-      getSetting("HOURS", "") ||
-      getSetting("WORKING_HOURS", "") ||
-      "";
-    const parsed = parseHours(hoursStr);
-    if (!parsed) return false; // if unknown, do not force after-hours
-    // Use local time in TIME_ZONE
-    const now = new Date();
-    const parts = new Intl.DateTimeFormat("en-US", {
-      timeZone: TIME_ZONE,
-      hour12: false,
-      hour: "2-digit",
-      minute: "2-digit"
-    }).formatToParts(now);
-    const hh = Number(parts.find((p) => p.type === "hour")?.value || 0);
-    const mm = Number(parts.find((p) => p.type === "minute")?.value || 0);
-    const cur = hh * 60 + mm;
-    return cur < parsed.start || cur > parsed.end;
-  };
-
-  const buildFlowInstructions = (sayText, extra = []) => {
-    const baseStyle =
-      MB_BASE_STYLE && MB_BASE_STYLE.trim()
-        ? MB_BASE_STYLE.trim()
-        : "סגנון: נטע. תשובות קצרות, ענייניות, אנושיות. בלי חזרות מיותרות.";
-    const dnsRows = Array.isArray(SHEETS.doNotSay) ? SHEETS.doNotSay : [];
-    const doNotSayText = dnsRows
-      .map((r) => {
-        const a = String(r.forbidden_topic || "").trim();
-        const b = String(r.trigger_examples || "").trim();
-        const c = String(r.safe_response_he || "").trim();
-        const parts = [a && `נושא: ${a}`, b && `טריגרים: ${b}`, c && `תגובה בטוחה: ${c}`].filter(
-          Boolean
-        );
-        return parts.join(" | ");
-      })
-      .filter(Boolean)
-      .slice(0, 20)
-      .join("\n");
-    const rules = [
-      baseStyle,
-      "אין להמציא שמות, מספרים או פרטים שלא נאמרו או שלא קיימים בשיטס.",
-      "כאשר מציינים מספר טלפון, הקריאי ספרה־ספרה בלבד.",
-      doNotSayText ? `DO_NOT_SAY (כללים מחייבים):\n${doNotSayText}` : ""
-    ].filter(Boolean);
-    const say = sayText ? `תגידי בדיוק את המשפט הבא מילה במילה, ללא תוספות:\n${sayText}` : "";
-    return [...rules, ...extra.filter(Boolean), say].filter(Boolean).join("\n\n").trim();
-  };
-
-  const buildCarrierList = () => {
-    const deliveryRows = Array.isArray(SHEETS.deliveryContacts) ? SHEETS.deliveryContacts : [];
-    const carrierDescriptions = deliveryRows
-      .map((r) => {
-        let p = String(r.phone_e164 || r.phone || "").replace(/\D+/g, "");
-        if (!p) return "";
-        if (p.startsWith("972") && p.length > 3) {
-          p = "0" + p.slice(3);
-        }
-        const spaced = formatSpacedDigits(p);
-        const name = String(r.name || "").trim();
-        return name ? `${name} – ${spaced}` : spaced;
-      })
-      .filter(Boolean);
-    return carrierDescriptions;
-  };
-
-  const findExactImporter = (brandName) => {
-    const brand = String(brandName || "").trim();
-    if (!brand) return null;
-    const importerRows = Array.isArray(SHEETS.suppliersImporters)
-      ? SHEETS.suppliersImporters
-      : [];
-    const match = importerRows.find(
-      (r) => String(r.brand_name || "").trim() === brand
-    );
-    if (!match) return null;
-    return {
-      brand: brand,
-      importer: String(match.importer_name || "").trim(),
-      phone: String(match.phone_e164 || match.phone || "").trim()
-    };
-  };
-
-  const flowState = {
-    stage: "routing",
-    askedRouting: false,
-    route: "other",
-    afterHours: false,
-    data: {
-      product_interest: "",
-      product_model: "",
-      product_brand: "",
-      issue_type: "",
-      issue_desc: "",
-      message_target: "",
-      message_body: "",
-      delivery_desc: "",
-      full_name: "",
-      callback_phone: ""
-    },
-    finalEvent: "",
-    finalSummary: "",
-    finalPayload: null,
-    shouldHangup: false
-  };
-
-  const ensureCallerDigits = () => {
-    const callerRaw = String(caller || "").trim();
-    if (!callerRaw) return "";
-    return normalizePhoneDigits(callerRaw);
-  };
-
-  const buildFinalPayload = () => {
-    const ended = endedAt || nowIso();
-    const fallbackCallerPhone = ensureCallerDigits();
-    const payload = {
-      callSid,
-      streamSid: twilioStreamSid,
-      caller,
-      called,
-      started_at: startedAt,
-      ended_at: ended,
-      language,
-      route: flowState.route,
-      caller_last_utterance: lastCallerFinal,
-      bot_last_utterance: lastBotFinal,
-      transcript: transcriptTurns,
-      recognized_phones: recognizedPhones,
-      call_reason: flowState.route,
-      call_subject: flowState.finalSummary || lastBotFinal || lastCallerFinal
-    };
-    if (flowState.route === "sales") {
-      payload.product_interest = flowState.data.product_interest;
-      payload.product_model = flowState.data.product_model;
-      payload.product_brand = flowState.data.product_brand;
-      payload.full_name = flowState.data.full_name;
-      payload.callback_phone = flowState.data.callback_phone || fallbackCallerPhone;
-    } else if (flowState.route === "support") {
-      payload.issue_type = flowState.data.issue_type;
-      payload.issue_desc = flowState.data.issue_desc;
-      payload.product_model = flowState.data.product_model;
-      payload.product_brand = flowState.data.product_brand;
-      payload.full_name = flowState.data.full_name;
-      payload.callback_phone = flowState.data.callback_phone || fallbackCallerPhone;
-    } else if (flowState.route === "delivery") {
-      payload.delivery_desc = flowState.data.delivery_desc;
-      payload.full_name = flowState.data.full_name;
-      payload.callback_phone = flowState.data.callback_phone || fallbackCallerPhone;
-      payload.after_hours = flowState.afterHours ? "כן" : "לא";
-    } else if (flowState.route === "message") {
-      payload.message_target = flowState.data.message_target;
-      payload.message_body = flowState.data.message_body;
-      payload.full_name = flowState.data.full_name;
-      payload.callback_phone = flowState.data.callback_phone || fallbackCallerPhone;
-    }
-    return payload;
-  };
-
-  const handleRouting = (utterance) => {
-    const routeCandidate = extractRoute(utterance);
-    if (routeCandidate) {
-      flowState.route = routeCandidate;
-      flowState.stage =
-        routeCandidate === "sales"
-          ? "sales_product"
-          : routeCandidate === "support"
-          ? "support_issue"
-          : routeCandidate === "delivery"
-          ? "delivery_name"
-          : "message_target";
-      if (routeCandidate === "delivery") {
-        flowState.afterHours = isAfterHours();
-        flowState.data.delivery_desc = String(utterance || "").trim();
-      }
-      if (routeCandidate === "sales") {
-        flowState.data.product_interest = String(utterance || "").trim();
-      }
-      if (routeCandidate === "support") {
-        flowState.data.issue_desc = String(utterance || "").trim();
-        flowState.data.issue_type = String(utterance || "").trim();
-      }
-    } else if (!flowState.askedRouting) {
-      flowState.askedRouting = true;
-      flowState.stage = "routing_clarify";
-    } else {
-      flowState.route = "message";
-      flowState.stage = "message_target";
-    }
-    route = flowState.route;
-  };
-
-  const buildNextInstructions = () => {
-    const callerDigits = ensureCallerDigits();
-    const spacedCaller = callerDigits ? formatSpacedDigits(callerDigits) : "";
-    if (flowState.stage === "routing_clarify") {
-      return buildFlowInstructions(
-        "כדי לעזור במדויק—זה לגבי התעניינות במוצר, שירות/תקלה/אחריות, משלוח/אספקה, או להשאיר הודעה למישהו מהצוות?"
-      );
-    }
-    if (flowState.stage === "sales_product") {
-      return buildFlowInstructions(
-        "בשמחה. על איזה מוצר אתם מתעניינים? תגידו לי בבקשה: סוג מוצר, ואם יש—דגם ו־שם מותג."
-      );
-    }
-    if (flowState.stage === "sales_name") {
-      return buildFlowInstructions("מעולה, תודה. כדי שנחזור אליכם—מה השם המלא שלכם?");
-    }
-    if (flowState.stage === "sales_phone_confirm") {
-      const text = spacedCaller
-        ? `האם לחזור אליכם למספר הזה: ${spacedCaller} ?`
-        : "על איזה מספר טלפון נוח לחזור אליכם?";
-      return buildFlowInstructions(text);
-    }
-    if (flowState.stage === "sales_phone_collect") {
-      return buildFlowInstructions("אין בעיה, תגידו לי בבקשה את מספר הטלפון לחזרה.");
-    }
-    if (flowState.stage === "sales_phone_confirm_new") {
-      const spaced = formatSpacedDigits(flowState.data.callback_phone);
-      return buildFlowInstructions(`רק לוודא—המספר לחזרה הוא: ${spaced}. נכון?`);
-    }
-    if (flowState.stage === "sales_done") {
-      flowState.finalEvent = "מתעניין";
-      flowState.finalSummary = "לקוח מתעניין ברכישת מוצר";
-      flowState.shouldHangup = true;
-      return buildFlowInstructions(
-        "מעולה. העברתי את הפרטים למחלקת המכירות, ויחזרו אליכם בהקדם. תודה רבה ויום טוב."
-      );
-    }
-    if (flowState.stage === "support_issue") {
-      return buildFlowInstructions(
-        "הבנתי. כדי שאעביר לשירות בצורה מדויקת—מה סוג התקלה ומה מהות התקלה בכמה מילים?"
-      );
-    }
-    if (flowState.stage === "support_product") {
-      return buildFlowInstructions("ועל איזה מוצר זה? תגידו לי בבקשה דגם ו־שם מותג.");
-    }
-    if (flowState.stage === "support_name") {
-      return buildFlowInstructions("תודה. מה השם המלא שלכם?");
-    }
-    if (flowState.stage === "support_phone_confirm") {
-      const text = spacedCaller
-        ? `האם לחזור אליכם למספר הזה: ${spacedCaller} ?`
-        : "על איזה מספר טלפון נוח לחזור אליכם?";
-      return buildFlowInstructions(text);
-    }
-    if (flowState.stage === "support_phone_collect") {
-      return buildFlowInstructions("אין בעיה, תגידו לי בבקשה את מספר הטלפון לחזרה.");
-    }
-    if (flowState.stage === "support_phone_confirm_new") {
-      const spaced = formatSpacedDigits(flowState.data.callback_phone);
-      return buildFlowInstructions(`רק לוודא—המספר לחזרה הוא: ${spaced}. נכון?`);
-    }
-    if (flowState.stage === "support_done") {
-      flowState.finalEvent = "שירות לקוחות \\ תמיכה";
-      flowState.finalSummary = "לקוח מבקש שירות/תמיכה";
-      flowState.shouldHangup = true;
-      const importer = findExactImporter(flowState.data.product_brand);
-      const extra = [];
-      if (importer && importer.phone) {
-        const spaced = formatSpacedDigits(normalizePhoneDigits(importer.phone));
-        extra.push(
-          `תגידי לפני הסיום: רק לידיעה—המספר של היבואן עבור המותג ${importer.brand} הוא: ${spaced}.`
-        );
-      }
-      return buildFlowInstructions(
-        "מעולה. שלחתי את הפרטים למחלקת השירות, ויחזרו אליכם בהקדם. תודה רבה ויום טוב.",
-        extra
-      );
-    }
-    if (flowState.stage === "delivery_name") {
-      flowState.afterHours = isAfterHours();
-      const carriers = flowState.afterHours ? buildCarrierList() : [];
-      const afterHoursText =
-        flowState.afterHours && carriers.length
-          ? `כרגע אנחנו מחוץ לשעות הפעילות. כדי לעזור כבר עכשיו—אלו מספרי הטלפון של המובילים: ${carriers.join(
-              ", "
-            )}.`
-          : flowState.afterHours
-          ? "כרגע אנחנו מחוץ לשעות הפעילות. אין לי כרגע מספרי מובילים זמינים מהטבלה."
-          : "";
-      const intro = "הבנתי. זה לגבי משלוח/אספקה. אני אקח כמה פרטים ואעביר למחלקת אספקה.";
-      const askName = "מה השם המלא שלכם?";
-      return buildFlowInstructions(
-        [intro, afterHoursText, askName].filter(Boolean).join(" ")
-      );
-    }
-    if (flowState.stage === "delivery_phone_confirm") {
-      const text = spacedCaller
-        ? `האם לחזור אליכם למספר הזה: ${spacedCaller} ?`
-        : "על איזה מספר טלפון נוח לחזור אליכם?";
-      return buildFlowInstructions(text);
-    }
-    if (flowState.stage === "delivery_phone_collect") {
-      return buildFlowInstructions("אין בעיה, תגידו לי בבקשה את מספר הטלפון לחזרה.");
-    }
-    if (flowState.stage === "delivery_phone_confirm_new") {
-      const spaced = formatSpacedDigits(flowState.data.callback_phone);
-      return buildFlowInstructions(`רק לוודא—המספר לחזרה הוא: ${spaced}. נכון?`);
-    }
-    if (flowState.stage === "delivery_done") {
-      flowState.finalEvent = "שירות לקוחות \\ אספקה";
-      flowState.finalSummary = "לקוח רוצה לברר לגבי משלוח/אספקה";
-      flowState.shouldHangup = true;
-      return buildFlowInstructions(
-        "תודה. העברתי את הפרטים למחלקת אספקה, ויחזרו אליכם בהקדם. יום טוב."
-      );
-    }
-    if (flowState.stage === "message_target") {
-      return buildFlowInstructions("בשמחה. למי מיועדת ההודעה? (שם עובד/מנהל)");
-    }
-    if (flowState.stage === "message_name") {
-      return buildFlowInstructions("מה השם המלא שלכם?");
-    }
-    if (flowState.stage === "message_body") {
-      return buildFlowInstructions("מה מהות ההודעה? תאמרו/תאמרי את זה בקצרה.");
-    }
-    if (flowState.stage === "message_phone_confirm") {
-      const text = spacedCaller
-        ? `האם לחזור אליכם למספר הזה: ${spacedCaller} ?`
-        : "על איזה מספר טלפון נוח לחזור אליכם?";
-      return buildFlowInstructions(text);
-    }
-    if (flowState.stage === "message_phone_collect") {
-      return buildFlowInstructions("אין בעיה, תגידו לי בבקשה את מספר הטלפון לחזרה.");
-    }
-    if (flowState.stage === "message_phone_confirm_new") {
-      const spaced = formatSpacedDigits(flowState.data.callback_phone);
-      return buildFlowInstructions(`רק לוודא—המספר לחזרה הוא: ${spaced}. נכון?`);
-    }
-    if (flowState.stage === "message_done") {
-      flowState.finalEvent = "הודעה כללית";
-      flowState.finalSummary = `הודעה עבור ${flowState.data.message_target || "הצוות"}`;
-      flowState.shouldHangup = true;
-      return buildFlowInstructions(
-        `תודה. העברתי את ההודעה ל־${flowState.data.message_target} ויחזרו אליכם בהקדם. יום טוב.`
-      );
-    }
-    return "";
-  };
-
-  const processCallerUtterance = (utterance) => {
-    const text = String(utterance || "").trim();
-    if (!text) return "";
-    if (flowState.stage === "routing" || flowState.stage === "routing_clarify") {
-      handleRouting(text);
-      return buildNextInstructions();
-    }
-    if (flowState.stage === "sales_product") {
-      flowState.data.product_interest = text;
-      const { brand, model } = extractBrandModel(text);
-      if (brand) flowState.data.product_brand = brand;
-      if (model) flowState.data.product_model = model;
-      flowState.stage = "sales_name";
-      return buildNextInstructions();
-    }
-    if (flowState.stage === "sales_name") {
-      flowState.data.full_name = text;
-      flowState.stage = "sales_phone_confirm";
-      return buildNextInstructions();
-    }
-    if (flowState.stage === "sales_phone_confirm") {
-      if (isYes(text)) {
-        flowState.data.callback_phone = ensureCallerDigits();
-        flowState.stage = "sales_done";
-        return buildNextInstructions();
-      }
-      if (isNo(text) || !ensureCallerDigits()) {
-        flowState.stage = "sales_phone_collect";
-        return buildNextInstructions();
-      }
-      flowState.stage = "sales_phone_collect";
-      return buildNextInstructions();
-    }
-    if (flowState.stage === "sales_phone_collect") {
-      const digits = extractPhoneCandidates(text);
-      if (!isValidPhoneDigits(digits)) {
-        return buildFlowInstructions("נראה שחסרה לי ספרה אחת, תוכלו להגיד שוב את המספר לאט?");
-      }
-      flowState.data.callback_phone = digits;
-      if (!recognizedPhones.includes(digits)) recognizedPhones.push(digits);
-      flowState.stage = "sales_phone_confirm_new";
-      return buildNextInstructions();
-    }
-    if (flowState.stage === "sales_phone_confirm_new") {
-      if (isYes(text)) {
-        flowState.stage = "sales_done";
-        return buildNextInstructions();
-      }
-      flowState.stage = "sales_phone_collect";
-      return buildNextInstructions();
-    }
-    if (flowState.stage === "support_issue") {
-      flowState.data.issue_type = text;
-      flowState.data.issue_desc = text;
-      flowState.stage = "support_product";
-      return buildNextInstructions();
-    }
-    if (flowState.stage === "support_product") {
-      const { brand, model } = extractBrandModel(text);
-      flowState.data.product_brand = brand || flowState.data.product_brand;
-      flowState.data.product_model = model || flowState.data.product_model;
-      flowState.stage = "support_name";
-      return buildNextInstructions();
-    }
-    if (flowState.stage === "support_name") {
-      flowState.data.full_name = text;
-      flowState.stage = "support_phone_confirm";
-      return buildNextInstructions();
-    }
-    if (flowState.stage === "support_phone_confirm") {
-      if (isYes(text)) {
-        flowState.data.callback_phone = ensureCallerDigits();
-        flowState.stage = "support_done";
-        return buildNextInstructions();
-      }
-      if (isNo(text) || !ensureCallerDigits()) {
-        flowState.stage = "support_phone_collect";
-        return buildNextInstructions();
-      }
-      flowState.stage = "support_phone_collect";
-      return buildNextInstructions();
-    }
-    if (flowState.stage === "support_phone_collect") {
-      const digits = extractPhoneCandidates(text);
-      if (!isValidPhoneDigits(digits)) {
-        return buildFlowInstructions("נראה שחסרה לי ספרה אחת, תוכלו להגיד שוב את המספר לאט?");
-      }
-      flowState.data.callback_phone = digits;
-      if (!recognizedPhones.includes(digits)) recognizedPhones.push(digits);
-      flowState.stage = "support_phone_confirm_new";
-      return buildNextInstructions();
-    }
-    if (flowState.stage === "support_phone_confirm_new") {
-      if (isYes(text)) {
-        flowState.stage = "support_done";
-        return buildNextInstructions();
-      }
-      flowState.stage = "support_phone_collect";
-      return buildNextInstructions();
-    }
-    if (flowState.stage === "delivery_name") {
-      flowState.data.full_name = text;
-      flowState.stage = "delivery_phone_confirm";
-      return buildNextInstructions();
-    }
-    if (flowState.stage === "delivery_phone_confirm") {
-      if (isYes(text)) {
-        flowState.data.callback_phone = ensureCallerDigits();
-        flowState.stage = "delivery_done";
-        return buildNextInstructions();
-      }
-      if (isNo(text) || !ensureCallerDigits()) {
-        flowState.stage = "delivery_phone_collect";
-        return buildNextInstructions();
-      }
-      flowState.stage = "delivery_phone_collect";
-      return buildNextInstructions();
-    }
-    if (flowState.stage === "delivery_phone_collect") {
-      const digits = extractPhoneCandidates(text);
-      if (!isValidPhoneDigits(digits)) {
-        return buildFlowInstructions("נראה שחסרה לי ספרה אחת, תוכלו להגיד שוב את המספר לאט?");
-      }
-      flowState.data.callback_phone = digits;
-      if (!recognizedPhones.includes(digits)) recognizedPhones.push(digits);
-      flowState.stage = "delivery_phone_confirm_new";
-      return buildNextInstructions();
-    }
-    if (flowState.stage === "delivery_phone_confirm_new") {
-      if (isYes(text)) {
-        flowState.stage = "delivery_done";
-        return buildNextInstructions();
-      }
-      flowState.stage = "delivery_phone_collect";
-      return buildNextInstructions();
-    }
-    if (flowState.stage === "message_target") {
-      flowState.data.message_target = text;
-      flowState.stage = "message_name";
-      return buildNextInstructions();
-    }
-    if (flowState.stage === "message_name") {
-      flowState.data.full_name = text;
-      flowState.stage = "message_body";
-      return buildNextInstructions();
-    }
-    if (flowState.stage === "message_body") {
-      flowState.data.message_body = text;
-      flowState.stage = "message_phone_confirm";
-      return buildNextInstructions();
-    }
-    if (flowState.stage === "message_phone_confirm") {
-      if (isYes(text)) {
-        flowState.data.callback_phone = ensureCallerDigits();
-        flowState.stage = "message_done";
-        return buildNextInstructions();
-      }
-      if (isNo(text) || !ensureCallerDigits()) {
-        flowState.stage = "message_phone_collect";
-        return buildNextInstructions();
-      }
-      flowState.stage = "message_phone_collect";
-      return buildNextInstructions();
-    }
-    if (flowState.stage === "message_phone_collect") {
-      const digits = extractPhoneCandidates(text);
-      if (!isValidPhoneDigits(digits)) {
-        return buildFlowInstructions("נראה שחסרה לי ספרה אחת, תוכלו להגיד שוב את המספר לאט?");
-      }
-      flowState.data.callback_phone = digits;
-      if (!recognizedPhones.includes(digits)) recognizedPhones.push(digits);
-      flowState.stage = "message_phone_confirm_new";
-      return buildNextInstructions();
-    }
-    if (flowState.stage === "message_phone_confirm_new") {
-      if (isYes(text)) {
-        flowState.stage = "message_done";
-        return buildNextInstructions();
-      }
-      flowState.stage = "message_phone_collect";
-      return buildNextInstructions();
-    }
-    return "";
-  };
-
-  /**
-   * Normalize an input transcript for duplicate detection.
-   * This helper removes common greetings and filler words,
-   * strips punctuation and extra whitespace, and lowercases the result.
-   * It allows us to compare two caller utterances for semantic equality
-   * even if they differ slightly in casing or punctuation. We define
-   * greetings that should not trigger a new response (e.g. "היי", "שלום", "ביי").
-   */
-  const normalizeTranscript = (s) => {
-    try {
-      let t = String(s || "").toLowerCase();
-      // Remove punctuation
-      t = t.replace(/[\.,!?\-–—;:'"\u05be]/g, " ");
-      // Replace multiple spaces
-      t = t.replace(/\s+/g, " ").trim();
-      // Remove common greetings and filler words at start or end
-      const greetings = [
-        "היי",
-        "הי",
-        "שלום",
-        "ביי",
-        "היי שלום",
-        "היי, שלום",
-        "היי שלום לך",
-        "שלום לך",
-        "ביי שלום",
-        "ביי, שלום",
-        "אה",
-        "אה, שלום",
-        "אה שלום",
-        "אה, שלום לך",
-        "אה שלום לך",
-        // English greetings and farewells to ignore
-        "hi",
-        "hello",
-        "bye",
-        "bye-bye",
-        "bye bye",
-        "bye, bye"
-      ];
-      // Remove greeting phrases from beginning
-      for (const g of greetings) {
-        if (t.startsWith(g + " ")) t = t.slice(g.length).trim();
-        if (t === g) return "";
-      }
-      return t;
-    } catch (_) {
-      return String(s || "").trim().toLowerCase();
-    }
-  };
-
-  const isFillerOnly = (normalized) => {
-    const fillerPhrases = [
-      "תודה",
-      "תודה רבה",
-      "כן",
-      "סבבה",
-      "בבקשה",
-      "בסדר",
-      "תודה על הקופון"
-    ];
-    return fillerPhrases.some(
-      (fp) => normalized === fp || normalized.startsWith(fp + " ") || normalized.endsWith(" " + fp)
-    );
-  };
-
-  // Keep track of normalized caller utterances to prevent duplicate responses
-  let lastCallerNormalized = "";
-  let lastRequestedCallerNormalized = "";
-
-  const printCallerFinal = (text) => {
-    const t = String(text || "").trim();
-    if (!t) return;
-    if (t === lastCallerFinal) return;
-    lastCallerFinal = t;
-    pushTurn("caller", t);
-    // Update proxy instructions for next response (flow-driven)
-    proxyInstructions = processCallerUtterance(t);
-    always(`[CALLER][${connTag}]`, t);
-  };
-
-  const printBotFinal = (text) => {
-    const t = String(text || "").trim();
-    if (!t) return;
-    if (t === lastBotFinal) return;
-    lastBotFinal = t;
-    pushTurn("bot", t);
-    always(`[BOT][${connTag}]`, t);
-  };
-
-  // NOTE: declare openaiWs variable early so closures can reference safely
-  let openaiWs = null;
-
-  const safeOpenAISend = (obj) => {
-    try {
-      if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
-        openaiWs.send(JSON.stringify(obj));
-        return true;
-      }
-      return false;
-    } catch (e) {
-      error("OpenAI send failed", e.message);
-      return false;
-    }
-  };
-
-  const safeTwilioSend = (obj) => {
-    try {
-      if (twilioWs && twilioWs.readyState === WebSocket.OPEN) {
-        twilioWs.send(JSON.stringify(obj));
-        return true;
-      }
-      return false;
-    } catch (e) {
-      error("Twilio send failed", e.message);
-      return false;
-    }
-  };
-
-  if (!OPENAI_API_KEY) {
-    error("OPENAI_API_KEY missing — closing call");
-    try {
-      twilioWs.close();
-    } catch (_) {}
+  if (!GSHEET_ID || !GOOGLE_SERVICE_ACCOUNT_JSON_B64) {
+    error("Sheets env missing", { GSHEET_ID: !!GSHEET_ID, GOOGLE_SERVICE_ACCOUNT_JSON_B64: !!GOOGLE_SERVICE_ACCOUNT_JSON_B64 });
     return;
   }
 
-  // -----------------------------
-  // Anti-overlap: only ONE active response at a time
-  // -----------------------------
-  // awaitingResponse indicates the assistant is currently speaking. While true
-  // we pause forwarding caller audio to OpenAI. When false, we can send
-  // audio and, if there is a pending user utterance, trigger a response.
+  const credsJson = Buffer.from(GOOGLE_SERVICE_ACCOUNT_JSON_B64, "base64").toString("utf8");
+  const creds = JSON.parse(credsJson);
+
+  const auth = new google.auth.GoogleAuth({
+    credentials: creds,
+    scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+  });
+
+  const sheets = google.sheets({ version: "v4", auth });
+
+  const range = [
+    "PROMPTS!A:B",
+    "SETTINGS!A:B",
+    "KB_FACTS!A:B",
+    "DO_NOT_SAY!A:B",
+    "SUPPLIERS_IMPORTERS!A:B",
+    "DELIVERY_CONTACTS!A:D",
+    "ROUTING_RULES!A:D",
+    "BUSINESS_INFO!A:B"
+  ];
+
+  const resp = await sheets.spreadsheets.values.batchGet({
+    spreadsheetId: GSHEET_ID,
+    ranges: range,
+    majorDimension: "ROWS"
+  });
+
+  const [prompts, settings, kbFacts, doNotSay, suppliersImporters, deliveryContacts, routingRules, businessInfo] =
+    resp.data.valueRanges.map((r) => r.values || []);
+
+  SHEETS = {
+    loaded_at: new Date().toISOString(),
+    prompts: parseTable(prompts, "prompt_id", "content_he"),
+    settings: parseTable(settings, "key", "value"),
+    kbFacts: rowsToObjects(kbFacts),
+    doNotSay: parseArray(doNotSay, "key", "value"),
+    suppliersImporters: rowsToObjects(suppliersImporters),
+    deliveryContacts: rowsToObjects(deliveryContacts),
+    routingRules: rowsToObjects(routingRules),
+    businessInfo: rowsToObjects(businessInfo)
+  };
+
+  log(
+    `Sheets loaded (prompts=${Object.keys(SHEETS.prompts).length}, settings=${Object.keys(
+      SHEETS.settings
+    ).length}, kbFacts=${SHEETS.kbFacts.length}, doNotSay=${SHEETS.doNotSay.length}, suppliersImporters=${SHEETS.suppliersImporters.length}, deliveryContacts=${SHEETS.deliveryContacts.length})`
+  );
+}
+
+function getPrompt(id, fallback = "") {
+  return (SHEETS.prompts && SHEETS.prompts[id]) || fallback;
+}
+
+function getSetting(key, fallback = "") {
+  return (SHEETS.settings && SHEETS.settings[key]) || fallback;
+}
+
+// --------------------------------------------------
+// Text utils (Hebrew normalization)
+// --------------------------------------------------
+const normalizeText = (s) => {
+  return String(s || "")
+    .replace(/\s+/g, " ")
+    .replace(/[“”]/g, '"')
+    .replace(/[’‘]/g, "'")
+    .trim();
+};
+
+// --------------------------------------------------
+// Call-level memory (simple, in-memory, TTL)
+// --------------------------------------------------
+const memory = new Map();
+
+function getMemory(callSid) {
+  const entry = memory.get(callSid);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) {
+    memory.delete(callSid);
+    return null;
+  }
+  return entry.data;
+}
+
+function setMemory(callSid, data, ttlMinutes = 30) {
+  memory.set(callSid, {
+    data,
+    expiresAt: Date.now() + ttlMinutes * 60 * 1000
+  });
+}
+
+// --------------------------------------------------
+// Assistants logic (prompt building)
+// --------------------------------------------------
+function buildSystemPrompt(masterPrompt) {
+  return normalizeText(masterPrompt);
+}
+
+function buildBaseStyleInstructions() {
+  if (!MB_BASE_STYLE) return "";
+  return `\nסגנון בסיס:\n${MB_BASE_STYLE}`;
+}
+
+function buildKnowledgeBase() {
+  const lines = [];
+
+  const kbFacts = (SHEETS.kbFacts || []).map((r) => `${r.question || ""}: ${r.answer || ""}`);
+  if (kbFacts.length) {
+    lines.push("ידע כללי:");
+    lines.push(...kbFacts);
+  }
+
+  const doNotSay = (SHEETS.doNotSay || []).map((r) => `❌ ${r.key} — ${r.value}`);
+  if (doNotSay.length) {
+    lines.push("לא לומר:");
+    lines.push(...doNotSay);
+  }
+
+  const suppliers = (SHEETS.suppliersImporters || []).map((r) => `• ${r.supplier || ""} — ${r.contact || ""}`);
+  if (suppliers.length) {
+    lines.push("ספקים/יבואנים:");
+    lines.push(...suppliers);
+  }
+
+  const deliveryContacts = (SHEETS.deliveryContacts || []).map((r) => {
+    const name = r.name || "";
+    const phone = r.phone || "";
+    const area = r.area || "";
+    return `• ${name} — ${phone} — ${area}`;
+  });
+  if (deliveryContacts.length) {
+    lines.push("שליחים/הובלה:");
+    lines.push(...deliveryContacts);
+  }
+
+  const businessInfo = (SHEETS.businessInfo || []).map((r) => `${r.key || ""}: ${r.value || ""}`);
+  if (businessInfo.length) {
+    lines.push("מידע עסקי:");
+    lines.push(...businessInfo);
+  }
+
+  if (!lines.length) return "";
+  return `\nמידע לבוט:\n${lines.join("\n")}`;
+}
+
+function buildNextInstructions() {
+  const masterPrompt = getPrompt(
+    "MASTER_PROMPT",
+    "אתם עוזרת קולית בשם נטע עבור גיל ספורט. דברו קצר, קליל וברור."
+  );
+
+  const promptParts = [
+    buildSystemPrompt(masterPrompt),
+    buildBaseStyleInstructions(),
+    buildKnowledgeBase()
+  ];
+
+  return normalizeText(promptParts.filter(Boolean).join("\n\n"));
+}
+
+// --------------------------------------------------
+// Simple lead extraction
+// --------------------------------------------------
+const phoneRegex = /(\+972|0)\s?(\d)([\s-]?\d){7,9}/g;
+
+function extractLeadFromText(text) {
+  const leads = [];
+
+  const matches = String(text || "").match(phoneRegex) || [];
+  for (const m of matches) {
+    const digits = m.replace(/\D/g, "");
+    if (digits.length >= 9) {
+      leads.push({ type: "phone", value: digits });
+    }
+  }
+
+  return leads;
+}
+
+// --------------------------------------------------
+// Express setup
+// --------------------------------------------------
+const app = express();
+app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: "5mb" }));
+
+app.get("/", (_req, res) => {
+  res.json({
+    status: "ok",
+    time: nowIso(),
+    sheets_loaded_at: SHEETS.loaded_at,
+    ws_connections: RUNTIME.ws_connections,
+    ws_closed: RUNTIME.ws_closed,
+    ws_errors: RUNTIME.ws_errors,
+    openai_errors: RUNTIME.openai_errors,
+    openai_closed: RUNTIME.openai_closed,
+    last_ws_conn_at: RUNTIME.last_ws_conn_at,
+    last_ws_close_at: RUNTIME.last_ws_close_at
+  });
+});
+
+app.post("/healthz", (_req, res) => {
+  res.json({ ok: true, ts: nowIso() });
+});
+
+app.post("/twilio-voice", (req, res) => {
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Start>
+    <Stream url="wss://${req.headers.host}/twilio-media-stream" />
+  </Start>
+  <Say voice="Polly.Natalie">Connecting you to Neta.</Say>
+  <Pause length="60" />
+</Response>`;
+  res.type("text/xml").send(xml);
+});
+
+app.get("/recording/:callSid", async (req, res) => {
+  const callSid = req.params.callSid || "";
+  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) {
+    return res.status(500).json({ error: "Twilio auth not configured" });
+  }
+  if (!callSid) {
+    return res.status(400).json({ error: "Missing callSid" });
+  }
+
+  const listUrl = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Recordings.json?CallSid=${encodeURIComponent(
+    callSid
+  )}&PageSize=1`;
+  const auth = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64");
+
+  try {
+    const resp = await fetch(listUrl, {
+      headers: {
+        Authorization: `Basic ${auth}`
+      }
+    });
+
+    if (!resp.ok) {
+      return res.status(resp.status).json({ error: "Twilio error" });
+    }
+
+    const data = await resp.json();
+    const rec = data.recordings && data.recordings[0];
+
+    if (!rec || !rec.media_url) {
+      return res.status(404).json({ error: "Recording not found" });
+    }
+
+    res.redirect(`${rec.media_url}.mp3`);
+  } catch (e) {
+    return res.status(500).json({ error: "Failed to fetch recording" });
+  }
+});
+
+// --------------------------------------------------
+// HTTP server
+// --------------------------------------------------
+const server = http.createServer(app);
+
+// --------------------------------------------------
+// WebSocket: Twilio Media Streams
+// --------------------------------------------------
+const wss = new WebSocket.Server({ server });
+
+wss.on("connection", (twilioWs, req) => {
+  RUNTIME.ws_connections += 1;
+  RUNTIME.last_ws_conn_at = nowIso();
+
+  const connId = crypto.randomUUID().slice(0, 8);
+  const connTag = `conn_${connId}`;
+
+  always("WS connection", {
+    at: nowIso(),
+    ip: req.socket.remoteAddress,
+    ua: req.headers["user-agent"],
+    url: req.url,
+    total_ws_connections: RUNTIME.ws_connections
+  });
+
+  let openaiWs = null;
+  let openaiReady = false;
+  let twilioStreamSid = null;
+  let callSid = null;
+
+  let pendingAudio = [];
   let awaitingResponse = false;
-  // pendingResponseRequest is flagged whenever we detect a new caller
-  // utterance (final transcript). It is consumed on the next response.done.
   let pendingResponseRequest = false;
+  let lastUserAudioAt = Date.now();
+  let lastBotAudioAt = Date.now();
+  let totalMs = 0;
+  let idleWarningSent = false;
+  let maxCallWarningSent = false;
+  let callEnded = false;
 
-  // When flushing buffered audio frames back to OpenAI after the assistant
-  // finishes speaking, we temporarily ignore any resulting transcripts.
-  let isFlushingBufferedAudio = false;
+  // One-time per connection
+  const reportOnce = new Set();
 
-  const requestAssistantResponse = (reason = "") => {
-    // Only send a response if the OpenAI WS is ready
+  // --------------------------------------------------
+  // Twilio -> OpenAI
+  // --------------------------------------------------
+
+  const safeOpenAISend = (payload) => {
     if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN) return;
+    openaiWs.send(JSON.stringify(payload));
+  };
 
-    // Don't start a new response while another is in flight
-    if (awaitingResponse) {
-      debug(`[${connTag}] response.request ignored (awaitingResponse=true) reason=${reason}`);
+  const closeBoth = () => {
+    try {
+      if (twilioWs && twilioWs.readyState === WebSocket.OPEN) twilioWs.close();
+    } catch (_) {}
+    try {
+      if (openaiWs && openaiWs.readyState === WebSocket.OPEN) openaiWs.close();
+    } catch (_) {}
+  };
+
+  const markCallEnded = () => {
+    if (callEnded) return;
+    callEnded = true;
+    sendWebhookEvent("call_end", {
+      callSid,
+      ended_at: nowIso(),
+      ws_connection_id: connTag
+    });
+  };
+
+  const clearIfShouldHangup = () => {
+    if (!callSid) return;
+    if (totalMs > MB_MAX_CALL_MS && !maxCallWarningSent) {
+      maxCallWarningSent = true;
+      const msg = "הגעתם לזמן המקסימלי של השיחה. ניתוק בקרוב.";
+      safeOpenAISend({
+        type: "response.create",
+        response: { modalities: ["audio", "text"], instructions: msg }
+      });
+    }
+
+    if (totalMs > MB_MAX_CALL_MS + MB_IDLE_HANGUP_MS) {
+      markCallEnded();
+      closeBoth();
+    }
+  };
+
+  const handleTwilioMessage = (message) => {
+    let data;
+    try {
+      data = JSON.parse(message);
+    } catch {
       return;
     }
 
-    // Reset flags: we're starting a new response now
-    awaitingResponse = true;
-    pendingResponseRequest = false;
+    if (data.event === "start") {
+      twilioStreamSid = data.start && data.start.streamSid;
+      callSid = data.start && data.start.callSid;
 
-    // Mark that we've responded to the most recent caller utterance
-    lastRequestedCallerFinal = lastCallerFinal;
-    lastRequestedCallerNormalized = lastCallerNormalized;
+      always(`[TWILIO_START][${connTag}]`, JSON.stringify(data.start || {}));
 
-    // Build dynamic instructions for this turn.
-    let instructions = proxyInstructions;
-    if (!instructions) {
-      try {
-        instructions = buildNextInstructions();
-      } catch (_) {
-        instructions = getPrompt(
-          "MASTER_PROMPT",
-          "אתם עוזרת קולית בשם נטע עבור גיל ספורט. דברו קצר, קליל וברור."
-        );
+      // Call start webhook
+      sendWebhookEvent("call_start", {
+        callSid,
+        started_at: nowIso(),
+        ws_connection_id: connTag
+      });
+    }
+
+    if (data.event === "media") {
+      lastUserAudioAt = Date.now();
+      if (!openaiReady) {
+        pendingAudio.push(data.media.payload);
+      } else {
+        safeOpenAISend({
+          type: "input_audio_buffer.append",
+          audio: data.media.payload
+        });
       }
+    }
+
+    if (data.event === "stop") {
+      always(`[TWILIO_STOP][${connTag}] stream stopped`);
+      markCallEnded();
+      closeBoth();
+    }
+  };
+
+  twilioWs.on("message", handleTwilioMessage);
+
+  twilioWs.on("error", (e) => {
+    RUNTIME.ws_errors += 1;
+    error("Twilio WS error", e?.message || e);
+    closeBoth();
+  });
+
+  twilioWs.on("close", () => {
+    RUNTIME.ws_closed += 1;
+    always(`[TWILIO_CLOSE][${connTag}] socket closed`);
+    closeBoth();
+  });
+
+  // --------------------------------------------------
+  // OpenAI WebSocket
+  // --------------------------------------------------
+
+  const sendAssistantResponse = (reason = "turn") => {
+    if (awaitingResponse) return;
+    awaitingResponse = true;
+
+    let instructions = buildNextInstructions();
+
+    // Optional use of OPENAI_VOICE_STYLE on first response
+    if (OPENAI_VOICE_STYLE) {
+      instructions = `${instructions}\n\nסגנון קול: ${OPENAI_VOICE_STYLE}`;
+    }
+
+    if (MB_BASE_STYLE) {
+      instructions = `${instructions}\n\n${MB_BASE_STYLE}`;
+    }
+
+    const tone = getSetting("TONE", "");
+    if (tone) {
+      instructions = `${instructions}\n\n${tone}`;
+    }
+
+    if (getSetting("ASK_ONE_QUESTION_ONLY", "false") === "true") {
+      instructions = `${instructions}\n\nתשאלי שאלה אחת בלבד בסוף התשובה.`;
+    }
+
+    if (getSetting("SHORT_ANSWERS", "false") === "true") {
+      instructions = `${instructions}\n\nהתשובות צריכות להיות קצרות (עד 1-2 משפטים).`;
+    }
+
+    try {
+      instructions = buildNextInstructions();
+    } catch (_) {
+      instructions = getPrompt(
+        "MASTER_PROMPT",
+        "אתם עוזרת קולית בשם נטע עבור גיל ספורט. דברו קצר, קליל וברור."
+      );
     }
 
     debug(`[${connTag}] response.create (reason=${reason})`);
@@ -1375,20 +755,15 @@ wss.on("connection", (twilioWs, req) => {
       master_preview: preview(masterPrompt, 220)
     });
 
-    // Prepare the realtime session settings. We allow specifying a voice
-    // style and speaking rate via environment variables. If a style is
-    // provided, we pass an object with name, style and rate to the API.
+    // Prepare the realtime session settings. The API now expects voice.id,
+    // so always send an object with id and optional style/rate overrides.
     const session = {
       modalities: ["audio", "text"],
-      voice:
-        OPENAI_VOICE_STYLE || OPENAI_SPEAKING_RATE !== 1.0
-          ? {
-              name: OPENAI_VOICE,
-              // Only include style if non-empty to avoid overriding defaults.
-              ...(OPENAI_VOICE_STYLE ? { style: OPENAI_VOICE_STYLE } : {}),
-              rate: OPENAI_SPEAKING_RATE
-            }
-          : OPENAI_VOICE,
+      voice: {
+        id: OPENAI_VOICE,
+        ...(OPENAI_VOICE_STYLE ? { style: OPENAI_VOICE_STYLE } : {}),
+        ...(OPENAI_SPEAKING_RATE !== 1.0 ? { rate: OPENAI_SPEAKING_RATE } : {})
+      },
       input_audio_format: "g711_ulaw",
       output_audio_format: "g711_ulaw",
       turn_detection: {
@@ -1444,374 +819,200 @@ wss.on("connection", (twilioWs, req) => {
     } catch (_) {}
   });
 
-  openaiWs.on("message", (data) => {
-    let msg;
+  openaiWs.on("message", (msg) => {
+    let data;
     try {
-      msg = JSON.parse(data.toString());
-    } catch (e) {
-      error(`[${connTag}] OpenAI message JSON parse failed`, e.message);
+      data = JSON.parse(msg);
+    } catch {
       return;
     }
 
-    // RAW dump when needed
     if (MB_LOG_RAW_OPENAI) {
-      const small = { type: msg.type, event_id: msg.event_id };
-      if (msg.delta) small.delta_len = String(msg.delta).length;
-      if (msg.transcript) small.transcript = preview(msg.transcript, 200);
-      if (msg.text) small.text = preview(msg.text, 200);
-      always(`[RAW_OPENAI][${connTag}]`, JSON.stringify(small));
+      debug(`[${connTag}] OpenAI raw`, data);
     }
 
-    // Optional: log intermediate bot transcript parts if provided. This can help debug misread numbers.
-    try {
-      if (MB_LOG_TRANSCRIPTS && msg && typeof msg.transcript === "string" && msg.type && String(msg.type).startsWith("response.audio_transcript.delta")) {
-        always(`[BOT_PART][${connTag}]`, msg.transcript.trim());
-      }
-    } catch (_) {
-      /* ignore logging errors */
-    }
-
-    if (msg.type === "error") {
-      error(`[${connTag}] OpenAI error event`, msg);
-      const errCode = msg && msg.error && msg.error.code ? String(msg.error.code) : "";
-      if (errCode === "conversation_already_has_active_response") {
-        // The assistant is still speaking. Do not queue a new response here; the
-        // caller_final handler will decide if another response is needed. We simply
-        // keep awaitingResponse=true to prevent sending another response before
-        // the current one finishes.
-        awaitingResponse = true;
-        // Do not set pendingResponseRequest here — rely on new caller_final events.
-      }
+    if (data.type === "error") {
+      RUNTIME.openai_errors += 1;
+      error(`[${connTag}] OpenAI error event`, data);
       return;
     }
 
-    // -----------------------------
-    // BOT FINAL (clean)
-    // -----------------------------
-    if (msg.type === "response.audio_transcript.done") {
-      const t = String(msg.transcript || "").trim();
-      if (t) printBotFinal(t);
-      return;
+    if (data.type === "session.updated") {
+      debug(`[${connTag}] session.updated`);
     }
 
-    // -----------------------------
-    // CALLER FINAL (robust)
-    // -----------------------------
-    {
-      const type = String(msg.type || "");
-      const doneLike = type.includes("done") || type.includes("completed");
-      const possible =
-        msg.transcript ||
-        msg.text ||
-        msg?.item?.content?.[0]?.transcript ||
-        msg?.item?.content?.[0]?.text ||
-        "";
-      const isInputTranscript =
-        type.includes("input_audio_transcription") ||
-        type.includes("input_audio_transcript") ||
-        type.includes("conversation.item.input_audio_transcription");
-      if (doneLike && isInputTranscript && possible) {
-        const utterance = String(possible).trim();
-        // Normalize the utterance to remove greetings/punctuation for duplicate detection
-        const normalized = normalizeTranscript(utterance);
-        // Count meaningful words in the normalized text
-        const wordCount = normalized.split(/\s+/).filter(Boolean).length;
-        // If we are currently flushing buffered audio, ignore any transcripts generated
-        // by the flush. These partial echoes of prior audio should not trigger new responses.
-        if (isFlushingBufferedAudio) {
-          // still update lastCallerNormalized for diagnostics, but do not queue a response
-          lastCallerNormalized = normalized;
-          lastCallerFinal = utterance;
-          return;
+    if (data.type === "response.created") {
+      debug(`[${connTag}] response.created`);
+    }
+
+    if (data.type === "response.output_item.added") {
+      debug(`[${connTag}] response.output_item.added`, data.item?.type);
+    }
+
+    if (data.type === "response.output_item.done") {
+      debug(`[${connTag}] response.output_item.done`, data.item?.type);
+    }
+
+    if (data.type === "response.content_part.added") {
+      debug(`[${connTag}] response.content_part.added`, data.part?.type);
+    }
+
+    if (data.type === "response.content_part.done") {
+      if (data.part?.type === "audio") {
+        debug(`[${connTag}] response.content_part.done audio`);
+      }
+      if (data.part?.type === "text") {
+        const text = data.part?.text || "";
+        if (text) {
+          always(`[BOT][${connTag}]`, text);
         }
-        printCallerFinal(utterance);
-        // Update latest normalized utterance
-        lastCallerNormalized = normalized;
-        // Determine if the utterance contains any meaningful keywords (for routing)
-        const keywordList = [
-          "קופון",
-          "תקלה",
-          "בעיה",
-          "שירות",
-          "החלפה",
-          "החזרה",
-          "לא עובד",
-          "משלוח",
-          "אספקה",
-          "שליח",
-          "הזמנה",
-          "הגיע",
-          "לא הגיע",
-          "מוביל",
-          "מחיר",
-          "לקנות",
-          "רכישה",
-          "מוצר",
-          "דגם",
-          "מידה",
-          "צבע",
-          "מלאי",
-          "מבצע",
-          "קנייה",
-          "קניה"
-        ];
-        const hasKeyword = keywordList.some((kw) => normalized.includes(kw));
-        if (normalized) {
-          let isDup = false;
-          // Consider it a duplicate if the new normalized utterance is identical to the
-          // last one we responded to, or one contains the other. This avoids
-          // triggering multiple responses for slight transcription differences.
-          if (lastRequestedCallerNormalized) {
-            if (normalized === lastRequestedCallerNormalized) {
-              isDup = true;
-            } else if (normalized.startsWith(lastRequestedCallerNormalized)) {
-              isDup = true;
-            } else if (lastRequestedCallerNormalized.startsWith(normalized)) {
-              isDup = true;
-            }
-          }
-          const allowShortReply =
-            flowState && flowState.stage && !String(flowState.stage).endsWith("done");
-          const hasPhone = Boolean(extractPhoneCandidates(normalized));
-          const meaningfulShort =
-            isYes(normalized) || isNo(normalized) || hasPhone || (normalized && !isFillerOnly(normalized));
-          if (!isDup) {
-            if (allowShortReply) {
-              if (meaningfulShort) pendingResponseRequest = true;
-            } else if (wordCount >= 5 || hasKeyword) {
-              pendingResponseRequest = true;
-            }
-          }
-        }
-        return;
       }
     }
 
-    // -----------------------------
-    // Turn boundary events
-    // -----------------------------
-    if (msg.type === "input_audio_buffer.speech_stopped") {
-      // Ignore speech_stopped events for response timing. We'll respond after
-      // the assistant finishes speaking (response.done) based on pendingResponseRequest.
-      return;
+    if (data.type === "response.audio.delta") {
+      const audio = data.delta;
+      if (audio) {
+        twilioWs.send(
+          JSON.stringify({
+            event: "media",
+            streamSid: twilioStreamSid,
+            media: { payload: audio }
+          })
+        );
+        lastBotAudioAt = Date.now();
+      }
     }
 
-    // response lifecycle
-    if (msg.type === "response.done") {
+    if (data.type === "response.audio.done") {
       awaitingResponse = false;
-      // Flush any buffered audio frames that arrived while assistant was speaking.
-      // We mark that we are flushing so that any resulting transcriptions do not
-      // trigger a new response inadvertently.
-      if (Array.isArray(pausedAudioBuffer) && pausedAudioBuffer.length > 0) {
-        isFlushingBufferedAudio = true;
-        while (pausedAudioBuffer.length > 0) {
-          const audioFrame = pausedAudioBuffer.shift();
-          safeOpenAISend({ type: "input_audio_buffer.append", audio: audioFrame });
+      pendingResponseRequest = false;
+      lastBotAudioAt = Date.now();
+    }
+
+    if (data.type === "response.done") {
+      awaitingResponse = false;
+      pendingResponseRequest = false;
+
+      const output = data.response?.output || [];
+      const content = output
+        .flatMap((o) => o.content || [])
+        .map((c) => c.text || "")
+        .filter(Boolean)
+        .join(" ");
+
+      if (content) {
+        if (MB_LOG_TRANSCRIPTS) {
+          always(`[BOT][${connTag}]`, content);
         }
-        // give OpenAI some time to process the flush before accepting new transcripts
-        // we don't await here, but we reset the flag on the next tick
-        setTimeout(() => {
-          isFlushingBufferedAudio = false;
-        }, 50);
+
+        const leads = extractLeadFromText(content);
+        if (leads.length) {
+          sendWebhookEvent("lead_detected", {
+            callSid,
+            at: nowIso(),
+            leads,
+            source: "assistant",
+            text: content
+          });
+        }
       }
-      // If we have a pending caller utterance, and we haven't already
-      // responded to it, send one response now. We rely on the check
-      // lastCallerFinal !== lastRequestedCallerFinal to ensure we respond
-      // exactly once per caller utterance.
-      if (pendingResponseRequest && lastCallerFinal !== lastRequestedCallerFinal) {
-        debug(`[${connTag}] response.done -> draining pendingResponseRequest`);
-        pendingResponseRequest = false;
-        requestAssistantResponse("pending_after_done");
-      }
-      if (flowState.shouldHangup && !sentCallEnded && flowState.finalEvent) {
-        sentCallEnded = true;
-        endedAt = endedAt || nowIso();
-        const payload = buildFinalPayload();
-        sendWebhookEvent(flowState.finalEvent, payload, { wait_for_recording: true });
-        try {
-          if (openaiWs) openaiWs.close();
-        } catch (_) {}
-        try {
-          if (twilioWs) twilioWs.close();
-        } catch (_) {}
-      }
-      return;
+
+      // Allow next
+      pendingResponseRequest = false;
     }
 
-    // AUDIO back to Twilio
-    if (msg.type === "response.audio.delta") {
-      if (!twilioStreamSid) return;
-
-      safeTwilioSend({
-        event: "media",
-        streamSid: twilioStreamSid,
-        media: { payload: msg.delta || "" }
-      });
-      return;
-    }
-  });
-
-  twilioWs.on("message", async (data) => {
-    let msg;
-    try {
-      msg = JSON.parse(data.toString());
-    } catch (e) {
-      error(`[${connTag}] Twilio message JSON parse failed`, e.message);
-      return;
-    }
-
-    if (msg.event === "start" && msg.start?.streamSid) {
-      twilioStreamSid = msg.start.streamSid;
-      callSid = msg.start?.callSid || callSid;
-      startedAt = startedAt || nowIso();
-      // call_started webhook suppressed (final-only mode)
-      if (!MB_FINAL_WEBHOOK_ONLY) {
-        sendWebhookEvent("call_started", {
-          callSid,
-          streamSid: twilioStreamSid,
-          caller,
-          called,
-          started_at: startedAt,
-          language,
-          route,
-          recording_url_public: makeRecordingPublicUrl(callSid)
-        });
-      }
-      always(
-        `[TWILIO_START][${connTag}]`,
-        JSON.stringify({
-          streamSid: twilioStreamSid,
-          callSid: msg.start?.callSid,
-          tracks: msg.start?.tracks,
-          mediaFormat: msg.start?.mediaFormat
-        })
-      );
-      return;
-    }
-
-    if (msg.event === "media" && msg.media?.payload) {
-      const payload = msg.media.payload;
-      if (!openaiReady || !openaiWs || openaiWs.readyState !== WebSocket.OPEN) {
-        pendingAudio.push(payload);
-        if (pendingAudio.length > 400) pendingAudio.splice(0, pendingAudio.length - 400);
-        return;
-      }
-      // If the assistant is currently speaking, buffer the audio instead of
-      // sending it immediately. This prevents the model from listening during
-      // its own response.
+    if (data.type === "input_audio_buffer.speech_started") {
+      lastUserAudioAt = Date.now();
       if (awaitingResponse) {
-        pausedAudioBuffer.push(payload);
-        // cap buffer to avoid unbounded growth
-        if (pausedAudioBuffer.length > 400) {
-          pausedAudioBuffer.splice(0, pausedAudioBuffer.length - 400);
+        debug(`[${connTag}] user speech while bot speaking`);
+      }
+    }
+
+    if (data.type === "input_audio_buffer.speech_stopped") {
+      lastUserAudioAt = Date.now();
+    }
+
+    if (data.type === "input_audio_buffer.committed") {
+      lastUserAudioAt = Date.now();
+      if (!awaitingResponse && !pendingResponseRequest) {
+        pendingResponseRequest = true;
+        sendAssistantResponse("speech_end");
+      }
+    }
+
+    if (data.type === "conversation.item.input_audio_transcription.completed") {
+      const text = data.transcript || "";
+      if (text) {
+        if (MB_LOG_TRANSCRIPTS) {
+          always(`[USER][${connTag}]`, text);
         }
-        return;
+
+        const leads = extractLeadFromText(text);
+        if (leads.length) {
+          sendWebhookEvent("lead_detected", {
+            callSid,
+            at: nowIso(),
+            leads,
+            source: "caller",
+            text
+          });
+        }
       }
+    }
+  });
+
+  // --------------------------------------------------
+  // Timers / guardrails
+  // --------------------------------------------------
+  const interval = setInterval(() => {
+    totalMs += 1000;
+    clearIfShouldHangup();
+
+    // Idle handling
+    const now = Date.now();
+    const idleMs = now - Math.max(lastUserAudioAt, lastBotAudioAt);
+
+    if (!idleWarningSent && idleMs > MB_IDLE_WARNING_MS) {
+      idleWarningSent = true;
+      const msg = "האם תרצו עזרה נוספת?";
       safeOpenAISend({
-        type: "input_audio_buffer.append",
-        audio: payload
+        type: "response.create",
+        response: { modalities: ["audio", "text"], instructions: msg }
       });
-      return;
     }
 
-    if (msg.event === "stop") {
-      always(`[TWILIO_STOP][${connTag}]`, "stream stopped");
-      endedAt = nowIso();
-
-      if (!sentCallEnded) {
-        sentCallEnded = true;
-        const fallbackEvent =
-          route === "sales"
-            ? "sales_lead"
-            : route === "support"
-            ? "support_ticket"
-            : route === "delivery"
-            ? "delivery_after_hours"
-            : route === "message"
-            ? "message_taken"
-            : "call_ended";
-        const finalEvent = flowState.finalEvent || fallbackEvent;
-        const payload = flowState.finalEvent ? buildFinalPayload() : {
-          callSid,
-          streamSid: twilioStreamSid,
-          caller,
-          called,
-          started_at: startedAt,
-          ended_at: endedAt,
-          language,
-          route,
-          caller_last_utterance: lastCallerFinal,
-          bot_last_utterance: lastBotFinal,
-          transcript: transcriptTurns
-        };
-        await sendWebhookEvent(finalEvent, payload, { wait_for_recording: true });
-      }
-      try {
-        if (openaiWs) openaiWs.close();
-      } catch (_) {}
-      return;
+    if (idleMs > MB_IDLE_HANGUP_MS) {
+      markCallEnded();
+      closeBoth();
     }
-  });
-
-  twilioWs.on("error", (e) => {
-    RUNTIME.ws_errors += 1;
-    error(`[${connTag}] Twilio websocket error`, e?.message || e);
-    try {
-      if (openaiWs) openaiWs.close();
-    } catch (_) {}
-  });
+  }, 1000);
 
   twilioWs.on("close", () => {
-    RUNTIME.ws_closed += 1;
-    RUNTIME.last_ws_close_at = new Date().toISOString();
-    always(`[TWILIO_CLOSE][${connTag}]`, "socket closed");
-    // If socket closed unexpectedly and we never sent call_ended -> abandoned
-    if (!sentCallEnded && !sentCallAbandoned) {
-      sentCallAbandoned = true;
-      endedAt = endedAt || nowIso();
-      const recording_url_public = makeRecordingPublicUrl(callSid);
-      sendWebhookEvent(
-        "call_abandoned",
-        {
-          callSid,
-          streamSid: twilioStreamSid,
-          caller,
-          called,
-          started_at: startedAt,
-          ended_at: endedAt,
-          language,
-          route,
-          caller_last_utterance: lastCallerFinal,
-          bot_last_utterance: lastBotFinal,
-          transcript: transcriptTurns,
-          recording_url_public
-        },
-        { wait_for_recording: true }
-      );
-    }
-    try {
-      if (openaiWs) openaiWs.close();
-    } catch (_) {}
+    clearInterval(interval);
+    markCallEnded();
+  });
+
+  openaiWs.on("close", () => {
+    clearInterval(interval);
+    markCallEnded();
   });
 });
 
-// --------------------------------------------------
-// Start
-// --------------------------------------------------
-server.listen(PORT, () => {
+server.listen(PORT, async () => {
+  await loadSheets();
+
   log(`GilSport VoiceBot running on port ${PORT}`);
-  loadSheets();
   always("BOOT", {
-    at: RUNTIME.booted_at,
+    at: nowIso(),
     port: PORT,
     MB_DEBUG,
-    has_OPENAI_API_KEY: Boolean(OPENAI_API_KEY),
+    has_OPENAI_API_KEY: !!OPENAI_API_KEY,
     OPENAI_REALTIME_MODEL,
     OPENAI_VOICE,
-    has_GSHEET_ID: Boolean(GSHEET_ID),
-    has_GOOGLE_SERVICE_ACCOUNT_JSON_B64: Boolean(GOOGLE_SERVICE_ACCOUNT_JSON_B64),
-    has_TWILIO_ACCOUNT_SID: Boolean(TWILIO_ACCOUNT_SID),
-    has_TWILIO_AUTH_TOKEN: Boolean(TWILIO_AUTH_TOKEN),
+    has_GSHEET_ID: !!GSHEET_ID,
+    has_GOOGLE_SERVICE_ACCOUNT_JSON_B64: !!GOOGLE_SERVICE_ACCOUNT_JSON_B64,
+    has_TWILIO_ACCOUNT_SID: !!TWILIO_ACCOUNT_SID,
+    has_TWILIO_AUTH_TOKEN: !!TWILIO_AUTH_TOKEN,
     PUBLIC_BASE_URL,
     TIME_ZONE,
     MB_LOG_TRANSCRIPTS,
