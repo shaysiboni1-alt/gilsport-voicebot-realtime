@@ -130,6 +130,8 @@ async function waitForRecording(callSid, waitMs) {
 }
 
 const nowIso = () => new Date().toISOString();
+const OPENAI_SUMMARY_MODEL =
+  process.env.OPENAI_SUMMARY_MODEL || process.env.MB_SUMMARY_MODEL || "gpt-4o-mini";
 
 async function sendWebhookEvent(event, payload, opts = {}) {
   if (!MB_WEBHOOK_URL) return false;
@@ -167,6 +169,99 @@ function makeRecordingPublicUrl(callSid) {
   return callSid ? `${base}/recording/${callSid}` : "";
 }
 
+async function extractStructuredSummary({
+  route,
+  transcriptTurns,
+  caller,
+  called,
+  afterHours
+}) {
+  if (!OPENAI_API_KEY) return { summary: "", fields: {} };
+  const transcriptText = Array.isArray(transcriptTurns)
+    ? transcriptTurns
+        .map((t) => `${t.from === "bot" ? "נטע" : "לקוח"}: ${t.text}`)
+        .join("\n")
+    : "";
+  if (!transcriptText) return { summary: "", fields: {} };
+
+  const systemPrompt =
+    "את/ה מסכם שיחה טלפונית בעברית עבור מערכת שירות. " +
+    "החזירו JSON תקין בלבד ללא טקסט נוסף. " +
+    "אין להמציא פרטים שלא נאמרו. אם חסר פרט החזר ערך ריק.";
+
+  const userPrompt = `
+נתיב שיחה (route): ${route}
+Caller ID: ${caller || ""}
+Called: ${called || ""}
+אחרי שעות פעילות? ${afterHours ? "כן" : "לא"}
+
+פלט JSON במבנה:
+{
+  "summary": "שורה אחת בעברית",
+  "fields": {
+    "product_type": "",
+    "product_model": "",
+    "brand": "",
+    "full_name": "",
+    "callback_phone": "",
+    "fault_type": "",
+    "fault_description": "",
+    "delivery_request_summary": "",
+    "message_recipient": "",
+    "message_body": "",
+    "after_hours": "כן/לא"
+  }
+}
+
+כללים:
+- summary קצרה אחת בהתאם לנתיב: מתעניין/שירות/אספקה/הודעה.
+- full_name = שם מלא שנמסר.
+- callback_phone = מספר לחזרה שנמסר או שאושר.
+- brand/model/product_type לפי מה שהלקוח אמר.
+- fault_type/fault_description רק אם מדובר בשירות/תקלה.
+- delivery_request_summary רק אם מדובר באספקה/משלוח (למשל "אמור להגיע היום ולא תיאמו").
+- message_recipient/message_body רק אם מדובר בהודעה לעובד/מנהל.
+- after_hours תמיד "כן" או "לא".
+
+תמלול:
+${transcriptText}
+`.trim();
+
+  try {
+    const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: OPENAI_SUMMARY_MODEL,
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userPrompt }
+        ],
+        temperature: 0.2,
+        response_format: { type: "json_object" }
+      })
+    });
+    if (!resp.ok) {
+      debug("Summary extraction failed", resp.status);
+      return { summary: "", fields: {} };
+    }
+    const data = await resp.json();
+    const content = data?.choices?.[0]?.message?.content || "";
+    if (!content) return { summary: "", fields: {} };
+    const parsed = JSON.parse(content);
+    return {
+      summary: String(parsed.summary || "").trim(),
+      fields: typeof parsed.fields === "object" && parsed.fields ? parsed.fields : {}
+    };
+  } catch (e) {
+    debug("Summary extraction error", e && e.message ? e.message : e);
+    return { summary: "", fields: {} };
+  }
+}
+
 // --------------------------------------------------
 // Runtime diagnostics
 // --------------------------------------------------
@@ -195,6 +290,49 @@ let SHEETS = {
   routingRules: [], // (legacy/compat)
   businessInfo: [] // (legacy/compat)
 };
+
+const normalizeRowValue = (value) => String(value || "").trim();
+
+function getRowValueByKeys(row, keys) {
+  if (!row || !keys.length) return "";
+  const entries = Object.entries(row);
+  for (const key of keys) {
+    const match = entries.find(([k]) => String(k || "").toLowerCase() === key);
+    if (match && normalizeRowValue(match[1])) return normalizeRowValue(match[1]);
+  }
+  for (const [k, v] of entries) {
+    if (keys.some((key) => String(k || "").toLowerCase().includes(key))) {
+      const val = normalizeRowValue(v);
+      if (val) return val;
+    }
+  }
+  return "";
+}
+
+function buildSuppliersImportersList() {
+  const rows = Array.isArray(SHEETS.suppliersImporters) ? SHEETS.suppliersImporters : [];
+  const lines = [];
+  for (const row of rows) {
+    const brand = getRowValueByKeys(row, ["brand", "brand_name", "מותג"]);
+    const phone = getRowValueByKeys(row, ["phone_e164", "phone", "טלפון", "מספר"]);
+    if (!brand || !phone) continue;
+    lines.push(`מותג: ${brand} | טלפון יבואן: ${phone}`);
+  }
+  return Array.from(new Set(lines)).slice(0, 30);
+}
+
+function buildDeliveryContactsList() {
+  const rows = Array.isArray(SHEETS.deliveryContacts) ? SHEETS.deliveryContacts : [];
+  const lines = [];
+  for (const row of rows) {
+    const name = getRowValueByKeys(row, ["carrier", "name", "חברה", "שם"]);
+    const phone = getRowValueByKeys(row, ["phone_e164", "phone", "טלפון", "מספר"]);
+    if (!phone) continue;
+    const label = name ? `${name}: ${phone}` : phone;
+    lines.push(label);
+  }
+  return Array.from(new Set(lines)).slice(0, 30);
+}
 
 function parseTable(rows, keyColName, valColName) {
   const out = {};
@@ -510,6 +648,7 @@ wss.on("connection", (twilioWs, req) => {
   let endedAt = null;
   let route = "other";
   let language = getSetting("DEFAULT_LANGUAGE", "he") || "he";
+  let deliveryAfterHours = false;
 
   let transcriptTurns = []; // {from, text, at}
 
@@ -581,7 +720,7 @@ wss.on("connection", (twilioWs, req) => {
       let kws = [];
       for (const [k, v] of Object.entries(r || {})) {
         const key = String(k || "").toLowerCase();
-        if (key.includes("keyword") || key.includes("keywords") || key.includes("מילות")) {
+        if (key.includes("keyword") || key.includes("keywords") || key.includes("מיות")) {
           kws = kws.concat(normalizeKeywords(v));
         }
       }
@@ -636,8 +775,12 @@ wss.on("connection", (twilioWs, req) => {
 
     // Route heuristics (no FSM)
     if (/(אחריות|תקלה|בעיה|שירות|החלפה|החזרה|לא עובד|תקול)/.test(low)) route = "support";
-    else if (/(משלוח|אספקה|עסקה|הספקה|אספקת|שליח|הזמנה|הגיע|לא הגיע|מוביל)/.test(low)) route = "delivery";
-    else if (/(מחיר|לקנות|רכישה|מוצר|דגם|מידה|צבע|מלאי|כמה עולה|מבצע)/.test(low)) route = "sales";
+    else if (/(משלוח|אספקה|עסקה|הספקה|אספקת|שליח|הזמנה|הגיע|לא הגיע|מוביל)/.test(low))
+      route = "delivery";
+    else if (/(הודעה|להשאיר הודעה|השארת הודעה|להשאיר למנהל|להשאיר לעובד|מנהל|צוות)/.test(low))
+      route = "message";
+    else if (/(מחיר|לקנות|רכישה|מוצר|דגם|מידה|צבע|מלאי|כמה עולה|מבצע)/.test(low))
+      route = "sales";
     else route = route || "other";
 
     // DO_NOT_SAY: rows in DO_NOT_SAY tab (enforce via instruction)
@@ -659,16 +802,7 @@ wss.on("connection", (twilioWs, req) => {
     const mustNotLieDelivery =
       "אין לך גישה לסטטוס משלוח אמיתי. אסור להגיד 'בדקתי סטטוס' או להבטיח שראית מערכת משלוחים.";
 
-    // DELIVERY_CONTACTS: provide carrier contacts when needed
-    const deliveryRows = Array.isArray(SHEETS.deliveryContacts) ? SHEETS.deliveryContacts : [];
-    const carrierPhones = deliveryRows
-      .filter((r) => {
-        const ck = String(r.condition_keywords || "").toLowerCase();
-        return !ck || ck.split(/[,;\n\r\t]+/).some((kw) => kw.trim() && low.includes(kw.trim()));
-      })
-      .map((r) => String(r.phone_e164 || r.phone || "").trim())
-      .filter(Boolean)
-      .slice(0, 10);
+    const deliveryContactLines = buildDeliveryContactsList();
 
     // KB_FACTS: soft facts injection (only a few)
     const factsRows = Array.isArray(SHEETS.kbFacts) ? SHEETS.kbFacts : [];
@@ -696,13 +830,27 @@ wss.on("connection", (twilioWs, req) => {
         low
       );
       afterHours = isAfterHours() || afterHoursHint;
+      deliveryAfterHours = afterHours;
+    } else {
+      deliveryAfterHours = false;
     }
 
     const baseStyle =
       "סגנון: נטע. תשובות קצרות, ענייניות, אנושיות. משפט-שניים ואז שאלה מקדמת. לא לחפור, לא לחזור על עצמך.";
+    const callFlowHeader =
+      "אחרי פתיח, בצעי זיהוי כוונה (Routing). אם הלקוח לא ברור/כללי – שאלת הבהרה אחת בלבד: " +
+      "“כדי לעזור במדויק—זה לגבי התעניינות במוצר, שירות/תקלה/אחריות, משלוח/אספקה, או להשאיר הודעה למישהו מהצוות?”";
+    const phoneValidationRule =
+      "כלל אימות מספר: אם חוזרים למספר מזוהה – הקריאי אותו במלואו ספרה־ספרה. " +
+      "אם נמסר מספר חדש – חזרי עליו פעם אחת בלבד ושאלי “נכון?”. " +
+      "אם המספר לא תקין/חסרה ספרה: אמרי “נראה שחסרה לי ספרה אחת, תוכלו להגיד שוב את המספר לאט?”.";
+    const noGuessRule =
+      "כלל בלי המצאות: אין בקשת ספר הזמנה אלא אם יש הנחיה מפורשת בשיטס. " +
+      "אין שמות מובילים/יבואנים שלא מופיעים בטבלה. אין מספרים חלקיים.";
 
     const parts = [];
     parts.push(baseStyle);
+    parts.push(callFlowHeader);
     parts.push(
       "תעדיפי מידע מהשיטס (KB_FACTS/DELIVERY_CONTACTS/DO_NOT_SAY/SUPPLIERS_IMPORTERS) על פני המצאות."
     );
@@ -712,6 +860,8 @@ wss.on("connection", (twilioWs, req) => {
         "אם את חוזרת על מספר טלפון שנאמר, הקריאי אותו בדיוק כפי שהלקוח אמר, ספרה־ספרה, ללא חזרות או השמטה. " +
         "אל תקראי מספרים ברצף אחד. אם מתאים – ניתן גם להגיד שהטלפון נרשם בלי לחזור עליו, במקום לקרוא אותו שוב."
     );
+    parts.push(phoneValidationRule);
+    parts.push(noGuessRule);
 
     // Never claim that information is unavailable for coupon queries. This prevents the phrase
     // "אין לי מידע מדויק" from appearing. If you do not have specific info, tell the caller
@@ -810,36 +960,28 @@ wss.on("connection", (twilioWs, req) => {
         const dp = (SHEETS.prompts || {}).DELIVERY_PROMPT || "";
         if (dp) parts.push(String(dp).trim());
       } catch (_) {}
+      parts.push(
+        "מסלול אספקה/משלוח: אמרי בדיוק 'הבנתי. זה לגבי משלוח/אספקה. אני אקח כמה פרטים ואעביר למחלקת אספקה.'"
+      );
       parts.push(mustNotLieDelivery);
       if (afterHours) {
-        // Use KB fact row for after-hours same-day delivery queries
         parts.push(
-          "מבינה. אם האספקה תואמה להיום לאחר שעות הפעילות – אוכל למסור לכם את מספר המוביל."
+          "כרגע אנחנו מחוץ לשעות הפעילות. כדי לעזור כבר עכשיו—אלו מספרי הטלפון של המובילים:"
         );
-        if (carrierPhones.length) {
-          parts.push(
-            "מספרי מובילים: " +
-              carrierPhones.join(", ") +
-              ". אל תמציאי מספרים או שמות מובילים שלא קיימים."
-          );
-          // After giving the numbers, instruct to ask if the caller wants to leave a message
-          parts.push(
-            "לאחר מתן מספרי המובילים, שאלי אם תרצו שאעביר קריאה למשרד. אם כן, בקשי שם מלא ומספר טלפון כנדרש; אם לא – ניתן לסיים את השיחה, אך עדיין לשלוח webhook עם הערת סיכום על אספקה להיום."
-          );
+        if (deliveryContactLines.length) {
+          parts.push(deliveryContactLines.join("\n"));
         } else {
-          // fallback when no carrier phones available
-          parts.push(
-            "אין לי מספר מוביל זמין כרגע, אוכל להעביר בקשה לחזרה. אל תמציאי מספרים."
-          );
-          parts.push(
-            "שאלי אם תרצו שאעביר הודעה למשרד. אם כן, קחי שם מלא ומספר טלפון כנדרש; אם לא – ניתן לסיים את השיחה, אך עדיין לשלוח webhook עם הערת סיכום על אספקה להיום."
-          );
+          parts.push("אין לי מספרי מובילים זמינים כרגע. אל תמציאי מספרים.");
         }
       } else {
         parts.push(
           "אם מבקשים סטטוס משלוח: להסביר שאין סטטוס בזמן אמת ולהציע להשאיר הודעה/פרטים לחזרה."
         );
       }
+      parts.push(
+        "לאחר מכן: בקשי שם מלא ואז אימות מספר לחזרה לפי הכללים. " +
+          "סיום מדויק: “תודה. העברתי את הפרטים למחלקת אספקה, ויחזרו אליכם בהקדם. יום טוב.”"
+      );
     } else if (route === "support") {
       // Include the support prompt from the sheet when available
       try {
@@ -847,44 +989,21 @@ wss.on("connection", (twilioWs, req) => {
         if (sp) parts.push(String(sp).trim());
       } catch (_) {}
       parts.push(
-        "מטרה: להבין תקלה בקצרה, פרטי מוצר/מותג/הזמנה, ולסגור עם הבטחה לחזרה."
+        "מסלול שירות/תקלה/אחריות: שאלי בדיוק: “מה סוג התקלה ומה מהות התקלה בכמה מילים?” " +
+          "ואז: “ועל איזה מוצר זה? תגידו לי בבקשה דגם ו־שם מותג.”"
       );
-      // Detect brand keywords in the caller's utterance and provide importer phone numbers when appropriate.
-      try {
-        const importerRows = Array.isArray(SHEETS.suppliersImporters)
-          ? SHEETS.suppliersImporters
-          : [];
-        const brandPhones = [];
-        for (const r of importerRows) {
-          const kw = String(r.brand_keyword || "").toLowerCase().trim();
-          if (!kw) continue;
-          if (low.includes(kw)) {
-            const when = String(r.when_to_give || "").toLowerCase();
-            // Only give phone when the sheet instructs to do so (e.g. contains "fault" or "תקלה")
-            if (
-              (when && when.includes("fault")) ||
-              when.includes("fault_or_specific_request") ||
-              when.includes("תקלה")
-            ) {
-              let p = String(r.phone_e164 || r.phone || "").trim();
-              if (p) {
-                // Remove whitespace and avoid scientific notation
-                p = p.replace(/\s+/g, "");
-                brandPhones.push(p);
-              }
-            }
-          }
-        }
-        if (brandPhones.length) {
-          parts.push(
-            "מספרי יבואנים למותג התקלה: " +
-              brandPhones.join(", ") +
-              ". אל תמציא/י מספרים או שמות יבואנים."
-          );
-        }
-      } catch (_) {
-        /* ignore brand detection errors */
+      const supplierLines = buildSuppliersImportersList();
+      if (supplierLines.length) {
+        parts.push(
+          "טבלת יבואנים (התאמה מלאה לשם מותג בלבד):\n" +
+            supplierLines.join("\n") +
+            "\nאם שם המותג תואם בדיוק – מסרי את מספר היבואן. אם אין התאמה מלאה – אל תציעי יבואן."
+        );
       }
+      parts.push(
+        "לאחר מכן: בקשי שם מלא ואז אימות מספר לחזרה לפי הכללים. " +
+          "סיום מדויק: “מעולה. שלחתי את הפרטים למחלקת השירות, ויחזרו אליכם בהקדם. תודה רבה ויום טוב.”"
+      );
     } else if (route === "sales") {
       // Include the sales prompt from the sheet when available
       try {
@@ -892,7 +1011,21 @@ wss.on("connection", (twilioWs, req) => {
         if (sp) parts.push(String(sp).trim());
       } catch (_) {}
       parts.push(
-        "מטרה: להבין במה מתעניינים (סוג מוצר/דגם/מותג) ואז לקחת פרטי חזרה (אפשר להציע להשתמש במספר המזוהה)."
+        "מסלול מתעניין במוצר: שאלי בדיוק: “בשמחה. על איזה מוצר אתם מתעניינים? " +
+          "תגידו לי בבקשה: סוג מוצר, ואם יש—דגם ו־שם מותג.” " +
+          "אחרי זה בקשי שם מלא ואז אימות מספר לחזרה לפי הכללים. " +
+          "סיום מדויק: “מעולה. העברתי את הפרטים למחלקת המכירות, ויחזרו אליכם בהקדם. תודה רבה ויום טוב.”"
+      );
+    } else if (route === "message") {
+      try {
+        const mp = (SHEETS.prompts || {}).MESSAGE_TO_MANAGER_PROMPT || "";
+        if (mp) parts.push(String(mp).trim());
+      } catch (_) {}
+      parts.push(
+        "מסלול הודעה לעובד/מנהל: שאלי בדיוק: “בשמחה. למי מיועדת ההודעה? (שם עובד/מנהל)” " +
+          "אחר כך: “מה השם המלא שלכם?” ואז: “מה מהות ההודעה? תאמרו/תאמרי את זה בקצרה.” " +
+          "לבסוף אימות מספר לפי הכללים. סיום מדויק: " +
+          "“תודה. העברתי את ההודעה ל־{שם היעד} ויחזרו אליכם בהקדם. יום טוב.”"
       );
     } else {
       // Unknown route: include message-to-manager prompt if available and ask clarifying question
@@ -900,7 +1033,10 @@ wss.on("connection", (twilioWs, req) => {
         const mp = (SHEETS.prompts || {}).MESSAGE_TO_MANAGER_PROMPT || "";
         if (mp) parts.push(String(mp).trim());
       } catch (_) {}
-      parts.push("אם לא ברור, תשאלי שאלה אחת להבהרה: מכירה / שירות / משלוח.");
+      parts.push(
+        "אם לא ברור, תשאלי שאלה אחת להבהרה לפי הנוסח המדויק: " +
+          "“כדי לעזור במדויק—זה לגבי התעניינות במוצר, שירות/תקלה/אחריות, משלוח/אספקה, או להשאיר הודעה למישהו מהצוות?”"
+      );
     }
 
     let inst = parts.join("\n\n");
@@ -1460,14 +1596,21 @@ wss.on("connection", (twilioWs, req) => {
         // ONE final webhook (by route when possible) - always wait for recording (best effort)
         const finalEvent =
           route === "sales"
-            ? "sales_lead"
+            ? "מתעניין"
             : route === "support"
-            ? "support_ticket"
+            ? "שירות לקוחות \\ תמיכה"
             : route === "delivery"
-            ? "delivery_after_hours"
+            ? "שירות לקוחות \\ אספקה"
             : route === "message"
-            ? "message_taken"
+            ? "הודעה כללית"
             : "call_ended";
+        const summaryData = await extractStructuredSummary({
+          route,
+          transcriptTurns,
+          caller,
+          called,
+          afterHours: Boolean(deliveryAfterHours)
+        });
         await sendWebhookEvent(
           finalEvent,
           {
@@ -1479,6 +1622,9 @@ wss.on("connection", (twilioWs, req) => {
             ended_at: endedAt,
             language,
             route,
+            summary: summaryData.summary || "",
+            fields: summaryData.fields || {},
+            after_hours: route === "delivery" ? (deliveryAfterHours ? "כן" : "לא") : "",
             caller_last_utterance: lastCallerFinal,
             bot_last_utterance: lastBotFinal,
             transcript: transcriptTurns
