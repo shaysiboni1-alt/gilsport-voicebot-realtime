@@ -51,6 +51,25 @@ function normalizeVoice(v) {
 }
 const OPENAI_VOICE = normalizeVoice(process.env.OPENAI_VOICE || "alloy");
 
+// Optional voice style and speaking rate controls. These environment variables
+// allow operators to adjust the tone and speed of the synthetic voice without
+// changing code. If OPENAI_VOICE_STYLE is set, it will be passed to the
+// realtime API as the voice style. OPENAI_SPEAKING_RATE should be a number
+// (e.g. 1.0 for normal speed, 0.9 for slower, 1.1 for faster). If not set,
+// defaults are used. Note: the realtime API may ignore unknown styles or
+// unsupported rates.
+const OPENAI_VOICE_STYLE = process.env.OPENAI_VOICE_STYLE || "";
+const OPENAI_SPEAKING_RATE = (() => {
+  const rate = parseFloat(process.env.OPENAI_SPEAKING_RATE);
+  return Number.isFinite(rate) && rate > 0 ? rate : 1.0;
+})();
+
+// Base style override. Operators can define MB_BASE_STYLE in the
+// environment to change the overall tone/phrasing of the assistant (e.g.
+// "טון מקצועי ורשמי" או "טון קליל ומזמין"). This will be appended to the
+// dynamic instructions for every turn.
+const MB_BASE_STYLE = process.env.MB_BASE_STYLE || "";
+
 const GSHEET_ID = process.env.GSHEET_ID || "";
 const GOOGLE_SERVICE_ACCOUNT_JSON_B64 = process.env.GOOGLE_SERVICE_ACCOUNT_JSON_B64 || "";
 
@@ -130,8 +149,6 @@ async function waitForRecording(callSid, waitMs) {
 }
 
 const nowIso = () => new Date().toISOString();
-const OPENAI_SUMMARY_MODEL =
-  process.env.OPENAI_SUMMARY_MODEL || process.env.MB_SUMMARY_MODEL || "gpt-4o-mini";
 
 async function sendWebhookEvent(event, payload, opts = {}) {
   if (!MB_WEBHOOK_URL) return false;
@@ -169,99 +186,6 @@ function makeRecordingPublicUrl(callSid) {
   return callSid ? `${base}/recording/${callSid}` : "";
 }
 
-async function extractStructuredSummary({
-  route,
-  transcriptTurns,
-  caller,
-  called,
-  afterHours
-}) {
-  if (!OPENAI_API_KEY) return { summary: "", fields: {} };
-  const transcriptText = Array.isArray(transcriptTurns)
-    ? transcriptTurns
-        .map((t) => `${t.from === "bot" ? "נטע" : "לקוח"}: ${t.text}`)
-        .join("\n")
-    : "";
-  if (!transcriptText) return { summary: "", fields: {} };
-
-  const systemPrompt =
-    "את/ה מסכם שיחה טלפונית בעברית עבור מערכת שירות. " +
-    "החזירו JSON תקין בלבד ללא טקסט נוסף. " +
-    "אין להמציא פרטים שלא נאמרו. אם חסר פרט החזר ערך ריק.";
-
-  const userPrompt = `
-נתיב שיחה (route): ${route}
-Caller ID: ${caller || ""}
-Called: ${called || ""}
-אחרי שעות פעילות? ${afterHours ? "כן" : "לא"}
-
-פלט JSON במבנה:
-{
-  "summary": "שורה אחת בעברית",
-  "fields": {
-    "product_type": "",
-    "product_model": "",
-    "brand": "",
-    "full_name": "",
-    "callback_phone": "",
-    "fault_type": "",
-    "fault_description": "",
-    "delivery_request_summary": "",
-    "message_recipient": "",
-    "message_body": "",
-    "after_hours": "כן/לא"
-  }
-}
-
-כללים:
-- summary קצרה אחת בהתאם לנתיב: מתעניין/שירות/אספקה/הודעה.
-- full_name = שם מלא שנמסר.
-- callback_phone = מספר לחזרה שנמסר או שאושר.
-- brand/model/product_type לפי מה שהלקוח אמר.
-- fault_type/fault_description רק אם מדובר בשירות/תקלה.
-- delivery_request_summary רק אם מדובר באספקה/משלוח (למשל "אמור להגיע היום ולא תיאמו").
-- message_recipient/message_body רק אם מדובר בהודעה לעובד/מנהל.
-- after_hours תמיד "כן" או "לא".
-
-תמלול:
-${transcriptText}
-`.trim();
-
-  try {
-    const resp = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        model: OPENAI_SUMMARY_MODEL,
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: userPrompt }
-        ],
-        temperature: 0.2,
-        response_format: { type: "json_object" }
-      })
-    });
-    if (!resp.ok) {
-      debug("Summary extraction failed", resp.status);
-      return { summary: "", fields: {} };
-    }
-    const data = await resp.json();
-    const content = data?.choices?.[0]?.message?.content || "";
-    if (!content) return { summary: "", fields: {} };
-    const parsed = JSON.parse(content);
-    return {
-      summary: String(parsed.summary || "").trim(),
-      fields: typeof parsed.fields === "object" && parsed.fields ? parsed.fields : {}
-    };
-  } catch (e) {
-    debug("Summary extraction error", e && e.message ? e.message : e);
-    return { summary: "", fields: {} };
-  }
-}
-
 // --------------------------------------------------
 // Runtime diagnostics
 // --------------------------------------------------
@@ -290,49 +214,6 @@ let SHEETS = {
   routingRules: [], // (legacy/compat)
   businessInfo: [] // (legacy/compat)
 };
-
-const normalizeRowValue = (value) => String(value || "").trim();
-
-function getRowValueByKeys(row, keys) {
-  if (!row || !keys.length) return "";
-  const entries = Object.entries(row);
-  for (const key of keys) {
-    const match = entries.find(([k]) => String(k || "").toLowerCase() === key);
-    if (match && normalizeRowValue(match[1])) return normalizeRowValue(match[1]);
-  }
-  for (const [k, v] of entries) {
-    if (keys.some((key) => String(k || "").toLowerCase().includes(key))) {
-      const val = normalizeRowValue(v);
-      if (val) return val;
-    }
-  }
-  return "";
-}
-
-function buildSuppliersImportersList() {
-  const rows = Array.isArray(SHEETS.suppliersImporters) ? SHEETS.suppliersImporters : [];
-  const lines = [];
-  for (const row of rows) {
-    const brand = getRowValueByKeys(row, ["brand", "brand_name", "מותג"]);
-    const phone = getRowValueByKeys(row, ["phone_e164", "phone", "טלפון", "מספר"]);
-    if (!brand || !phone) continue;
-    lines.push(`מותג: ${brand} | טלפון יבואן: ${phone}`);
-  }
-  return Array.from(new Set(lines)).slice(0, 30);
-}
-
-function buildDeliveryContactsList() {
-  const rows = Array.isArray(SHEETS.deliveryContacts) ? SHEETS.deliveryContacts : [];
-  const lines = [];
-  for (const row of rows) {
-    const name = getRowValueByKeys(row, ["carrier", "name", "חברה", "שם"]);
-    const phone = getRowValueByKeys(row, ["phone_e164", "phone", "טלפון", "מספר"]);
-    if (!phone) continue;
-    const label = name ? `${name}: ${phone}` : phone;
-    lines.push(label);
-  }
-  return Array.from(new Set(lines)).slice(0, 30);
-}
 
 function parseTable(rows, keyColName, valColName) {
   const out = {};
@@ -648,7 +529,6 @@ wss.on("connection", (twilioWs, req) => {
   let endedAt = null;
   let route = "other";
   let language = getSetting("DEFAULT_LANGUAGE", "he") || "he";
-  let deliveryAfterHours = false;
 
   let transcriptTurns = []; // {from, text, at}
 
@@ -658,6 +538,12 @@ wss.on("connection", (twilioWs, req) => {
 
   // Proxy decision: dynamic response instructions (no FSM)
   let proxyInstructions = "";
+
+  // Keep track of all phone numbers provided by the caller during this call. When
+  // the caller mentions a phone number in their utterance, we extract the
+  // digits and store them here. These numbers will be sent in the final
+  // webhook payload under recognized_phones. The array is deduplicated.
+  let recognizedPhones = [];
 
   // Buffer audio frames when the assistant is speaking. When awaitingResponse is
   // true, we temporarily store incoming caller audio and send it only after
@@ -720,7 +606,7 @@ wss.on("connection", (twilioWs, req) => {
       let kws = [];
       for (const [k, v] of Object.entries(r || {})) {
         const key = String(k || "").toLowerCase();
-        if (key.includes("keyword") || key.includes("keywords") || key.includes("מיות")) {
+        if (key.includes("keyword") || key.includes("keywords") || key.includes("מילות")) {
           kws = kws.concat(normalizeKeywords(v));
         }
       }
@@ -775,12 +661,8 @@ wss.on("connection", (twilioWs, req) => {
 
     // Route heuristics (no FSM)
     if (/(אחריות|תקלה|בעיה|שירות|החלפה|החזרה|לא עובד|תקול)/.test(low)) route = "support";
-    else if (/(משלוח|אספקה|עסקה|הספקה|אספקת|שליח|הזמנה|הגיע|לא הגיע|מוביל)/.test(low))
-      route = "delivery";
-    else if (/(הודעה|להשאיר הודעה|השארת הודעה|להשאיר למנהל|להשאיר לעובד|מנהל|צוות)/.test(low))
-      route = "message";
-    else if (/(מחיר|לקנות|רכישה|מוצר|דגם|מידה|צבע|מלאי|כמה עולה|מבצע)/.test(low))
-      route = "sales";
+    else if (/(משלוח|אספקה|עסקה|הספקה|אספקת|שליח|הזמנה|הגיע|לא הגיע|מוביל)/.test(low)) route = "delivery";
+    else if (/(מחיר|לקנות|רכישה|מוצר|דגם|מידה|צבע|מלאי|כמה עולה|מבצע)/.test(low)) route = "sales";
     else route = route || "other";
 
     // DO_NOT_SAY: rows in DO_NOT_SAY tab (enforce via instruction)
@@ -802,7 +684,16 @@ wss.on("connection", (twilioWs, req) => {
     const mustNotLieDelivery =
       "אין לך גישה לסטטוס משלוח אמיתי. אסור להגיד 'בדקתי סטטוס' או להבטיח שראית מערכת משלוחים.";
 
-    const deliveryContactLines = buildDeliveryContactsList();
+    // DELIVERY_CONTACTS: provide carrier contacts when needed
+    const deliveryRows = Array.isArray(SHEETS.deliveryContacts) ? SHEETS.deliveryContacts : [];
+    const carrierPhones = deliveryRows
+      .filter((r) => {
+        const ck = String(r.condition_keywords || "").toLowerCase();
+        return !ck || ck.split(/[,;\n\r\t]+/).some((kw) => kw.trim() && low.includes(kw.trim()));
+      })
+      .map((r) => String(r.phone_e164 || r.phone || "").trim())
+      .filter(Boolean)
+      .slice(0, 10);
 
     // KB_FACTS: soft facts injection (only a few)
     const factsRows = Array.isArray(SHEETS.kbFacts) ? SHEETS.kbFacts : [];
@@ -830,27 +721,17 @@ wss.on("connection", (twilioWs, req) => {
         low
       );
       afterHours = isAfterHours() || afterHoursHint;
-      deliveryAfterHours = afterHours;
-    } else {
-      deliveryAfterHours = false;
     }
 
+    // Use the operator-defined base style if provided; otherwise fall back to a default tone.
     const baseStyle =
-      "סגנון: נטע. תשובות קצרות, ענייניות, אנושיות. משפט-שניים ואז שאלה מקדמת. לא לחפור, לא לחזור על עצמך.";
-    const callFlowHeader =
-      "אחרי פתיח, בצעי זיהוי כוונה (Routing). אם הלקוח לא ברור/כללי – שאלת הבהרה אחת בלבד: " +
-      "“כדי לעזור במדויק—זה לגבי התעניינות במוצר, שירות/תקלה/אחריות, משלוח/אספקה, או להשאיר הודעה למישהו מהצוות?”";
-    const phoneValidationRule =
-      "כלל אימות מספר: אם חוזרים למספר מזוהה – הקריאי אותו במלואו ספרה־ספרה. " +
-      "אם נמסר מספר חדש – חזרי עליו פעם אחת בלבד ושאלי “נכון?”. " +
-      "אם המספר לא תקין/חסרה ספרה: אמרי “נראה שחסרה לי ספרה אחת, תוכלו להגיד שוב את המספר לאט?”.";
-    const noGuessRule =
-      "כלל בלי המצאות: אין בקשת ספר הזמנה אלא אם יש הנחיה מפורשת בשיטס. " +
-      "אין שמות מובילים/יבואנים שלא מופיעים בטבלה. אין מספרים חלקיים.";
+      MB_BASE_STYLE && MB_BASE_STYLE.trim()
+        ? MB_BASE_STYLE.trim()
+        :
+          "סגנון: נטע. תשובות קצרות, ענייניות, אנושיות. משפט-שניים ואז שאלה מקדמת. לא לחפור, לא לחזור על עצמך.";
 
     const parts = [];
     parts.push(baseStyle);
-    parts.push(callFlowHeader);
     parts.push(
       "תעדיפי מידע מהשיטס (KB_FACTS/DELIVERY_CONTACTS/DO_NOT_SAY/SUPPLIERS_IMPORTERS) על פני המצאות."
     );
@@ -860,8 +741,6 @@ wss.on("connection", (twilioWs, req) => {
         "אם את חוזרת על מספר טלפון שנאמר, הקריאי אותו בדיוק כפי שהלקוח אמר, ספרה־ספרה, ללא חזרות או השמטה. " +
         "אל תקראי מספרים ברצף אחד. אם מתאים – ניתן גם להגיד שהטלפון נרשם בלי לחזור עליו, במקום לקרוא אותו שוב."
     );
-    parts.push(phoneValidationRule);
-    parts.push(noGuessRule);
 
     // Never claim that information is unavailable for coupon queries. This prevents the phrase
     // "אין לי מידע מדויק" from appearing. If you do not have specific info, tell the caller
@@ -919,13 +798,18 @@ wss.on("connection", (twilioWs, req) => {
       /* ignore caller number errors */
     }
 
-    // Include guardrails and routing prompts if available
+    // Include guardrails prompt always; include routing prompt only when route is unknown
     try {
       const ps = SHEETS.prompts || {};
       const guardrailsPrompt = ps.GUARDRAILS_PROMPT || "";
       const routingPrompt = ps.ROUTING_PROMPT || "";
       if (guardrailsPrompt) parts.push(guardrailsPrompt.trim());
-      if (routingPrompt) parts.push(routingPrompt.trim());
+      // Only add the routing prompt if the current route is still 'other'. When we
+      // already detected a sales/support/delivery route from keywords, we skip
+      // the clarifying question to avoid asking unnecessary “האם מדובר ברכישה…”
+      if (routingPrompt && route === "other") {
+        parts.push(routingPrompt.trim());
+      }
     } catch (_) {}
 
     if (doNotSayText) {
@@ -960,28 +844,55 @@ wss.on("connection", (twilioWs, req) => {
         const dp = (SHEETS.prompts || {}).DELIVERY_PROMPT || "";
         if (dp) parts.push(String(dp).trim());
       } catch (_) {}
-      parts.push(
-        "מסלול אספקה/משלוח: אמרי בדיוק 'הבנתי. זה לגבי משלוח/אספקה. אני אקח כמה פרטים ואעביר למחלקת אספקה.'"
-      );
       parts.push(mustNotLieDelivery);
       if (afterHours) {
+        // Use KB fact row for after-hours same-day delivery queries
         parts.push(
-          "כרגע אנחנו מחוץ לשעות הפעילות. כדי לעזור כבר עכשיו—אלו מספרי הטלפון של המובילים:"
+          "מבינה. אם האספקה תואמה להיום לאחר שעות הפעילות – אוכל למסור לכם את מספר המוביל."
         );
-        if (deliveryContactLines.length) {
-          parts.push(deliveryContactLines.join("\n"));
+        if (carrierPhones.length) {
+          // Build carrier descriptions with names and spaced phone digits. Use local format for Israeli numbers.
+          const carrierDescriptions = deliveryRows
+            .filter((r) => {
+              const ck = String(r.condition_keywords || "").toLowerCase();
+              return (
+                !ck ||
+                ck.split(/[,;\n\r\t]+/).some((kw) => kw.trim() && low.includes(kw.trim()))
+              );
+            })
+            .map((r) => {
+              let p = String(r.phone_e164 || r.phone || "").replace(/\D+/g, "");
+              if (p.startsWith("972") && p.length > 3) {
+                p = "0" + p.slice(3);
+              }
+              const spaced = p.split("").join(" ");
+              const name = String(r.name || "").trim();
+              return name ? `${name} – ${spaced}` : spaced;
+            })
+            .filter(Boolean);
+          parts.push(
+            "מספרי מובילים: " +
+              carrierDescriptions.join(", ") +
+              ". אל תמציאי מספרים או שמות מובילים שלא קיימים."
+          );
+          // After giving the numbers, instruct to ask if the caller wants to leave a message
+          parts.push(
+            "לאחר מתן מספרי המובילים, שאלי אם תרצו שאעביר קריאה למשרד. אם כן, בקשי שם מלא ומספר טלפון כנדרש; אם לא – ניתן לסיים את השיחה, אך עדיין לשלוח webhook עם הערת סיכום על אספקה להיום."
+          );
         } else {
-          parts.push("אין לי מספרי מובילים זמינים כרגע. אל תמציאי מספרים.");
+          // fallback when no carrier phones available
+          parts.push(
+            "אין לי מספר מוביל זמין כרגע, אוכל להעביר בקשה לחזרה. אל תמציאי מספרים."
+          );
+          parts.push(
+            "שאלי אם תרצו שאעביר הודעה למשרד. אם כן, קחי שם מלא ומספר טלפון כנדרש; אם לא – ניתן לסיים את השיחה, אך עדיין לשלוח webhook עם הערת סיכום על אספקה להיום."
+          );
         }
       } else {
         parts.push(
           "אם מבקשים סטטוס משלוח: להסביר שאין סטטוס בזמן אמת ולהציע להשאיר הודעה/פרטים לחזרה."
         );
       }
-      parts.push(
-        "לאחר מכן: בקשי שם מלא ואז אימות מספר לחזרה לפי הכללים. " +
-          "סיום מדויק: “תודה. העברתי את הפרטים למחלקת אספקה, ויחזרו אליכם בהקדם. יום טוב.”"
-      );
     } else if (route === "support") {
       // Include the support prompt from the sheet when available
       try {
@@ -989,21 +900,51 @@ wss.on("connection", (twilioWs, req) => {
         if (sp) parts.push(String(sp).trim());
       } catch (_) {}
       parts.push(
-        "מסלול שירות/תקלה/אחריות: שאלי בדיוק: “מה סוג התקלה ומה מהות התקלה בכמה מילים?” " +
-          "ואז: “ועל איזה מוצר זה? תגידו לי בבקשה דגם ו־שם מותג.”"
+        "מטרה: להבין תקלה בקצרה, פרטי מוצר/מותג/הזמנה, ולסגור עם הבטחה לחזרה."
       );
-      const supplierLines = buildSuppliersImportersList();
-      if (supplierLines.length) {
-        parts.push(
-          "טבלת יבואנים (התאמה מלאה לשם מותג בלבד):\n" +
-            supplierLines.join("\n") +
-            "\nאם שם המותג תואם בדיוק – מסרי את מספר היבואן. אם אין התאמה מלאה – אל תציעי יבואן."
-        );
+      // Detect brand keywords in the caller's utterance and provide importer phone numbers when appropriate.
+      try {
+        const importerRows = Array.isArray(SHEETS.suppliersImporters)
+          ? SHEETS.suppliersImporters
+          : [];
+        const brandPhones = [];
+        for (const r of importerRows) {
+          const kw = String(r.brand_keyword || "").toLowerCase().trim();
+          if (!kw) continue;
+          if (low.includes(kw)) {
+            const when = String(r.when_to_give || "").toLowerCase();
+            // Only give phone when the sheet instructs to do so (e.g. contains "fault" or "תקלה")
+            if (
+              (when && when.includes("fault")) ||
+              when.includes("fault_or_specific_request") ||
+              when.includes("תקלה")
+            ) {
+              let p = String(r.phone_e164 || r.phone || "").trim();
+              if (p) {
+                // Remove whitespace and avoid scientific notation
+                p = p.replace(/\s+/g, "");
+                brandPhones.push(p);
+              }
+            }
+          }
+        }
+        if (brandPhones.length) {
+          // Format importer numbers as spaced digits to ensure proper reading.
+          const importerTexts = brandPhones.map((p) => p.split("").join(" "));
+          parts.push(
+            "מספרי יבואנים למותג התקלה: " +
+              importerTexts.join(", ") +
+              ". אל תמציא/י מספרים או שמות יבואנים."
+          );
+        } else {
+          // No matching importer found. Instruct not to invent names and ask to take details.
+          parts.push(
+            "אין לי מידע על יבואן למותג זה. אל תמציא/י שם או מספר יבואן. הציעי לקחת שם מלא ומספר טלפון כדי שנציג שירות יחזור אליכם."
+          );
+        }
+      } catch (_) {
+        /* ignore brand detection errors */
       }
-      parts.push(
-        "לאחר מכן: בקשי שם מלא ואז אימות מספר לחזרה לפי הכללים. " +
-          "סיום מדויק: “מעולה. שלחתי את הפרטים למחלקת השירות, ויחזרו אליכם בהקדם. תודה רבה ויום טוב.”"
-      );
     } else if (route === "sales") {
       // Include the sales prompt from the sheet when available
       try {
@@ -1011,21 +952,7 @@ wss.on("connection", (twilioWs, req) => {
         if (sp) parts.push(String(sp).trim());
       } catch (_) {}
       parts.push(
-        "מסלול מתעניין במוצר: שאלי בדיוק: “בשמחה. על איזה מוצר אתם מתעניינים? " +
-          "תגידו לי בבקשה: סוג מוצר, ואם יש—דגם ו־שם מותג.” " +
-          "אחרי זה בקשי שם מלא ואז אימות מספר לחזרה לפי הכללים. " +
-          "סיום מדויק: “מעולה. העברתי את הפרטים למחלקת המכירות, ויחזרו אליכם בהקדם. תודה רבה ויום טוב.”"
-      );
-    } else if (route === "message") {
-      try {
-        const mp = (SHEETS.prompts || {}).MESSAGE_TO_MANAGER_PROMPT || "";
-        if (mp) parts.push(String(mp).trim());
-      } catch (_) {}
-      parts.push(
-        "מסלול הודעה לעובד/מנהל: שאלי בדיוק: “בשמחה. למי מיועדת ההודעה? (שם עובד/מנהל)” " +
-          "אחר כך: “מה השם המלא שלכם?” ואז: “מה מהות ההודעה? תאמרו/תאמרי את זה בקצרה.” " +
-          "לבסוף אימות מספר לפי הכללים. סיום מדויק: " +
-          "“תודה. העברתי את ההודעה ל־{שם היעד} ויחזרו אליכם בהקדם. יום טוב.”"
+        "מטרה: להבין במה מתעניינים (סוג מוצר/דגם/מותג) ואז לקחת פרטי חזרה (אפשר להציע להשתמש במספר המזוהה)."
       );
     } else {
       // Unknown route: include message-to-manager prompt if available and ask clarifying question
@@ -1033,10 +960,7 @@ wss.on("connection", (twilioWs, req) => {
         const mp = (SHEETS.prompts || {}).MESSAGE_TO_MANAGER_PROMPT || "";
         if (mp) parts.push(String(mp).trim());
       } catch (_) {}
-      parts.push(
-        "אם לא ברור, תשאלי שאלה אחת להבהרה לפי הנוסח המדויק: " +
-          "“כדי לעזור במדויק—זה לגבי התעניינות במוצר, שירות/תקלה/אחריות, משלוח/אספקה, או להשאיר הודעה למישהו מהצוות?”"
-      );
+      parts.push("אם לא ברור, תשאלי שאלה אחת להבהרה: מכירה / שירות / משלוח.");
     }
 
     let inst = parts.join("\n\n");
@@ -1092,6 +1016,33 @@ wss.on("connection", (twilioWs, req) => {
         if (t.startsWith(g + " ")) t = t.slice(g.length).trim();
         if (t === g) return "";
       }
+      // Remove filler words commonly used as acknowledgements
+      // such as 'תודה', 'כן', 'טוב', 'סבבה', 'אוקיי', 'בסדר', 'תודה רבה'.
+      const filler = [
+        "תודה",
+        "תודה רבה",
+        "תודה לך",
+        "כן",
+        "כן תודה",
+        "טוב",
+        "טוב בסדר",
+        "סבבה",
+        "בבקשה",
+        "אוקיי",
+        "אוקי",
+        "אוקיי תודה",
+        "אוקי תודה",
+        "בסדר",
+        "בסדר גמור",
+        "אין בעיה",
+        "הבנתי"
+      ];
+      for (const f of filler) {
+        if (t === f) return "";
+        // If the phrase appears at the beginning or end separated by space, trim it
+        if (t.startsWith(f + " ")) t = t.slice(f.length).trim();
+        if (t.endsWith(" " + f)) t = t.slice(0, -f.length).trim();
+      }
       return t;
     } catch (_) {
       return String(s || "").trim().toLowerCase();
@@ -1111,6 +1062,19 @@ wss.on("connection", (twilioWs, req) => {
     // Update proxy instructions for next response (Option B)
     proxyInstructions = buildProxyInstructions(t);
     always(`[CALLER][${connTag}]`, t);
+
+    // Extract any phone numbers mentioned in the caller's utterance. If a
+    // number is present, normalize it to digits and add it to the
+    // recognizedPhones array. Deduplication is handled by checking
+    // existence before pushing.
+    try {
+      const digits = extractPhoneCandidates(t);
+      if (digits && !recognizedPhones.includes(digits)) {
+        recognizedPhones.push(digits);
+      }
+    } catch (_) {
+      /* ignore phone extraction errors */
+    }
   };
 
   const printBotFinal = (text) => {
@@ -1256,9 +1220,20 @@ wss.on("connection", (twilioWs, req) => {
       master_preview: preview(masterPrompt, 220)
     });
 
+    // Prepare the realtime session settings. We allow specifying a voice
+    // style and speaking rate via environment variables. If a style is
+    // provided, we pass an object with name, style and rate to the API.
     const session = {
       modalities: ["audio", "text"],
-      voice: OPENAI_VOICE,
+      voice:
+        OPENAI_VOICE_STYLE || OPENAI_SPEAKING_RATE !== 1.0
+          ? {
+              name: OPENAI_VOICE,
+              // Only include style if non-empty to avoid overriding defaults.
+              ...(OPENAI_VOICE_STYLE ? { style: OPENAI_VOICE_STYLE } : {}),
+              rate: OPENAI_SPEAKING_RATE
+            }
+          : OPENAI_VOICE,
       input_audio_format: "g711_ulaw",
       output_audio_format: "g711_ulaw",
       turn_detection: {
@@ -1460,9 +1435,11 @@ wss.on("connection", (twilioWs, req) => {
               }
             }
           }
-          if (!isDup && (wordCount >= 4 || hasKeyword)) {
-            // require at least 5 meaningful words or a keyword to trigger a new response
-            if (wordCount >= 5 || hasKeyword) {
+          if (!isDup && (wordCount >= 5 || hasKeyword)) {
+            // require at least 7 meaningful words or a keyword to trigger a new response. This higher
+            // threshold prevents the assistant from reacting to short confirmations like "כן", "תודה" או
+            // "אוקיי". Only meaningful sentences (≥7 מילים) או שאלות עם מילות מפתח יגררו תשובה.
+            if (hasKeyword || wordCount >= 7) {
               pendingResponseRequest = true;
             }
           }
@@ -1498,11 +1475,12 @@ wss.on("connection", (twilioWs, req) => {
           isFlushingBufferedAudio = false;
         }, 50);
       }
-      // If we have a pending caller utterance, and we haven't already
-      // responded to it, send one response now. We rely on the check
-      // lastCallerFinal !== lastRequestedCallerFinal to ensure we respond
-      // exactly once per caller utterance.
-      if (pendingResponseRequest && lastCallerFinal !== lastRequestedCallerFinal) {
+      // If we have a pending caller utterance and have not already responded
+      // to the same normalized utterance, send one response now. We rely on the
+      // check lastCallerNormalized !== lastRequestedCallerNormalized to ensure
+      // we respond exactly once per meaningful caller utterance and avoid
+      // differences due to minor transcription variations (e.g. punctuation).
+      if (pendingResponseRequest && lastCallerNormalized !== lastRequestedCallerNormalized) {
         debug(`[${connTag}] response.done -> draining pendingResponseRequest`);
         pendingResponseRequest = false;
         requestAssistantResponse("pending_after_done");
@@ -1596,41 +1574,68 @@ wss.on("connection", (twilioWs, req) => {
         // ONE final webhook (by route when possible) - always wait for recording (best effort)
         const finalEvent =
           route === "sales"
-            ? "מתעניין"
+            ? "sales_lead"
             : route === "support"
-            ? "שירות לקוחות \\ תמיכה"
+            ? "support_ticket"
             : route === "delivery"
-            ? "שירות לקוחות \\ אספקה"
+            ? "delivery_after_hours"
             : route === "message"
-            ? "הודעה כללית"
+            ? "message_taken"
             : "call_ended";
-        const summaryData = await extractStructuredSummary({
-          route,
-          transcriptTurns,
-          caller,
-          called,
-          afterHours: Boolean(deliveryAfterHours)
-        });
-        await sendWebhookEvent(
-          finalEvent,
-          {
-            callSid,
-            streamSid: twilioStreamSid,
-            caller,
-            called,
-            started_at: startedAt,
-            ended_at: endedAt,
-            language,
-            route,
-            summary: summaryData.summary || "",
-            fields: summaryData.fields || {},
-            after_hours: route === "delivery" ? (deliveryAfterHours ? "כן" : "לא") : "",
-            caller_last_utterance: lastCallerFinal,
-            bot_last_utterance: lastBotFinal,
-            transcript: transcriptTurns
-          },
-          { wait_for_recording: true }
-        );
+        {
+          // Always include the caller's default number as a fallback if no recognized phones were found
+          const phones = [...recognizedPhones];
+          try {
+            if (!phones.length && caller) {
+              let digits = String(caller).replace(/\D+/g, "");
+              if (digits.startsWith("972") && digits.length > 3) {
+                digits = "0" + digits.slice(3);
+              }
+              if (digits && !phones.includes(digits)) {
+                phones.push(digits);
+              }
+            }
+          } catch (_) {}
+          // Derive a human-friendly call subject based on the route and last caller utterance. If
+          // the route is known, prefix the subject accordingly. Otherwise, use the bot's
+          // last utterance as a fallback.
+          let callSubject = "";
+          try {
+            if (route === "sales") {
+              callSubject = `פנייה לרכישה – ${lastCallerFinal}`;
+            } else if (route === "support") {
+              callSubject = `תקלה/שירות – ${lastCallerFinal}`;
+            } else if (route === "delivery") {
+              callSubject = `בירור אספקה – ${lastCallerFinal}`;
+            } else if (route === "message") {
+              callSubject = `הודעה למנהל – ${lastCallerFinal}`;
+            } else {
+              callSubject = lastBotFinal || lastCallerFinal;
+            }
+          } catch (_) {
+            callSubject = lastBotFinal || lastCallerFinal;
+          }
+          await sendWebhookEvent(
+            finalEvent,
+            {
+              callSid,
+              streamSid: twilioStreamSid,
+              caller,
+              called,
+              started_at: startedAt,
+              ended_at: endedAt,
+              language,
+              route,
+              caller_last_utterance: lastCallerFinal,
+              bot_last_utterance: lastBotFinal,
+              transcript: transcriptTurns,
+              recognized_phones: phones,
+              call_reason: route,
+              call_subject: callSubject
+            },
+            { wait_for_recording: true }
+          );
+        }
       }
       try {
         if (openaiWs) openaiWs.close();
@@ -1656,6 +1661,23 @@ wss.on("connection", (twilioWs, req) => {
       sentCallAbandoned = true;
       endedAt = endedAt || nowIso();
       const recording_url_public = makeRecordingPublicUrl(callSid);
+      // Construct a call subject for abandoned calls based on the route and last utterance
+      let callSubject = "";
+      try {
+        if (route === "sales") {
+          callSubject = `פנייה לרכישה – ${lastCallerFinal}`;
+        } else if (route === "support") {
+          callSubject = `תקלה/שירות – ${lastCallerFinal}`;
+        } else if (route === "delivery") {
+          callSubject = `בירור אספקה – ${lastCallerFinal}`;
+        } else if (route === "message") {
+          callSubject = `הודעה למנהל – ${lastCallerFinal}`;
+        } else {
+          callSubject = lastBotFinal || lastCallerFinal;
+        }
+      } catch (_) {
+        callSubject = lastBotFinal || lastCallerFinal;
+      }
       sendWebhookEvent(
         "call_abandoned",
         {
@@ -1670,7 +1692,10 @@ wss.on("connection", (twilioWs, req) => {
           caller_last_utterance: lastCallerFinal,
           bot_last_utterance: lastBotFinal,
           transcript: transcriptTurns,
-          recording_url_public
+          recording_url_public,
+          recognized_phones: recognizedPhones,
+          call_reason: route,
+          call_subject: callSubject
         },
         { wait_for_recording: true }
       );
