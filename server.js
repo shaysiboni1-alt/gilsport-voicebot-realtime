@@ -2008,6 +2008,13 @@ wss.on("connection", (twilioWs, req) => {
       const startCalled = params.called || params.Called || "";
       if (startCaller) caller = startCaller;
       if (startCalled) called = startCalled;
+      if (!caller) {
+        try {
+          const u = new URL(req.url || "", "http://localhost");
+          caller = u.searchParams.get("caller") || caller;
+          called = u.searchParams.get("called") || called;
+        } catch (_) {}
+      }
       // call_started webhook suppressed (final-only mode)
       if (!MB_FINAL_WEBHOOK_ONLY) {
         sendWebhookEvent(
@@ -2103,10 +2110,10 @@ wss.on("connection", (twilioWs, req) => {
           flowState.finalPayloadSent = true;
         }
         await sendWebhookEvent(finalEvent, payload, { wait_for_recording: true });
-      }
-      if (!hangupRequested && flowState.finalPayloadSent) {
-        hangupRequested = true;
-        completeTwilioCall(callSid);
+        if (!hangupRequested) {
+          hangupRequested = true;
+          completeTwilioCall(callSid);
+        }
       }
       try {
         if (openaiWs) openaiWs.close();
