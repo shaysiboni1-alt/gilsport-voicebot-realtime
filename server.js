@@ -326,7 +326,11 @@ async function loadSheets() {
     };
 
     log(
-      `Sheets loaded (prompts=${Object.keys(prompts).length}, settings=${Object.keys(settings).length}, kbFacts=${kbFactsRows.length}, doNotSay=${doNotSayRows.length}, suppliersImporters=${suppliersImportersRows.length}, deliveryContacts=${deliveryContactsRows.length})`
+      `Sheets loaded (prompts=${Object.keys(prompts).length}, settings=${
+        Object.keys(settings).length
+      }, kbFacts=${kbFactsRows.length}, doNotSay=${doNotSayRows.length}, suppliersImporters=${
+        suppliersImportersRows.length
+      }, deliveryContacts=${deliveryContactsRows.length})`
     );
   } catch (e) {
     error("Sheets load failed", e.message);
@@ -1377,16 +1381,17 @@ wss.on("connection", (twilioWs, req) => {
 
     // Prepare the realtime session settings. We allow specifying a voice
     // style and speaking rate via environment variables. If a style is
-    // provided, we pass an object with name, style and rate to the API.
+    // provided, we pass an object with id, style and rate to the API.
     const session = {
       modalities: ["audio", "text"],
       voice:
         OPENAI_VOICE_STYLE || OPENAI_SPEAKING_RATE !== 1.0
           ? {
-              name: OPENAI_VOICE,
+              id: OPENAI_VOICE,
               // Only include style if non-empty to avoid overriding defaults.
               ...(OPENAI_VOICE_STYLE ? { style: OPENAI_VOICE_STYLE } : {}),
-              rate: OPENAI_SPEAKING_RATE
+              // Only include rate if not 1.0 (default)
+              ...(OPENAI_SPEAKING_RATE !== 1.0 ? { rate: OPENAI_SPEAKING_RATE } : {})
             }
           : OPENAI_VOICE,
       input_audio_format: "g711_ulaw",
