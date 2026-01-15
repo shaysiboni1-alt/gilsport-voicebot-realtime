@@ -1379,17 +1379,15 @@ wss.on("connection", (twilioWs, req) => {
       master_preview: preview(masterPrompt, 220)
     });
 
-    // Prepare the realtime session settings. We allow specifying a voice
-    // style and speaking rate via environment variables. If a style is
-    // provided, we pass an object with id, style and rate to the API.
+    // Prepare the realtime session settings. We allow specifying a speaking
+    // rate via environment variables. If a rate is provided, we pass an
+    // object with id and rate to the API.
     const session = {
       modalities: ["audio", "text"],
       voice:
-        OPENAI_VOICE_STYLE || OPENAI_SPEAKING_RATE !== 1.0
+        OPENAI_SPEAKING_RATE !== 1.0
           ? {
               id: OPENAI_VOICE,
-              // Only include style if non-empty to avoid overriding defaults.
-              ...(OPENAI_VOICE_STYLE ? { style: OPENAI_VOICE_STYLE } : {}),
               // Only include rate if not 1.0 (default)
               ...(OPENAI_SPEAKING_RATE !== 1.0 ? { rate: OPENAI_SPEAKING_RATE } : {})
             }
