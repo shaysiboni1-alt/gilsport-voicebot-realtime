@@ -1044,9 +1044,16 @@ wss.on("connection", (twilioWs, req) => {
     return "";
   };
 
+  const markStageAdvance = (prevStage, result, forceAdvance = false) => {
+    const shouldAdvance = forceAdvance || flowState.stage !== prevStage;
+    flowState.stageAdvanced = Boolean(result) && shouldAdvance;
+    return result;
+  };
+
   const processCallerUtterance = (utterance) => {
     const text = String(utterance || "").trim();
     if (!text) return "";
+    const prevStage = flowState.stage;
     if (flowState.stage === "routing" || flowState.stage === "routing_clarify") {
       return handleRouting(text);
     }
