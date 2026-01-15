@@ -712,12 +712,13 @@ wss.on("connection", (twilioWs, req) => {
       "הזרימה נקבעת לפי השלב והטקסט מהשיטס בלבד; אין להחליט על שלבים חדשים.",
       "אין להמציא שמות, מספרים או פרטים שלא נאמרו או שלא קיימים בשיטס.",
       "כאשר מציינים מספר טלפון, הקריאי ספרה־ספרה בלבד.",
+      "את חייבת להקריא בדיוק את הטקסט שמופיע תחת SAY מילה במילה, בלי להוסיף כלום.",
       doNotSayText ? `DO_NOT_SAY (כללים מחייבים):\n${doNotSayText}` : ""
     ].filter(Boolean);
     if (!sayText) {
       return buildFlowInstructions(FALLBACK_EMPTY_INSTRUCTIONS);
     }
-    const say = `תגידי בדיוק את המשפט הבא מילה במילה, ללא תוספות:\n${sayText}`;
+    const say = `SAY:\n${sayText}`;
     return [...rules, ...extra.filter(Boolean), say].filter(Boolean).join("\n\n").trim();
   };
 
@@ -830,7 +831,9 @@ wss.on("connection", (twilioWs, req) => {
     shouldHangup: false,
     stageAdvanced: false,
     phoneConfirmed: false,
-    finalPayloadSent: false
+    finalPayloadSent: false,
+    doneLocked: false,
+    allowFinalResponse: false
   };
 
   const ensureCallerDigits = () => {
@@ -940,6 +943,15 @@ wss.on("connection", (twilioWs, req) => {
 
   const advanceStage = (nextStage, sayText) => {
     flowState.stage = nextStage;
+    if (String(nextStage || "").endsWith("_done")) {
+      flowState.doneLocked = true;
+      flowState.allowFinalResponse = true;
+      pendingResponseRequest = false;
+      if (awaitingResponse) {
+        safeOpenAISend({ type: "response.cancel" });
+        awaitingResponse = false;
+      }
+    }
     const result =
       typeof sayText === "string" ? buildFlowInstructions(sayText) : buildNextInstructions();
     flowState.stageAdvanced = Boolean(result);
@@ -1648,11 +1660,16 @@ wss.on("connection", (twilioWs, req) => {
     // Only send a response if the OpenAI WS is ready
     if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN) return;
 
+    if (flowState.doneLocked && !flowState.allowFinalResponse) {
+      pendingResponseRequest = false;
+      return;
+    }
+
     // Don't start a new response while another is in flight
     if (awaitingResponse) {
-      pendingResponseRequest = true;
-      debug(`[${connTag}] response.request deferred (awaitingResponse=true) reason=${reason}`);
-      return;
+      safeOpenAISend({ type: "response.cancel" });
+      awaitingResponse = false;
+      pendingResponseRequest = false;
     }
 
     // Build dynamic instructions for this turn.
@@ -1672,6 +1689,9 @@ wss.on("connection", (twilioWs, req) => {
     // Reset flags: we're starting a new response now
     awaitingResponse = true;
     pendingResponseRequest = false;
+    if (flowState.doneLocked) {
+      flowState.allowFinalResponse = false;
+    }
 
     // Mark that we've responded to the most recent caller utterance
     lastRequestedCallerFinal = lastCallerFinal;
@@ -1753,7 +1773,8 @@ wss.on("connection", (twilioWs, req) => {
         type: "server_vad",
         threshold: MB_VAD_THRESHOLD,
         silence_duration_ms: MB_VAD_SILENCE_MS,
-        prefix_padding_ms: MB_VAD_PREFIX_MS
+        prefix_padding_ms: MB_VAD_PREFIX_MS,
+        create_response: false
       },
       instructions: masterPrompt
     };
@@ -1954,10 +1975,15 @@ wss.on("connection", (twilioWs, req) => {
           const meaningfulShort =
             isYes(normalized) || isNo(normalized) || hasPhone || (normalized && !isFillerOnly(normalized));
           if (!isDup) {
-            if (allowShortReply) {
-              if (meaningfulShort) pendingResponseRequest = true;
-            } else if (wordCount >= 5 || hasKeyword) {
-              pendingResponseRequest = true;
+            const shouldRespond =
+              (allowShortReply && meaningfulShort) || (!allowShortReply && (wordCount >= 5 || hasKeyword));
+            if (shouldRespond) {
+              if (awaitingResponse) {
+                safeOpenAISend({ type: "response.cancel" });
+                awaitingResponse = false;
+              }
+              pendingResponseRequest = false;
+              requestAssistantResponse("caller_final");
             }
           }
         }
@@ -1996,11 +2022,6 @@ wss.on("connection", (twilioWs, req) => {
       // responded to it, send one response now. We rely on the check
       // lastCallerFinal !== lastRequestedCallerFinal to ensure we respond
       // exactly once per caller utterance.
-      if (pendingResponseRequest && lastCallerFinal !== lastRequestedCallerFinal) {
-        debug(`[${connTag}] response.done -> draining pendingResponseRequest`);
-        pendingResponseRequest = false;
-        requestAssistantResponse("pending_after_done");
-      }
       if (
         flowState.shouldHangup &&
         flowState.finalEvent &&
