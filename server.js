@@ -116,6 +116,7 @@ const FALLBACK_ROUTING_CLARIFY =
   "כדי לעזור במדויק—זה לגבי התעניינות במוצר, שירות/תקלה/אחריות, משלוח/אספקה, או להשאיר הודעה למישהו מהצוות?";
 const FALLBACK_PHONE_MISSING_DIGIT =
   "נראה שחסרה לי ספרה אחת, תוכלו להגיד שוב את המספר לאט?";
+const FALLBACK_NAME_INVALID = "אפשר בבקשה שם מלא?";
 let warnedSheetsEmpty = false;
 
 // --------------------------------------------------
@@ -469,15 +470,15 @@ app.get("/recording/:callSid", async (req, res) => {
       `${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`
     ).toString("base64");
     const listResp = await fetch(listUrl, { headers: { Authorization: `Basic ${auth}` } });
-    if (!listResp.ok) return res.status(404).send("no recording");
+    if (!listResp.ok) return res.status(404).send("no recording found for callSid");
     const listJson = await listResp.json();
     const rec = (listJson.recordings || [])[0];
-    if (!rec || !rec.sid) return res.status(404).send("no recording");
+    if (!rec || !rec.sid) return res.status(404).send("no recording found for callSid");
 
     // Twilio media (mp3)
     const mediaUrl = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Recordings/${rec.sid}.mp3`;
     const mediaResp = await fetch(mediaUrl, { headers: { Authorization: `Basic ${auth}` } });
-    if (!mediaResp.ok) return res.status(404).send("recording not ready");
+    if (!mediaResp.ok) return res.status(404).send("no recording found for callSid");
 
     res.setHeader("Content-Type", "audio/mpeg");
     res.setHeader("Cache-Control", "no-store");
@@ -605,7 +606,33 @@ wss.on("connection", (twilioWs, req) => {
   const formatSpacedDigits = (digits) => String(digits || "").split("").join(" ");
 
   const normalizePhoneDigits = (raw) => {
-    let digits = String(raw || "").replace(/\D+/g, "");
+    let text = String(raw || "");
+    const wordToDigit = {
+      "אפס": "0",
+      "אחת": "1",
+      "אחד": "1",
+      "שתיים": "2",
+      "שתים": "2",
+      "שניים": "2",
+      "שנים": "2",
+      "שלוש": "3",
+      "שלושה": "3",
+      "ארבע": "4",
+      "ארבעה": "4",
+      "חמש": "5",
+      "חמישה": "5",
+      "שש": "6",
+      "שישה": "6",
+      "שבע": "7",
+      "שבעה": "7",
+      "שמונה": "8",
+      "תשע": "9",
+      "תשעה": "9"
+    };
+    for (const [word, digit] of Object.entries(wordToDigit)) {
+      text = text.replace(new RegExp(`\\b${word}\\b`, "g"), digit);
+    }
+    let digits = text.replace(/\D+/g, "");
     if (digits.startsWith("972") && digits.length > 3) {
       digits = "0" + digits.slice(3);
     }
@@ -771,12 +798,59 @@ wss.on("connection", (twilioWs, req) => {
     product_model: "",
     product_brand: "",
     issue_desc: "",
+    issue_topic: "",
     message_target: "",
     message_body: "",
     delivery_desc: "",
+    delivery_topic: "",
     after_hours: false,
     full_name: "",
     callback_phone: ""
+  };
+
+  const extractNameCandidate = (text) => {
+    let t = String(text || "").trim();
+    if (!t) return "";
+    const phoneCandidate = extractPhoneCandidates(t);
+    if (phoneCandidate) {
+      t = t.replace(phoneCandidate, "").trim();
+    }
+    const lowered = t.toLowerCase();
+    const nameMarkers = ["השם שלי", "קוראים לי", "שמי", "אני"];
+    for (const marker of nameMarkers) {
+      if (lowered.includes(marker)) {
+        const idx = lowered.lastIndexOf(marker);
+        t = t.slice(idx + marker.length).trim();
+        break;
+      }
+    }
+    t = t.replace(/[0-9]/g, "").replace(/\s+/g, " ").trim();
+    if (!t || t.length < 2 || t.length > 40) return "";
+    const filler = ["תודה", "אוקיי", "אוקי", "כן", "לא", "ביי", "שלום", "בסדר", "סבבה"];
+    if (filler.includes(t)) return "";
+    if (!/[A-Za-z\u0590-\u05FF]/.test(t)) return "";
+    return t;
+  };
+
+  const isExplicitNamePhrase = (text) =>
+    /(השם שלי|קוראים לי|שמי)/.test(String(text || ""));
+
+  const extractIssueTopic = (text) => {
+    const t = String(text || "");
+    if (/מסך|תצוגה|צג/.test(t)) return "תקלה במסך";
+    if (/מנוע|רע(ש|שים)|רעש|חריקה/.test(t)) return "תקלה במנוע";
+    if (/לא נדלק|לא עובד|לא מגיב/.test(t)) return "לא עובד";
+    if (/חשמל|כבל|תקע|ספק/.test(t)) return "בעיה חשמלית";
+    return "";
+  };
+
+  const extractDeliveryTopic = (text) => {
+    const t = String(text || "");
+    if (/לא הגיע|לא קיבל|לא הגיעו/.test(t)) return "לא הגיע";
+    if (/איחור|מאחר/.test(t)) return "איחור";
+    if (/פגום|שבור|קרוע/.test(t)) return "נזק במשלוח";
+    if (/תיאום|תאריך|שעה/.test(t)) return "תיאום משלוח";
+    return "";
   };
 
   const buildSummary = () => {
@@ -870,6 +944,16 @@ wss.on("connection", (twilioWs, req) => {
       route: flowState.route,
       stage: flowState.stage,
       summary,
+      product_type: flowState.data.product_type || "",
+      product_brand: flowState.data.product_brand || "",
+      product_model: flowState.data.product_model || "",
+      issue_desc: flowState.data.issue_desc || "",
+      issue_topic: flowState.data.issue_topic || "",
+      delivery_desc: flowState.data.delivery_desc || "",
+      delivery_topic: flowState.data.delivery_topic || "",
+      after_hours: Boolean(flowState.afterHours),
+      message_target: flowState.data.message_target || "",
+      message_body: flowState.data.message_body || "",
       caller_last_utterance: lastCallerFinal,
       bot_last_utterance: lastBotFinal,
       transcript: transcriptTurns,
@@ -879,21 +963,6 @@ wss.on("connection", (twilioWs, req) => {
       call_reason: flowState.route,
       call_subject: flowState.finalSummary || lastBotFinal || lastCallerFinal
     };
-    if (flowState.route === "sales") {
-      payload.product_type = flowState.data.product_type;
-      payload.product_model = flowState.data.product_model;
-      payload.product_brand = flowState.data.product_brand;
-    } else if (flowState.route === "support") {
-      payload.issue_desc = flowState.data.issue_desc;
-      payload.product_model = flowState.data.product_model;
-      payload.product_brand = flowState.data.product_brand;
-    } else if (flowState.route === "delivery") {
-      payload.delivery_desc = flowState.data.delivery_desc;
-      payload.after_hours = Boolean(flowState.afterHours);
-    } else if (flowState.route === "message") {
-      payload.message_target = flowState.data.message_target;
-      payload.message_body = flowState.data.message_body;
-    }
     return payload;
   };
 
@@ -1045,6 +1114,14 @@ wss.on("connection", (twilioWs, req) => {
       );
     }
     if (flowState.stage === "sales_phone_confirm_new") {
+      if (!isValidPhoneDigits(flowState.data.callback_phone)) {
+        return buildFlowInstructions(
+          getFlowTextOrFallback(
+            "FLOW_SALES_PHONE_COLLECT",
+            "אין בעיה, תגידו לי בבקשה את מספר הטלפון לחזרה."
+          )
+        );
+      }
       const spaced = formatSpacedDigits(flowState.data.callback_phone);
       return buildFlowInstructions(
         renderFlowText(
@@ -1112,6 +1189,14 @@ wss.on("connection", (twilioWs, req) => {
       );
     }
     if (flowState.stage === "support_phone_confirm_new") {
+      if (!isValidPhoneDigits(flowState.data.callback_phone)) {
+        return buildFlowInstructions(
+          getFlowTextOrFallback(
+            "FLOW_SUPPORT_PHONE_COLLECT",
+            "אין בעיה, תגידו לי בבקשה את מספר הטלפון לחזרה."
+          )
+        );
+      }
       const spaced = formatSpacedDigits(flowState.data.callback_phone);
       return buildFlowInstructions(
         renderFlowText(
@@ -1150,7 +1235,16 @@ wss.on("connection", (twilioWs, req) => {
     if (flowState.stage === "delivery_name") {
       flowState.afterHours = isAfterHours();
       const carriers = flowState.afterHours ? buildCarrierList() : [];
-      const afterHoursText = flowState.afterHours && carriers.length ? carriers.join(", ") : "";
+      const afterHoursText =
+        flowState.afterHours && carriers.length
+          ? renderFlowText(
+              getFlowTextOrFallback(
+                "FLOW_DELIVERY_AFTER_HOURS",
+                "אלו מספרי המובילים: {carriers}"
+              ),
+              { carriers: carriers.join(", ") }
+            )
+          : "";
       const intro = getFlowTextOrFallback("FLOW_DELIVERY_INTRO", "");
       const askName = getFlowTextOrFallback(
         "FLOW_DELIVERY_NAME",
@@ -1192,6 +1286,14 @@ wss.on("connection", (twilioWs, req) => {
       );
     }
     if (flowState.stage === "delivery_phone_confirm_new") {
+      if (!isValidPhoneDigits(flowState.data.callback_phone)) {
+        return buildFlowInstructions(
+          getFlowTextOrFallback(
+            "FLOW_DELIVERY_PHONE_COLLECT",
+            "אין בעיה, תגידו לי בבקשה את מספר הטלפון לחזרה."
+          )
+        );
+      }
       const spaced = formatSpacedDigits(flowState.data.callback_phone);
       return buildFlowInstructions(
         renderFlowText(
@@ -1259,6 +1361,14 @@ wss.on("connection", (twilioWs, req) => {
       );
     }
     if (flowState.stage === "message_phone_confirm_new") {
+      if (!isValidPhoneDigits(flowState.data.callback_phone)) {
+        return buildFlowInstructions(
+          getFlowTextOrFallback(
+            "FLOW_MESSAGE_PHONE_COLLECT",
+            "אין בעיה, תגידו לי בבקשה את מספר הטלפון לחזרה."
+          )
+        );
+      }
       const spaced = formatSpacedDigits(flowState.data.callback_phone);
       return buildFlowInstructions(
         renderFlowText(
@@ -1300,6 +1410,12 @@ wss.on("connection", (twilioWs, req) => {
   const processCallerUtterance = (utterance) => {
     const text = String(utterance || "").trim();
     if (!text) return "";
+    if (isExplicitNamePhrase(text)) {
+      const nameCandidate = extractNameCandidate(text);
+      if (nameCandidate) {
+        flowState.data.full_name = nameCandidate;
+      }
+    }
     const prevStage = flowState.stage;
     if (flowState.stage === "routing" || flowState.stage === "routing_clarify") {
       return handleRouting(text);
@@ -1312,7 +1428,18 @@ wss.on("connection", (twilioWs, req) => {
       return advanceStage("sales_name");
     }
     if (flowState.stage === "sales_name") {
-      flowState.data.full_name = text;
+      const nameCandidate = extractNameCandidate(text);
+      const phoneCandidate = extractPhoneCandidates(text);
+      if (phoneCandidate && !flowState.data.callback_phone) {
+        flowState.data.callback_phone = phoneCandidate;
+      }
+      if (!nameCandidate) {
+        return advanceStage(
+          flowState.stage,
+          getFlowTextOrFallback("FLOW_NAME_INVALID", FALLBACK_NAME_INVALID)
+        );
+      }
+      flowState.data.full_name = nameCandidate;
       return advanceStage("sales_phone_confirm");
     }
     if (flowState.stage === "sales_phone_confirm") {
@@ -1348,6 +1475,10 @@ wss.on("connection", (twilioWs, req) => {
     }
     if (flowState.stage === "sales_phone_confirm_new") {
       if (isYes(text)) {
+        if (!isValidPhoneDigits(flowState.data.callback_phone)) {
+          flowState.phoneConfirmed = false;
+          return advanceStage("sales_phone_collect");
+        }
         flowState.data.callback_phone = String(flowState.data.callback_phone || "");
         flowState.phoneConfirmed = true;
         return advanceStage("sales_done");
@@ -1357,6 +1488,9 @@ wss.on("connection", (twilioWs, req) => {
     }
     if (flowState.stage === "support_issue_desc") {
       flowState.data.issue_desc = text;
+      if (!flowState.data.issue_topic) {
+        flowState.data.issue_topic = extractIssueTopic(text);
+      }
       return advanceStage("support_product");
     }
     if (flowState.stage === "support_product") {
@@ -1366,7 +1500,18 @@ wss.on("connection", (twilioWs, req) => {
       return advanceStage("support_name");
     }
     if (flowState.stage === "support_name") {
-      flowState.data.full_name = text;
+      const nameCandidate = extractNameCandidate(text);
+      const phoneCandidate = extractPhoneCandidates(text);
+      if (phoneCandidate && !flowState.data.callback_phone) {
+        flowState.data.callback_phone = phoneCandidate;
+      }
+      if (!nameCandidate) {
+        return advanceStage(
+          flowState.stage,
+          getFlowTextOrFallback("FLOW_NAME_INVALID", FALLBACK_NAME_INVALID)
+        );
+      }
+      flowState.data.full_name = nameCandidate;
       return advanceStage("support_phone_confirm");
     }
     if (flowState.stage === "support_phone_confirm") {
@@ -1402,6 +1547,10 @@ wss.on("connection", (twilioWs, req) => {
     }
     if (flowState.stage === "support_phone_confirm_new") {
       if (isYes(text)) {
+        if (!isValidPhoneDigits(flowState.data.callback_phone)) {
+          flowState.phoneConfirmed = false;
+          return advanceStage("support_phone_collect");
+        }
         flowState.data.callback_phone = String(flowState.data.callback_phone || "");
         flowState.phoneConfirmed = true;
         return advanceStage("support_done");
@@ -1411,11 +1560,25 @@ wss.on("connection", (twilioWs, req) => {
     }
     if (flowState.stage === "delivery_name") {
       flowState.data.after_hours = Boolean(flowState.afterHours);
-      flowState.data.full_name = text;
+      const nameCandidate = extractNameCandidate(text);
+      const phoneCandidate = extractPhoneCandidates(text);
+      if (phoneCandidate && !flowState.data.callback_phone) {
+        flowState.data.callback_phone = phoneCandidate;
+      }
+      if (!nameCandidate) {
+        return advanceStage(
+          flowState.stage,
+          getFlowTextOrFallback("FLOW_NAME_INVALID", FALLBACK_NAME_INVALID)
+        );
+      }
+      flowState.data.full_name = nameCandidate;
       return advanceStage("delivery_phone_confirm");
     }
     if (flowState.stage === "delivery_desc") {
       flowState.data.delivery_desc = text;
+      if (!flowState.data.delivery_topic) {
+        flowState.data.delivery_topic = extractDeliveryTopic(text);
+      }
       return advanceStage("delivery_name");
     }
     if (flowState.stage === "delivery_phone_confirm") {
@@ -1451,6 +1614,10 @@ wss.on("connection", (twilioWs, req) => {
     }
     if (flowState.stage === "delivery_phone_confirm_new") {
       if (isYes(text)) {
+        if (!isValidPhoneDigits(flowState.data.callback_phone)) {
+          flowState.phoneConfirmed = false;
+          return advanceStage("delivery_phone_collect");
+        }
         flowState.data.callback_phone = String(flowState.data.callback_phone || "");
         flowState.phoneConfirmed = true;
         return advanceStage("delivery_done");
@@ -1463,7 +1630,18 @@ wss.on("connection", (twilioWs, req) => {
       return advanceStage("message_name");
     }
     if (flowState.stage === "message_name") {
-      flowState.data.full_name = text;
+      const nameCandidate = extractNameCandidate(text);
+      const phoneCandidate = extractPhoneCandidates(text);
+      if (phoneCandidate && !flowState.data.callback_phone) {
+        flowState.data.callback_phone = phoneCandidate;
+      }
+      if (!nameCandidate) {
+        return advanceStage(
+          flowState.stage,
+          getFlowTextOrFallback("FLOW_NAME_INVALID", FALLBACK_NAME_INVALID)
+        );
+      }
+      flowState.data.full_name = nameCandidate;
       return advanceStage("message_body");
     }
     if (flowState.stage === "message_body") {
@@ -1503,6 +1681,10 @@ wss.on("connection", (twilioWs, req) => {
     }
     if (flowState.stage === "message_phone_confirm_new") {
       if (isYes(text)) {
+        if (!isValidPhoneDigits(flowState.data.callback_phone)) {
+          flowState.phoneConfirmed = false;
+          return advanceStage("message_phone_collect");
+        }
         flowState.data.callback_phone = String(flowState.data.callback_phone || "");
         flowState.phoneConfirmed = true;
         return advanceStage("message_done");
@@ -2143,6 +2325,17 @@ wss.on("connection", (twilioWs, req) => {
       endedAt = nowIso();
 
       if (!sentCallEnded && !flowState.finalPayloadSent) {
+        if (!flowState.stage.endsWith("_done")) {
+          sentCallEnded = true;
+          if (!hangupRequested) {
+            hangupRequested = true;
+            completeTwilioCall(callSid);
+          }
+          try {
+            if (openaiWs) openaiWs.close();
+          } catch (_) {}
+          return;
+        }
         sentCallEnded = true;
         const canSendFinal = Boolean(flowState.finalEvent);
         const fallbackEvent =
