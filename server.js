@@ -752,7 +752,9 @@ wss.on("connection", (twilioWs, req) => {
     finalSummary: "",
     finalPayload: null,
     shouldHangup: false,
-    stageAdvanced: false
+    stageAdvanced: false,
+    phoneConfirmed: false,
+    finalPayloadSent: false
   };
 
   const ensureCallerDigits = () => {
@@ -807,11 +809,48 @@ wss.on("connection", (twilioWs, req) => {
     return payload;
   };
 
+  const hasRequiredFields = () => {
+    const phone = flowState.data.callback_phone || ensureCallerDigits();
+    if (!flowState.phoneConfirmed || !phone) return false;
+    if (flowState.route === "sales") {
+      return Boolean(flowState.data.product_interest && flowState.data.full_name);
+    }
+    if (flowState.route === "support") {
+      return Boolean(
+        flowState.data.issue_type &&
+          flowState.data.issue_desc &&
+          flowState.data.full_name
+      );
+    }
+    if (flowState.route === "delivery") {
+      return Boolean(flowState.data.delivery_desc && flowState.data.full_name);
+    }
+    if (flowState.route === "message") {
+      return Boolean(
+        flowState.data.message_target &&
+          flowState.data.message_body &&
+          flowState.data.full_name
+      );
+    }
+    return false;
+  };
+
+  const advanceStage = (nextStage, sayText) => {
+    flowState.stage = nextStage;
+    const result =
+      typeof sayText === "string" ? buildFlowInstructions(sayText) : buildNextInstructions();
+    flowState.stageAdvanced = Boolean(result);
+    return result;
+  };
+
   const handleRouting = (utterance) => {
+    if (flowState.route !== "other") {
+      return "";
+    }
     const routeCandidate = extractRoute(utterance);
     if (routeCandidate) {
       flowState.route = routeCandidate;
-      flowState.stage =
+      const nextStage =
         routeCandidate === "sales"
           ? "sales_product"
           : routeCandidate === "support"
@@ -830,14 +869,20 @@ wss.on("connection", (twilioWs, req) => {
         flowState.data.issue_desc = String(utterance || "").trim();
         flowState.data.issue_type = String(utterance || "").trim();
       }
+      const result = advanceStage(nextStage);
+      route = flowState.route;
+      return result;
     } else if (!flowState.askedRouting) {
       flowState.askedRouting = true;
-      flowState.stage = "routing_clarify";
+      const result = advanceStage("routing_clarify");
+      route = flowState.route;
+      return result;
     } else {
       flowState.route = "message";
-      flowState.stage = "message_target";
+      const result = advanceStage("message_target");
+      route = flowState.route;
+      return result;
     }
-    route = flowState.route;
   };
 
   const buildNextInstructions = () => {
@@ -1001,199 +1046,193 @@ wss.on("connection", (twilioWs, req) => {
     if (!text) return "";
     const prevStage = flowState.stage;
     if (flowState.stage === "routing" || flowState.stage === "routing_clarify") {
-      handleRouting(text);
-      return markStageAdvance(prevStage, buildNextInstructions());
+      return handleRouting(text);
     }
     if (flowState.stage === "sales_product") {
       flowState.data.product_interest = text;
       const { brand, model } = extractBrandModel(text);
       if (brand) flowState.data.product_brand = brand;
       if (model) flowState.data.product_model = model;
-      flowState.stage = "sales_name";
-      return markStageAdvance(prevStage, buildNextInstructions());
+      return advanceStage("sales_name");
     }
     if (flowState.stage === "sales_name") {
       flowState.data.full_name = text;
-      flowState.stage = "sales_phone_confirm";
-      return markStageAdvance(prevStage, buildNextInstructions());
+      return advanceStage("sales_phone_confirm");
     }
     if (flowState.stage === "sales_phone_confirm") {
       if (isYes(text)) {
         flowState.data.callback_phone = ensureCallerDigits();
-        flowState.stage = "sales_done";
-        return markStageAdvance(prevStage, buildNextInstructions());
+        if (!flowState.data.callback_phone) {
+          flowState.phoneConfirmed = false;
+          return advanceStage("sales_phone_collect");
+        }
+        flowState.phoneConfirmed = true;
+        return advanceStage("sales_done");
       }
       if (isNo(text) || !ensureCallerDigits()) {
-        flowState.stage = "sales_phone_collect";
-        return markStageAdvance(prevStage, buildNextInstructions());
+        flowState.phoneConfirmed = false;
+        return advanceStage("sales_phone_collect");
       }
-      flowState.stage = "sales_phone_collect";
-      return markStageAdvance(prevStage, buildNextInstructions());
+      flowState.phoneConfirmed = false;
+      return advanceStage("sales_phone_collect");
     }
     if (flowState.stage === "sales_phone_collect") {
       const digits = extractPhoneCandidates(text);
       if (!isValidPhoneDigits(digits)) {
-        return markStageAdvance(
-          prevStage,
-          buildFlowInstructions(getFlowText("FLOW_PHONE_MISSING_DIGIT")),
-          true
-        );
+        return advanceStage(flowState.stage, getFlowText("FLOW_PHONE_MISSING_DIGIT"));
       }
       flowState.data.callback_phone = digits;
+      flowState.phoneConfirmed = false;
       if (!recognizedPhones.includes(digits)) recognizedPhones.push(digits);
-      flowState.stage = "sales_phone_confirm_new";
-      return markStageAdvance(prevStage, buildNextInstructions());
+      return advanceStage("sales_phone_confirm_new");
     }
     if (flowState.stage === "sales_phone_confirm_new") {
       if (isYes(text)) {
-        flowState.stage = "sales_done";
-        return markStageAdvance(prevStage, buildNextInstructions());
+        flowState.data.callback_phone = String(flowState.data.callback_phone || "");
+        flowState.phoneConfirmed = true;
+        return advanceStage("sales_done");
       }
-      flowState.stage = "sales_phone_collect";
-      return markStageAdvance(prevStage, buildNextInstructions());
+      flowState.phoneConfirmed = true;
+      return advanceStage("sales_done");
     }
     if (flowState.stage === "support_issue") {
       flowState.data.issue_type = text;
       flowState.data.issue_desc = text;
-      flowState.stage = "support_product";
-      return markStageAdvance(prevStage, buildNextInstructions());
+      return advanceStage("support_product");
     }
     if (flowState.stage === "support_product") {
       const { brand, model } = extractBrandModel(text);
       flowState.data.product_brand = brand || flowState.data.product_brand;
       flowState.data.product_model = model || flowState.data.product_model;
-      flowState.stage = "support_name";
-      return markStageAdvance(prevStage, buildNextInstructions());
+      return advanceStage("support_name");
     }
     if (flowState.stage === "support_name") {
       flowState.data.full_name = text;
-      flowState.stage = "support_phone_confirm";
-      return markStageAdvance(prevStage, buildNextInstructions());
+      return advanceStage("support_phone_confirm");
     }
     if (flowState.stage === "support_phone_confirm") {
       if (isYes(text)) {
         flowState.data.callback_phone = ensureCallerDigits();
-        flowState.stage = "support_done";
-        return markStageAdvance(prevStage, buildNextInstructions());
+        if (!flowState.data.callback_phone) {
+          flowState.phoneConfirmed = false;
+          return advanceStage("support_phone_collect");
+        }
+        flowState.phoneConfirmed = true;
+        return advanceStage("support_done");
       }
       if (isNo(text) || !ensureCallerDigits()) {
-        flowState.stage = "support_phone_collect";
-        return markStageAdvance(prevStage, buildNextInstructions());
+        flowState.phoneConfirmed = false;
+        return advanceStage("support_phone_collect");
       }
-      flowState.stage = "support_phone_collect";
-      return markStageAdvance(prevStage, buildNextInstructions());
+      flowState.phoneConfirmed = false;
+      return advanceStage("support_phone_collect");
     }
     if (flowState.stage === "support_phone_collect") {
       const digits = extractPhoneCandidates(text);
       if (!isValidPhoneDigits(digits)) {
-        return markStageAdvance(
-          prevStage,
-          buildFlowInstructions(getFlowText("FLOW_PHONE_MISSING_DIGIT")),
-          true
-        );
+        return advanceStage(flowState.stage, getFlowText("FLOW_PHONE_MISSING_DIGIT"));
       }
       flowState.data.callback_phone = digits;
+      flowState.phoneConfirmed = false;
       if (!recognizedPhones.includes(digits)) recognizedPhones.push(digits);
-      flowState.stage = "support_phone_confirm_new";
-      return markStageAdvance(prevStage, buildNextInstructions());
+      return advanceStage("support_phone_confirm_new");
     }
     if (flowState.stage === "support_phone_confirm_new") {
       if (isYes(text)) {
-        flowState.stage = "support_done";
-        return markStageAdvance(prevStage, buildNextInstructions());
+        flowState.data.callback_phone = String(flowState.data.callback_phone || "");
+        flowState.phoneConfirmed = true;
+        return advanceStage("support_done");
       }
-      flowState.stage = "support_phone_collect";
-      return markStageAdvance(prevStage, buildNextInstructions());
+      flowState.phoneConfirmed = true;
+      return advanceStage("support_done");
     }
     if (flowState.stage === "delivery_name") {
       flowState.data.full_name = text;
-      flowState.stage = "delivery_phone_confirm";
-      return markStageAdvance(prevStage, buildNextInstructions());
+      return advanceStage("delivery_phone_confirm");
     }
     if (flowState.stage === "delivery_phone_confirm") {
       if (isYes(text)) {
         flowState.data.callback_phone = ensureCallerDigits();
-        flowState.stage = "delivery_done";
-        return markStageAdvance(prevStage, buildNextInstructions());
+        if (!flowState.data.callback_phone) {
+          flowState.phoneConfirmed = false;
+          return advanceStage("delivery_phone_collect");
+        }
+        flowState.phoneConfirmed = true;
+        return advanceStage("delivery_done");
       }
       if (isNo(text) || !ensureCallerDigits()) {
-        flowState.stage = "delivery_phone_collect";
-        return markStageAdvance(prevStage, buildNextInstructions());
+        flowState.phoneConfirmed = false;
+        return advanceStage("delivery_phone_collect");
       }
-      flowState.stage = "delivery_phone_collect";
-      return markStageAdvance(prevStage, buildNextInstructions());
+      flowState.phoneConfirmed = false;
+      return advanceStage("delivery_phone_collect");
     }
     if (flowState.stage === "delivery_phone_collect") {
       const digits = extractPhoneCandidates(text);
       if (!isValidPhoneDigits(digits)) {
-        return markStageAdvance(
-          prevStage,
-          buildFlowInstructions(getFlowText("FLOW_PHONE_MISSING_DIGIT")),
-          true
-        );
+        return advanceStage(flowState.stage, getFlowText("FLOW_PHONE_MISSING_DIGIT"));
       }
       flowState.data.callback_phone = digits;
+      flowState.phoneConfirmed = false;
       if (!recognizedPhones.includes(digits)) recognizedPhones.push(digits);
-      flowState.stage = "delivery_phone_confirm_new";
-      return markStageAdvance(prevStage, buildNextInstructions());
+      return advanceStage("delivery_phone_confirm_new");
     }
     if (flowState.stage === "delivery_phone_confirm_new") {
       if (isYes(text)) {
-        flowState.stage = "delivery_done";
-        return markStageAdvance(prevStage, buildNextInstructions());
+        flowState.data.callback_phone = String(flowState.data.callback_phone || "");
+        flowState.phoneConfirmed = true;
+        return advanceStage("delivery_done");
       }
-      flowState.stage = "delivery_phone_collect";
-      return markStageAdvance(prevStage, buildNextInstructions());
+      flowState.phoneConfirmed = true;
+      return advanceStage("delivery_done");
     }
     if (flowState.stage === "message_target") {
       flowState.data.message_target = text;
-      flowState.stage = "message_name";
-      return markStageAdvance(prevStage, buildNextInstructions());
+      return advanceStage("message_name");
     }
     if (flowState.stage === "message_name") {
       flowState.data.full_name = text;
-      flowState.stage = "message_body";
-      return markStageAdvance(prevStage, buildNextInstructions());
+      return advanceStage("message_body");
     }
     if (flowState.stage === "message_body") {
       flowState.data.message_body = text;
-      flowState.stage = "message_phone_confirm";
-      return markStageAdvance(prevStage, buildNextInstructions());
+      return advanceStage("message_phone_confirm");
     }
     if (flowState.stage === "message_phone_confirm") {
       if (isYes(text)) {
         flowState.data.callback_phone = ensureCallerDigits();
-        flowState.stage = "message_done";
-        return markStageAdvance(prevStage, buildNextInstructions());
+        if (!flowState.data.callback_phone) {
+          flowState.phoneConfirmed = false;
+          return advanceStage("message_phone_collect");
+        }
+        flowState.phoneConfirmed = true;
+        return advanceStage("message_done");
       }
       if (isNo(text) || !ensureCallerDigits()) {
-        flowState.stage = "message_phone_collect";
-        return markStageAdvance(prevStage, buildNextInstructions());
+        flowState.phoneConfirmed = false;
+        return advanceStage("message_phone_collect");
       }
-      flowState.stage = "message_phone_collect";
-      return markStageAdvance(prevStage, buildNextInstructions());
+      flowState.phoneConfirmed = false;
+      return advanceStage("message_phone_collect");
     }
     if (flowState.stage === "message_phone_collect") {
       const digits = extractPhoneCandidates(text);
       if (!isValidPhoneDigits(digits)) {
-        return markStageAdvance(
-          prevStage,
-          buildFlowInstructions(getFlowText("FLOW_PHONE_MISSING_DIGIT")),
-          true
-        );
+        return advanceStage(flowState.stage, getFlowText("FLOW_PHONE_MISSING_DIGIT"));
       }
       flowState.data.callback_phone = digits;
+      flowState.phoneConfirmed = false;
       if (!recognizedPhones.includes(digits)) recognizedPhones.push(digits);
-      flowState.stage = "message_phone_confirm_new";
-      return markStageAdvance(prevStage, buildNextInstructions());
+      return advanceStage("message_phone_confirm_new");
     }
     if (flowState.stage === "message_phone_confirm_new") {
       if (isYes(text)) {
-        flowState.stage = "message_done";
-        return markStageAdvance(prevStage, buildNextInstructions());
+        flowState.data.callback_phone = String(flowState.data.callback_phone || "");
+        flowState.phoneConfirmed = true;
+        return advanceStage("message_done");
       }
-      flowState.stage = "message_phone_collect";
-      return markStageAdvance(prevStage, buildNextInstructions());
+      flowState.phoneConfirmed = true;
+      return advanceStage("message_done");
     }
     flowState.stageAdvanced = false;
     return "";
@@ -1680,8 +1719,15 @@ wss.on("connection", (twilioWs, req) => {
         pendingResponseRequest = false;
         requestAssistantResponse("pending_after_done");
       }
-      if (flowState.shouldHangup && !sentCallEnded && flowState.finalEvent) {
+      if (
+        flowState.shouldHangup &&
+        flowState.finalEvent &&
+        !sentCallEnded &&
+        !flowState.finalPayloadSent &&
+        hasRequiredFields()
+      ) {
         sentCallEnded = true;
+        flowState.finalPayloadSent = true;
         endedAt = endedAt || nowIso();
         const payload = buildFinalPayload();
         sendWebhookEvent(flowState.finalEvent, payload, { wait_for_recording: true });
@@ -1775,7 +1821,7 @@ wss.on("connection", (twilioWs, req) => {
       always(`[TWILIO_STOP][${connTag}]`, "stream stopped");
       endedAt = nowIso();
 
-      if (!sentCallEnded) {
+      if (!sentCallEnded && !flowState.finalPayloadSent) {
         sentCallEnded = true;
         const fallbackEvent =
           route === "sales"
@@ -1787,20 +1833,26 @@ wss.on("connection", (twilioWs, req) => {
             : route === "message"
             ? "message_taken"
             : "call_ended";
-        const finalEvent = flowState.finalEvent || fallbackEvent;
-        const payload = flowState.finalEvent ? buildFinalPayload() : {
-          callSid,
-          streamSid: twilioStreamSid,
-          caller,
-          called,
-          started_at: startedAt,
-          ended_at: endedAt,
-          language,
-          route,
-          caller_last_utterance: lastCallerFinal,
-          bot_last_utterance: lastBotFinal,
-          transcript: transcriptTurns
-        };
+        const canSendFinal = flowState.finalEvent && hasRequiredFields();
+        const finalEvent = canSendFinal ? flowState.finalEvent : fallbackEvent;
+        const payload = canSendFinal
+          ? buildFinalPayload()
+          : {
+              callSid,
+              streamSid: twilioStreamSid,
+              caller,
+              called,
+              started_at: startedAt,
+              ended_at: endedAt,
+              language,
+              route,
+              caller_last_utterance: lastCallerFinal,
+              bot_last_utterance: lastBotFinal,
+              transcript: transcriptTurns
+            };
+        if (canSendFinal) {
+          flowState.finalPayloadSent = true;
+        }
         await sendWebhookEvent(finalEvent, payload, { wait_for_recording: true });
       }
       try {
