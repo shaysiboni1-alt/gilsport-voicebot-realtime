@@ -372,6 +372,8 @@ async function loadSheets() {
 
 const getPrompt = (id, fallback = "") => String(SHEETS.prompts[id] || fallback).trim();
 const getSetting = (key, fallback = "") => String(SHEETS.settings[key] || fallback).trim();
+const getText = (key) =>
+  (SHEETS.settings && SHEETS.settings[key]) || (SHEETS.prompts && SHEETS.prompts[key]) || null;
 
 // --------------------------------------------------
 // Express
@@ -648,6 +650,18 @@ wss.on("connection", (twilioWs, req) => {
     return d.length === 10 && d.startsWith("0");
   };
 
+  const attemptHangup = async (sid) => {
+    if (!sid) return false;
+    always(`[HANGUP] attempt callSid=${sid}`);
+    const ok = await completeTwilioCall(sid);
+    if (ok) {
+      always(`[HANGUP] success callSid=${sid}`);
+    } else {
+      error(`[HANGUP] error callSid=${sid}`);
+    }
+    return ok;
+  };
+
   const isYes = (text) =>
     /(כן|כן כן|נכון|מאשר|אישור|yes|yep|yeah|ok|בסדר|סבבה|מוסכם)/i.test(
       String(text || "").trim()
@@ -679,7 +693,7 @@ wss.on("connection", (twilioWs, req) => {
     return "";
   };
 
-  const parseHours = (s) => {
+  const parseHoursRange = (s) => {
     // expects like "09:00-18:00" or "09:00–18:00"
     const m = String(s || "").match(/(\d{1,2}):(\d{2})\s*[-–]\s*(\d{1,2}):(\d{2})/);
     if (!m) return null;
@@ -691,66 +705,55 @@ wss.on("connection", (twilioWs, req) => {
     return { start: aH * 60 + aM, end: bH * 60 + bM };
   };
 
+  const parseBusinessHours = (s) => {
+    const raw = String(s || "");
+    if (!raw) return { weekday: null, friday: null };
+    const parts = raw
+      .split("|")
+      .map((p) => p.trim())
+      .filter(Boolean);
+    const weekday = parseHoursRange(parts[0] || "");
+    const friday = parseHoursRange(parts[1] || "") || weekday;
+    return { weekday, friday };
+  };
+
   const isAfterHours = () => {
     const hoursStr =
       getSetting("BUSINESS_HOURS", "") ||
       getSetting("HOURS", "") ||
       getSetting("WORKING_HOURS", "") ||
       "";
-    const parsed = parseHours(hoursStr);
-    if (!parsed) return false; // if unknown, do not force after-hours
+    const parsed = parseBusinessHours(hoursStr);
+    if (!parsed.weekday) return false; // if unknown, do not force after-hours
     // Use local time in TIME_ZONE
     const now = new Date();
     const parts = new Intl.DateTimeFormat("en-US", {
       timeZone: TIME_ZONE,
       hour12: false,
       hour: "2-digit",
-      minute: "2-digit"
+      minute: "2-digit",
+      weekday: "short"
     }).formatToParts(now);
     const hh = Number(parts.find((p) => p.type === "hour")?.value || 0);
     const mm = Number(parts.find((p) => p.type === "minute")?.value || 0);
+    const weekday = String(parts.find((p) => p.type === "weekday")?.value || "").toLowerCase();
     const cur = hh * 60 + mm;
-    return cur < parsed.start || cur > parsed.end;
+    if (weekday.startsWith("sat")) return true;
+    const useRange = weekday.startsWith("fri") ? parsed.friday : parsed.weekday;
+    if (!useRange) return false;
+    return cur < useRange.start || cur > useRange.end;
   };
 
   const buildFlowInstructions = (sayText, extra = []) => {
-    const baseStyle =
-      MB_BASE_STYLE && MB_BASE_STYLE.trim()
-        ? MB_BASE_STYLE.trim()
-        : "סגנון: נטע. תשובות קצרות, ענייניות, אנושיות. בלי חזרות מיותרות.";
-    const dnsRows = Array.isArray(SHEETS.doNotSay) ? SHEETS.doNotSay : [];
-    const doNotSayText = dnsRows
-      .map((r) => {
-        const a = String(r.forbidden_topic || "").trim();
-        const b = String(r.trigger_examples || "").trim();
-        const c = String(r.safe_response_he || "").trim();
-        const parts = [a && `נושא: ${a}`, b && `טריגרים: ${b}`, c && `תגובה בטוחה: ${c}`].filter(
-          Boolean
-        );
-        return parts.join(" | ");
-      })
-      .filter(Boolean)
-      .slice(0, 20)
-      .join("\n");
-    const rules = [
-      baseStyle,
-      "עברית בלבד. תמיד בלשון רבים וללא פנייה מגדרית.",
-      "זרימת שיחה ליניארית: בכל שלב שאלה אחת בלבד, להמתין למענה מלא לפני מעבר לשלב הבא.",
-      "לא לשאול שוב שאלה שכבר נענתה, ולא ליזום שאלות כלליות או איפוס שיחה.",
-      "הזרימה נקבעת לפי השלב והטקסט מהשיטס בלבד; אין להחליט על שלבים חדשים.",
-      "אין להמציא שמות, מספרים או פרטים שלא נאמרו או שלא קיימים בשיטס.",
-      "כאשר מציינים מספר טלפון, הקריאי ספרה־ספרה בלבד.",
-      "את חייבת להקריא בדיוק את הטקסט שמופיע תחת SAY מילה במילה, בלי להוסיף כלום.",
-      doNotSayText ? `DO_NOT_SAY (כללים מחייבים):\n${doNotSayText}` : ""
-    ].filter(Boolean);
-    if (!sayText) {
-      return buildFlowInstructions(FALLBACK_EMPTY_INSTRUCTIONS);
-    }
-    const say = `SAY:\n${sayText}`;
-    return [...rules, ...extra.filter(Boolean), say].filter(Boolean).join("\n\n").trim();
+    const baseText = String(sayText || "").trim() || FALLBACK_EMPTY_INSTRUCTIONS;
+    const fullText = [...extra.filter(Boolean), baseText].filter(Boolean).join(" ").trim();
+    return (
+      "תגידי עכשיו בדיוק את הטקסט הבא, מילה במילה, ללא תוספות, ללא ניסוח מחדש וללא שאלות נוספות מעבר למה שכתוב:\n" +
+      fullText
+    );
   };
 
-  const getFlowText = (key) => String(getSetting(key, "") || "").trim();
+  const getFlowText = (key) => String(getText(key) || "").trim();
   const getFlowTextOrFallback = (key, fallback) => getFlowText(key) || fallback;
 
   const renderFlowText = (template, vars = {}) => {
@@ -816,6 +819,7 @@ wss.on("connection", (twilioWs, req) => {
     if (phoneCandidate) {
       t = t.replace(phoneCandidate, "").trim();
     }
+    t = t.replace(/[.,!?;:"'(){}\[\]\-–—]/g, " ").replace(/\s+/g, " ").trim();
     const lowered = t.toLowerCase();
     const nameMarkers = ["השם שלי", "קוראים לי", "שמי", "אני"];
     for (const marker of nameMarkers) {
@@ -828,11 +832,24 @@ wss.on("connection", (twilioWs, req) => {
     t = t.replace(/[0-9]/g, "").replace(/\s+/g, " ").trim();
     if (!t || t.length < 2 || t.length > 40) return "";
     const filler = ["תודה", "אוקיי", "אוקי", "כן", "לא", "ביי", "שלום", "בסדר", "סבבה"];
-    if (filler.includes(t)) return "";
+    const lowerClean = t.toLowerCase();
+    if (filler.includes(lowerClean)) return "";
     const parts = t.split(" ").filter(Boolean);
     if (parts.length > 5) return "";
     if (!/[A-Za-z\u0590-\u05FF]/.test(t)) return "";
     return t;
+  };
+
+  const extractMessageTarget = (text) => {
+    let t = String(text || "").trim();
+    if (!t) return "";
+    t = t.replace(/[.,!?;:"'(){}\[\]\-–—]/g, " ").replace(/\s+/g, " ").trim();
+    if (!t) return "";
+    if (t.startsWith("ל")) {
+      t = t.slice(1).trim();
+    }
+    const parts = t.split(/\s+/).filter(Boolean);
+    return parts[0] ? parts[0].trim() : "";
   };
 
   const isExplicitNamePhrase = (text) =>
@@ -854,15 +871,6 @@ wss.on("connection", (twilioWs, req) => {
     if (/פגום|שבור|קרוע/.test(t)) return "נזק במשלוח";
     if (/תיאום|תאריך|שעה/.test(t)) return "תיאום משלוח";
     return "";
-  };
-
-  const isLikelyProductReference = (text) => {
-    const t = String(text || "").trim();
-    if (!t) return false;
-    if (extractBrandModel(t).brand || extractBrandModel(t).model) return true;
-    if (/\b[א-תA-Za-z]{2,}\s*\d{1,}\b/.test(t)) return true;
-    if (/(הליכון|אופני|אופניים|אליפטיקל|אליפטי|חתירה|מולטיטול|סמית|קרוס|משקולות|ספסל|סטפר|מתקן|מכשיר)/.test(t)) return true;
-    return false;
   };
 
   const buildSummary = () => {
@@ -927,6 +935,77 @@ wss.on("connection", (twilioWs, req) => {
     if (!callerRaw) return "";
     const digits = normalizePhoneDigits(callerRaw);
     return isValidPhoneDigits(digits) ? digits : "";
+  };
+
+  const isRouteComplete = (routeName, data, phoneConfirmed) => {
+    const hasText = (v) => String(v || "").trim() !== "";
+    const hasPhone = phoneConfirmed && isValidPhoneDigits(data.callback_phone);
+    if (routeName === "sales") {
+      return hasText(data.product_type) && hasText(data.full_name) && hasPhone;
+    }
+    if (routeName === "support") {
+      return (
+        hasText(data.issue_desc) &&
+        hasText(data.product_brand) &&
+        hasText(data.product_model) &&
+        hasText(data.full_name) &&
+        hasPhone
+      );
+    }
+    if (routeName === "delivery") {
+      return hasText(data.delivery_desc) && hasText(data.full_name) && hasPhone;
+    }
+    if (routeName === "message") {
+      return (
+        hasText(data.message_target) &&
+        hasText(data.message_body) &&
+        hasText(data.full_name) &&
+        hasPhone
+      );
+    }
+    return false;
+  };
+
+  const getNextMissingStage = (routeName, data, phoneConfirmed) => {
+    const hasText = (v) => String(v || "").trim() !== "";
+    const callerDigits = ensureCallerDigits();
+    const getPhoneStage = () => {
+      if (phoneConfirmed) return "";
+      if (callerDigits) return `${routeName}_phone_confirm`;
+      if (isValidPhoneDigits(data.callback_phone)) return `${routeName}_phone_confirm_new`;
+      return `${routeName}_phone_collect`;
+    };
+    if (routeName === "sales") {
+      if (!hasText(data.product_type)) return "sales_product";
+      if (!hasText(data.full_name)) return "sales_name";
+      return getPhoneStage();
+    }
+    if (routeName === "support") {
+      if (!hasText(data.issue_desc)) return "support_issue_desc";
+      if (!hasText(data.product_brand) || !hasText(data.product_model)) return "support_product";
+      if (!hasText(data.full_name)) return "support_name";
+      return getPhoneStage();
+    }
+    if (routeName === "delivery") {
+      if (!hasText(data.delivery_desc)) return "delivery_desc";
+      if (!hasText(data.full_name)) return "delivery_name";
+      return getPhoneStage();
+    }
+    if (routeName === "message") {
+      if (!hasText(data.message_target)) return "message_target";
+      if (!hasText(data.full_name)) return "message_name";
+      if (!hasText(data.message_body)) return "message_body";
+      return getPhoneStage();
+    }
+    return "routing";
+  };
+
+  const advanceToDoneIfComplete = (routeName, doneStage) => {
+    if (isRouteComplete(routeName, flowState.data, flowState.phoneConfirmed)) {
+      return advanceStage(doneStage);
+    }
+    const nextStage = getNextMissingStage(routeName, flowState.data, flowState.phoneConfirmed);
+    return advanceStage(nextStage);
   };
 
   const buildFinalPayload = () => {
@@ -1036,6 +1115,7 @@ wss.on("connection", (twilioWs, req) => {
         finalSafetyTimer = setTimeout(async () => {
           if (sentCallEnded || flowState.finalPayloadSent) return;
           if (!flowState.finalEvent) return;
+          if (!isRouteComplete(flowState.route, flowState.data, flowState.phoneConfirmed)) return;
           endedAt = endedAt || nowIso();
           const payload = applyWebhookDefaults(buildFinalPayload());
           let sent = false;
@@ -1053,7 +1133,7 @@ wss.on("connection", (twilioWs, req) => {
           }
           if (!hangupRequested) {
             hangupRequested = true;
-            completeTwilioCall(callSid);
+            await attemptHangup(callSid);
           }
           try {
             if (openaiWs) openaiWs.close();
@@ -1180,12 +1260,16 @@ wss.on("connection", (twilioWs, req) => {
       flowState.finalEvent = "sales_lead";
       flowState.finalSummary = "התעניינות במוצר";
       flowState.shouldHangup = true;
-      return buildFlowInstructions(
+      const finalSay = [
         getFlowTextOrFallback(
           "FLOW_SALES_DONE",
           "מעולה. העברתי את הפרטים למחלקת המכירות, ויחזרו אליכם בהקדם. תודה רבה ויום טוב."
-        )
-      );
+        ),
+        getFlowText("CLOSING_SCRIPT")
+      ]
+        .filter(Boolean)
+        .join(" ");
+      return buildFlowInstructions(finalSay);
     }
     if (flowState.stage === "support_issue_desc") {
       return buildFlowInstructions(
@@ -1264,16 +1348,19 @@ wss.on("connection", (twilioWs, req) => {
           number: spaced
         });
         if (supplierText) {
-          extra.push(`תגידי לפני הסיום: ${supplierText}`);
+          extra.push(supplierText);
         }
       }
-      return buildFlowInstructions(
+      const finalSay = [
         getFlowTextOrFallback(
           "FLOW_SUPPORT_DONE",
           "מעולה. שלחתי את הפרטים למחלקת השירות, ויחזרו אליכם בהקדם. תודה רבה ויום טוב."
         ),
-        extra
-      );
+        getFlowText("CLOSING_SCRIPT")
+      ]
+        .filter(Boolean)
+        .join(" ");
+      return buildFlowInstructions(finalSay, extra);
     }
     if (flowState.stage === "delivery_name") {
       flowState.afterHours = isAfterHours();
@@ -1358,12 +1445,16 @@ wss.on("connection", (twilioWs, req) => {
       flowState.finalEvent = "delivery_ticket";
       flowState.finalSummary = "פניית אספקה/משלוח";
       flowState.shouldHangup = true;
-      return buildFlowInstructions(
+      const finalSay = [
         getFlowTextOrFallback(
           "FLOW_DELIVERY_DONE",
           "תודה. העברתי את הפרטים למחלקת אספקה, ויחזרו אליכם בהקדם. יום טוב."
-        )
-      );
+        ),
+        getFlowText("CLOSING_SCRIPT")
+      ]
+        .filter(Boolean)
+        .join(" ");
+      return buildFlowInstructions(finalSay);
     }
     if (flowState.stage === "message_target") {
       return buildFlowInstructions(
@@ -1433,7 +1524,7 @@ wss.on("connection", (twilioWs, req) => {
       flowState.finalEvent = "message_taken";
       flowState.finalSummary = `הודעה עבור ${flowState.data.message_target || "הצוות"}`;
       flowState.shouldHangup = true;
-      return buildFlowInstructions(
+      const finalSay = [
         renderFlowText(
           getFlowTextOrFallback(
             "FLOW_MESSAGE_DONE",
@@ -1442,8 +1533,12 @@ wss.on("connection", (twilioWs, req) => {
           {
             target: flowState.data.message_target || "הצוות"
           }
-        )
-      );
+        ),
+        getFlowText("CLOSING_SCRIPT")
+      ]
+        .filter(Boolean)
+        .join(" ");
+      return buildFlowInstructions(finalSay);
     }
     return buildFlowInstructions(
       getFlowTextOrFallback("FLOW_FALLBACK", FALLBACK_EMPTY_INSTRUCTIONS)
@@ -1493,10 +1588,14 @@ wss.on("connection", (twilioWs, req) => {
         );
       }
       flowState.data.full_name = nameCandidate;
+      const callerDigits = ensureCallerDigits();
+      if (callerDigits) {
+        return advanceStage("sales_phone_confirm");
+      }
       if (isValidPhoneDigits(flowState.data.callback_phone)) {
         return advanceStage("sales_phone_confirm_new");
       }
-      return advanceStage("sales_phone_confirm");
+      return advanceStage("sales_phone_collect");
     }
     if (flowState.stage === "sales_phone_confirm") {
       const callerDigits = ensureCallerDigits();
@@ -1507,7 +1606,7 @@ wss.on("connection", (twilioWs, req) => {
         }
         flowState.data.callback_phone = callerDigits;
         flowState.phoneConfirmed = true;
-        return advanceStage("sales_done");
+        return advanceToDoneIfComplete(flowState.route, "sales_done");
       }
       if (isNo(text) || !callerDigits) {
         flowState.phoneConfirmed = false;
@@ -1537,7 +1636,7 @@ wss.on("connection", (twilioWs, req) => {
         }
         flowState.data.callback_phone = String(flowState.data.callback_phone || "");
         flowState.phoneConfirmed = true;
-        return advanceStage("sales_done");
+        return advanceToDoneIfComplete(flowState.route, "sales_done");
       }
       flowState.phoneConfirmed = false;
       return advanceStage("sales_phone_collect");
@@ -1550,11 +1649,7 @@ wss.on("connection", (twilioWs, req) => {
       const { brand, model } = extractBrandModel(text);
       if (brand) flowState.data.product_brand = brand;
       if (model) flowState.data.product_model = model;
-      if (
-        flowState.data.product_brand ||
-        flowState.data.product_model ||
-        isLikelyProductReference(text)
-      ) {
+      if (brand && model) {
         return advanceStage("support_name");
       }
       return advanceStage("support_product");
@@ -1563,7 +1658,16 @@ wss.on("connection", (twilioWs, req) => {
       const { brand, model } = extractBrandModel(text);
       flowState.data.product_brand = brand || flowState.data.product_brand;
       flowState.data.product_model = model || flowState.data.product_model;
-      return advanceStage("support_name");
+      if (flowState.data.product_brand && flowState.data.product_model) {
+        return advanceStage("support_name");
+      }
+      return advanceStage(
+        flowState.stage,
+        getFlowTextOrFallback(
+          "FLOW_SUPPORT_PRODUCT",
+          "ועל איזה מוצר זה? דגם ושם מותג."
+        )
+      );
     }
     if (flowState.stage === "support_name") {
       const nameCandidate = extractNameCandidate(text);
@@ -1578,10 +1682,14 @@ wss.on("connection", (twilioWs, req) => {
         );
       }
       flowState.data.full_name = nameCandidate;
+      const callerDigits = ensureCallerDigits();
+      if (callerDigits) {
+        return advanceStage("support_phone_confirm");
+      }
       if (isValidPhoneDigits(flowState.data.callback_phone)) {
         return advanceStage("support_phone_confirm_new");
       }
-      return advanceStage("support_phone_confirm");
+      return advanceStage("support_phone_collect");
     }
     if (flowState.stage === "support_phone_confirm") {
       const callerDigits = ensureCallerDigits();
@@ -1592,7 +1700,7 @@ wss.on("connection", (twilioWs, req) => {
         }
         flowState.data.callback_phone = callerDigits;
         flowState.phoneConfirmed = true;
-        return advanceStage("support_done");
+        return advanceToDoneIfComplete(flowState.route, "support_done");
       }
       if (isNo(text) || !callerDigits) {
         flowState.phoneConfirmed = false;
@@ -1622,7 +1730,7 @@ wss.on("connection", (twilioWs, req) => {
         }
         flowState.data.callback_phone = String(flowState.data.callback_phone || "");
         flowState.phoneConfirmed = true;
-        return advanceStage("support_done");
+        return advanceToDoneIfComplete(flowState.route, "support_done");
       }
       flowState.phoneConfirmed = false;
       return advanceStage("support_phone_collect");
@@ -1641,10 +1749,14 @@ wss.on("connection", (twilioWs, req) => {
         );
       }
       flowState.data.full_name = nameCandidate;
+      const callerDigits = ensureCallerDigits();
+      if (callerDigits) {
+        return advanceStage("delivery_phone_confirm");
+      }
       if (isValidPhoneDigits(flowState.data.callback_phone)) {
         return advanceStage("delivery_phone_confirm_new");
       }
-      return advanceStage("delivery_phone_confirm");
+      return advanceStage("delivery_phone_collect");
     }
     if (flowState.stage === "delivery_desc") {
       flowState.data.delivery_desc = text;
@@ -1662,7 +1774,7 @@ wss.on("connection", (twilioWs, req) => {
         }
         flowState.data.callback_phone = callerDigits;
         flowState.phoneConfirmed = true;
-        return advanceStage("delivery_done");
+        return advanceToDoneIfComplete(flowState.route, "delivery_done");
       }
       if (isNo(text) || !callerDigits) {
         flowState.phoneConfirmed = false;
@@ -1692,13 +1804,23 @@ wss.on("connection", (twilioWs, req) => {
         }
         flowState.data.callback_phone = String(flowState.data.callback_phone || "");
         flowState.phoneConfirmed = true;
-        return advanceStage("delivery_done");
+        return advanceToDoneIfComplete(flowState.route, "delivery_done");
       }
       flowState.phoneConfirmed = false;
       return advanceStage("delivery_phone_collect");
     }
     if (flowState.stage === "message_target") {
-      flowState.data.message_target = text;
+      const target = extractMessageTarget(text);
+      if (!target) {
+        return advanceStage(
+          flowState.stage,
+          getFlowTextOrFallback(
+            "FLOW_MESSAGE_TARGET",
+            "בשמחה. למי מיועדת ההודעה? (שם עובד/מנהל)"
+          )
+        );
+      }
+      flowState.data.message_target = target;
       return advanceStage("message_name");
     }
     if (flowState.stage === "message_name") {
@@ -1714,14 +1836,18 @@ wss.on("connection", (twilioWs, req) => {
         );
       }
       flowState.data.full_name = nameCandidate;
-      if (isValidPhoneDigits(flowState.data.callback_phone)) {
-        return advanceStage("message_phone_confirm_new");
-      }
       return advanceStage("message_body");
     }
     if (flowState.stage === "message_body") {
       flowState.data.message_body = text;
-      return advanceStage("message_phone_confirm");
+      const callerDigits = ensureCallerDigits();
+      if (callerDigits) {
+        return advanceStage("message_phone_confirm");
+      }
+      if (isValidPhoneDigits(flowState.data.callback_phone)) {
+        return advanceStage("message_phone_confirm_new");
+      }
+      return advanceStage("message_phone_collect");
     }
     if (flowState.stage === "message_phone_confirm") {
       const callerDigits = ensureCallerDigits();
@@ -1732,7 +1858,7 @@ wss.on("connection", (twilioWs, req) => {
         }
         flowState.data.callback_phone = callerDigits;
         flowState.phoneConfirmed = true;
-        return advanceStage("message_done");
+        return advanceToDoneIfComplete(flowState.route, "message_done");
       }
       if (isNo(text) || !callerDigits) {
         flowState.phoneConfirmed = false;
@@ -1762,7 +1888,7 @@ wss.on("connection", (twilioWs, req) => {
         }
         flowState.data.callback_phone = String(flowState.data.callback_phone || "");
         flowState.phoneConfirmed = true;
-        return advanceStage("message_done");
+        return advanceToDoneIfComplete(flowState.route, "message_done");
       }
       flowState.phoneConfirmed = false;
       return advanceStage("message_phone_collect");
@@ -2052,9 +2178,7 @@ wss.on("connection", (twilioWs, req) => {
       type: "response.create",
       response: {
         modalities: ["audio", "text"],
-        instructions:
-          `תגידי עכשיו בדיוק את המשפט הבא מילה במילה, ללא תוספות וללא שאלות:\n` +
-          `${openingScript}`
+        instructions: buildFlowInstructions(openingScript)
       }
     });
 
@@ -2286,6 +2410,9 @@ wss.on("connection", (twilioWs, req) => {
         !sentCallEnded &&
         !flowState.finalPayloadSent
       ) {
+        if (!isRouteComplete(flowState.route, flowState.data, flowState.phoneConfirmed)) {
+          return;
+        }
         sentCallEnded = true;
         flowState.finalPayloadSent = true;
         if (finalSafetyTimer) {
@@ -2297,7 +2424,7 @@ wss.on("connection", (twilioWs, req) => {
         await sendWebhookEvent(flowState.finalEvent, payload, { wait_for_recording: true });
         if (!hangupRequested) {
           hangupRequested = true;
-          completeTwilioCall(callSid);
+          await attemptHangup(callSid);
         }
         try {
           if (openaiWs) openaiWs.close();
@@ -2405,7 +2532,12 @@ wss.on("connection", (twilioWs, req) => {
       endedAt = nowIso();
 
       if (!sentCallEnded && !flowState.finalPayloadSent) {
-        if (!flowState.stage.endsWith("_done")) {
+        const routeComplete = isRouteComplete(
+          flowState.route,
+          flowState.data,
+          flowState.phoneConfirmed
+        );
+        if (!flowState.stage.endsWith("_done") || !routeComplete) {
           sentCallEnded = true;
           sentCallAbandoned = true;
           const payload = applyWebhookDefaults(buildFinalPayload());
@@ -2416,7 +2548,7 @@ wss.on("connection", (twilioWs, req) => {
           } catch (_) {}
           if (!hangupRequested) {
             hangupRequested = true;
-            completeTwilioCall(callSid);
+            await attemptHangup(callSid);
           }
           try {
             if (openaiWs) openaiWs.close();
@@ -2462,7 +2594,7 @@ wss.on("connection", (twilioWs, req) => {
         await sendWebhookEvent(finalEvent, payload, { wait_for_recording: true });
         if (!hangupRequested) {
           hangupRequested = true;
-          completeTwilioCall(callSid);
+          await attemptHangup(callSid);
         }
       }
       try {
@@ -2512,7 +2644,7 @@ wss.on("connection", (twilioWs, req) => {
     }
     if (!hangupRequested && (flowState.finalPayloadSent || sentCallEnded)) {
       hangupRequested = true;
-      completeTwilioCall(callSid);
+      attemptHangup(callSid);
     }
     try {
       if (openaiWs) openaiWs.close();
