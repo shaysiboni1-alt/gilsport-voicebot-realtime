@@ -1444,6 +1444,10 @@ wss.on("connection", (twilioWs, req) => {
     }
     if (flowState.stage === "sales_name") {
       const nameCandidate = extractNameCandidate(text);
+      const phoneCandidate = extractPhoneCandidates(text);
+      if (phoneCandidate && !flowState.data.callback_phone) {
+        flowState.data.callback_phone = phoneCandidate;
+      }
       if (!nameCandidate) {
         return advanceStage(
           flowState.stage,
@@ -1525,6 +1529,10 @@ wss.on("connection", (twilioWs, req) => {
     }
     if (flowState.stage === "support_name") {
       const nameCandidate = extractNameCandidate(text);
+      const phoneCandidate = extractPhoneCandidates(text);
+      if (phoneCandidate && !flowState.data.callback_phone) {
+        flowState.data.callback_phone = phoneCandidate;
+      }
       if (!nameCandidate) {
         return advanceStage(
           flowState.stage,
@@ -1584,6 +1592,10 @@ wss.on("connection", (twilioWs, req) => {
     if (flowState.stage === "delivery_name") {
       flowState.data.after_hours = Boolean(flowState.afterHours);
       const nameCandidate = extractNameCandidate(text);
+      const phoneCandidate = extractPhoneCandidates(text);
+      if (phoneCandidate && !flowState.data.callback_phone) {
+        flowState.data.callback_phone = phoneCandidate;
+      }
       if (!nameCandidate) {
         return advanceStage(
           flowState.stage,
@@ -1653,6 +1665,10 @@ wss.on("connection", (twilioWs, req) => {
     }
     if (flowState.stage === "message_name") {
       const nameCandidate = extractNameCandidate(text);
+      const phoneCandidate = extractPhoneCandidates(text);
+      if (phoneCandidate && !flowState.data.callback_phone) {
+        flowState.data.callback_phone = phoneCandidate;
+      }
       if (!nameCandidate) {
         return advanceStage(
           flowState.stage,
@@ -1660,9 +1676,6 @@ wss.on("connection", (twilioWs, req) => {
         );
       }
       flowState.data.full_name = nameCandidate;
-      if (isValidPhoneDigits(flowState.data.callback_phone)) {
-        return advanceStage("message_phone_confirm_new");
-      }
       return advanceStage("message_body");
     }
     if (flowState.stage === "message_body") {
