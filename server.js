@@ -75,7 +75,7 @@ const GOOGLE_SERVICE_ACCOUNT_JSON_B64 = process.env.GOOGLE_SERVICE_ACCOUNT_JSON_
 
 const MB_WEBHOOK_URL = process.env.MB_WEBHOOK_URL || "";
 const MB_FINAL_WEBHOOK_ONLY = envBool("MB_FINAL_WEBHOOK_ONLY", true);
-const MB_RECORDING_WAIT_MS = envNum("MB_RECORDING_WAIT_MS", 8000);
+const MB_RECORDING_WAIT_MS = envNum("MB_RECORDING_WAIT_MS", 25000);
 const MB_DEBUG = envBool("MB_DEBUG", false);
 
 const MB_VAD_THRESHOLD = envNum("MB_VAD_THRESHOLD", 0.65);
@@ -573,6 +573,7 @@ wss.on("connection", (twilioWs, req) => {
   let sentCallEnded = false;
   let sentCallAbandoned = false;
   let hangupRequested = false;
+  let finalSafetyTimer = null;
 
   // Proxy decision: dynamic response instructions (no FSM)
   let proxyInstructions = "";
@@ -1031,6 +1032,37 @@ wss.on("connection", (twilioWs, req) => {
         safeOpenAISend({ type: "response.cancel" });
         awaitingResponse = false;
       }
+      if (!finalSafetyTimer) {
+        finalSafetyTimer = setTimeout(async () => {
+          if (sentCallEnded || flowState.finalPayloadSent) return;
+          if (!flowState.finalEvent) return;
+          endedAt = endedAt || nowIso();
+          const payload = applyWebhookDefaults(buildFinalPayload());
+          let sent = false;
+          try {
+            sent = await sendWebhookEvent(flowState.finalEvent, payload, { wait_for_recording: true });
+          } catch (_) {
+            sent = false;
+          }
+          if (!sent) return;
+          sentCallEnded = true;
+          flowState.finalPayloadSent = true;
+          if (finalSafetyTimer) {
+            clearTimeout(finalSafetyTimer);
+            finalSafetyTimer = null;
+          }
+          if (!hangupRequested) {
+            hangupRequested = true;
+            completeTwilioCall(callSid);
+          }
+          try {
+            if (openaiWs) openaiWs.close();
+          } catch (_) {}
+          try {
+            if (twilioWs) twilioWs.close();
+          } catch (_) {}
+        }, 5000);
+      }
     }
     const result =
       typeof sayText === "string" ? buildFlowInstructions(sayText) : buildNextInstructions();
@@ -1246,6 +1278,12 @@ wss.on("connection", (twilioWs, req) => {
     if (flowState.stage === "delivery_name") {
       flowState.afterHours = isAfterHours();
       const carriers = flowState.afterHours ? buildCarrierList() : [];
+      const hoursStr =
+        getSetting("BUSINESS_HOURS", "") ||
+        getSetting("HOURS", "") ||
+        getSetting("WORKING_HOURS", "") ||
+        "";
+      debug(`[${connTag}] delivery_name afterHours=${flowState.afterHours} carriers=${carriers.length} hoursStr=${hoursStr}`);
       const afterHoursText =
         flowState.afterHours && carriers.length
           ? renderFlowText(
@@ -1676,6 +1714,9 @@ wss.on("connection", (twilioWs, req) => {
         );
       }
       flowState.data.full_name = nameCandidate;
+      if (isValidPhoneDigits(flowState.data.callback_phone)) {
+        return advanceStage("message_phone_confirm_new");
+      }
       return advanceStage("message_body");
     }
     if (flowState.stage === "message_body") {
@@ -2247,6 +2288,10 @@ wss.on("connection", (twilioWs, req) => {
       ) {
         sentCallEnded = true;
         flowState.finalPayloadSent = true;
+        if (finalSafetyTimer) {
+          clearTimeout(finalSafetyTimer);
+          finalSafetyTimer = null;
+        }
         endedAt = endedAt || nowIso();
         const payload = applyWebhookDefaults(buildFinalPayload());
         await sendWebhookEvent(flowState.finalEvent, payload, { wait_for_recording: true });
@@ -2362,6 +2407,13 @@ wss.on("connection", (twilioWs, req) => {
       if (!sentCallEnded && !flowState.finalPayloadSent) {
         if (!flowState.stage.endsWith("_done")) {
           sentCallEnded = true;
+          sentCallAbandoned = true;
+          const payload = applyWebhookDefaults(buildFinalPayload());
+          payload.stage = flowState.stage;
+          payload.route = flowState.route;
+          try {
+            await sendWebhookEvent("call_abandoned", payload, { wait_for_recording: false });
+          } catch (_) {}
           if (!hangupRequested) {
             hangupRequested = true;
             completeTwilioCall(callSid);
