@@ -828,6 +828,8 @@ wss.on("connection", (twilioWs, req) => {
     if (!t || t.length < 2 || t.length > 40) return "";
     const filler = ["תודה", "אוקיי", "אוקי", "כן", "לא", "ביי", "שלום", "בסדר", "סבבה"];
     if (filler.includes(t)) return "";
+    const parts = t.split(" ").filter(Boolean);
+    if (parts.length > 5) return "";
     if (!/[A-Za-z\u0590-\u05FF]/.test(t)) return "";
     return t;
   };
@@ -851,6 +853,15 @@ wss.on("connection", (twilioWs, req) => {
     if (/פגום|שבור|קרוע/.test(t)) return "נזק במשלוח";
     if (/תיאום|תאריך|שעה/.test(t)) return "תיאום משלוח";
     return "";
+  };
+
+  const isLikelyProductReference = (text) => {
+    const t = String(text || "").trim();
+    if (!t) return false;
+    if (extractBrandModel(t).brand || extractBrandModel(t).model) return true;
+    if (/\b[א-תA-Za-z]{2,}\s*\d{1,}\b/.test(t)) return true;
+    if (/(הליכון|אופני|אופניים|אליפטיקל|אליפטי|חתירה|מולטיטול|סמית|קרוס|משקולות|ספסל|סטפר|מתקן|מכשיר)/.test(t)) return true;
+    return false;
   };
 
   const buildSummary = () => {
@@ -1410,6 +1421,10 @@ wss.on("connection", (twilioWs, req) => {
   const processCallerUtterance = (utterance) => {
     const text = String(utterance || "").trim();
     if (!text) return "";
+    const inlinePhone = extractPhoneCandidates(text);
+    if (inlinePhone && !flowState.data.callback_phone) {
+      flowState.data.callback_phone = inlinePhone;
+    }
     if (isExplicitNamePhrase(text)) {
       const nameCandidate = extractNameCandidate(text);
       if (nameCandidate) {
@@ -1440,6 +1455,9 @@ wss.on("connection", (twilioWs, req) => {
         );
       }
       flowState.data.full_name = nameCandidate;
+      if (isValidPhoneDigits(flowState.data.callback_phone)) {
+        return advanceStage("sales_phone_confirm_new");
+      }
       return advanceStage("sales_phone_confirm");
     }
     if (flowState.stage === "sales_phone_confirm") {
@@ -1491,6 +1509,16 @@ wss.on("connection", (twilioWs, req) => {
       if (!flowState.data.issue_topic) {
         flowState.data.issue_topic = extractIssueTopic(text);
       }
+      const { brand, model } = extractBrandModel(text);
+      if (brand) flowState.data.product_brand = brand;
+      if (model) flowState.data.product_model = model;
+      if (
+        flowState.data.product_brand ||
+        flowState.data.product_model ||
+        isLikelyProductReference(text)
+      ) {
+        return advanceStage("support_name");
+      }
       return advanceStage("support_product");
     }
     if (flowState.stage === "support_product") {
@@ -1512,6 +1540,9 @@ wss.on("connection", (twilioWs, req) => {
         );
       }
       flowState.data.full_name = nameCandidate;
+      if (isValidPhoneDigits(flowState.data.callback_phone)) {
+        return advanceStage("support_phone_confirm_new");
+      }
       return advanceStage("support_phone_confirm");
     }
     if (flowState.stage === "support_phone_confirm") {
@@ -1572,6 +1603,9 @@ wss.on("connection", (twilioWs, req) => {
         );
       }
       flowState.data.full_name = nameCandidate;
+      if (isValidPhoneDigits(flowState.data.callback_phone)) {
+        return advanceStage("delivery_phone_confirm_new");
+      }
       return advanceStage("delivery_phone_confirm");
     }
     if (flowState.stage === "delivery_desc") {
@@ -1838,7 +1872,7 @@ wss.on("connection", (twilioWs, req) => {
   // finishes speaking, we temporarily ignore any resulting transcripts.
   let isFlushingBufferedAudio = false;
 
-  const requestAssistantResponse = (reason = "") => {
+  const requestAssistantResponse = async (reason = "") => {
     // Only send a response if the OpenAI WS is ready
     if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN) return;
 
@@ -1869,6 +1903,7 @@ wss.on("connection", (twilioWs, req) => {
     }
 
     // Reset flags: we're starting a new response now
+    await sleep(250);
     awaitingResponse = true;
     pendingResponseRequest = false;
     if (flowState.doneLocked) {
