@@ -7,10 +7,14 @@
  reduce reliance on an explicit state machine while still following
  the required conversation flows. The bot reads prompts and settings
  from a Google Sheet (designated by GSHEET_ID) and uses OpenAI
- Realtime for speech recognition and synthesis. All critical
- behaviours (tone, voice, speaking rate, VAD settings, etc.) are
- controlled via environment variables so they can be adjusted in
- Render without code changes.
+ Realtime for speech recognition and synthesis.
+
+ IMPORTANT FIX (voice/style/speaking-rate bug):
+ The current OpenAI Realtime Session API for the model you use rejects:
+ - session.voice_style
+ - session.speaking_rate
+ If you send them, you get: unknown_parameter, the WS closes, and you hear no voice.
+ Therefore: we keep the ENV vars for future use, but we DO NOT send them in session.update.
 */
 
 require("dotenv").config();
@@ -19,7 +23,6 @@ const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
 const { google } = require("googleapis");
-const crypto = require("crypto");
 
 // Helper functions to parse environment variables.
 const envNum = (k, d) => {
@@ -65,7 +68,7 @@ const OPENAI_VOICE_STYLE = process.env.OPENAI_VOICE_STYLE || "";
 
 // Speaking rate (1.0 = normal speed).
 // NOTE: Current OpenAI Realtime session API for this model rejects session.speaking_rate (unknown_parameter).
-// IMPORTANT FIX: If ENV is missing/invalid -> return null (NOT 1.0), so we don't accidentally send it.
+// IMPORTANT: If ENV is missing/invalid -> return null (NOT 1.0), so we don't accidentally send it.
 const OPENAI_SPEAKING_RATE = (() => {
   const raw = String(process.env.OPENAI_SPEAKING_RATE || "").trim();
   if (!raw) return null;
@@ -147,10 +150,7 @@ async function loadSheets() {
   if (!GSHEET_ID || !GOOGLE_SERVICE_ACCOUNT_JSON_B64) return;
   try {
     const json = JSON.parse(
-      Buffer.from(
-        GOOGLE_SERVICE_ACCOUNT_JSON_B64,
-        "base64"
-      ).toString("utf8")
+      Buffer.from(GOOGLE_SERVICE_ACCOUNT_JSON_B64, "base64").toString("utf8")
     );
     const auth = new google.auth.JWT({
       email: json.client_email,
@@ -170,6 +170,7 @@ async function loadSheets() {
       ]
     });
     const valueRanges = res.data.valueRanges || [];
+
     const toObj = (rows) => {
       const out = {};
       if (!rows.length) return out;
@@ -177,53 +178,25 @@ async function loadSheets() {
       rows.forEach((r) => {
         const obj = {};
         headers.forEach((h, i) => (obj[h] = r[i] || ""));
-        if (obj.key && obj.value)
-          out[String(obj.key).trim()] = String(obj.value);
+        if (obj.key && obj.value) out[String(obj.key).trim()] = String(obj.value);
       });
       return out;
     };
-    // Convert an array of rows into an array of objects using the first row as headers.
-    const toArr = (rows) => {
-      const copy = rows.map((r) => r.slice());
-      if (!copy.length) return [];
-      const headers = copy
-        .shift()
-        .map((h) => String(h || "").trim());
-      return copy
-        .map((r) => {
-          const obj = {};
-          headers.forEach((h, i) => (obj[h] = r[i] || ""));
-          return obj;
-        })
-        .filter((o) =>
-          Object.values(o).some((v) => String(v || "").trim())
-        );
-    };
-    const promptsRange = valueRanges.find((vr) =>
-      vr.range.startsWith("PROMPTS!")
-    );
-    const settingsRange = valueRanges.find((vr) =>
-      vr.range.startsWith("SETTINGS!")
-    );
-    const kbFactsRange = valueRanges.find((vr) =>
-      vr.range.startsWith("KB_FACTS!")
-    );
-    const doNotSayRange = valueRanges.find((vr) =>
-      vr.range.startsWith("DO_NOT_SAY!")
-    );
+
+    const promptsRange = valueRanges.find((vr) => vr.range.startsWith("PROMPTS!"));
+    const settingsRange = valueRanges.find((vr) => vr.range.startsWith("SETTINGS!"));
+    const kbFactsRange = valueRanges.find((vr) => vr.range.startsWith("KB_FACTS!"));
+    const doNotSayRange = valueRanges.find((vr) => vr.range.startsWith("DO_NOT_SAY!"));
     const suppliersRange = valueRanges.find((vr) =>
       vr.range.startsWith("SUPPLIERS_IMPORTERS!")
     );
     const deliveryRange = valueRanges.find((vr) =>
       vr.range.startsWith("DELIVERY_CONTACTS!")
     );
+
     // Build prompts dictionary
     const prompts = {};
-    if (
-      promptsRange &&
-      promptsRange.values &&
-      promptsRange.values.length
-    ) {
+    if (promptsRange && promptsRange.values && promptsRange.values.length) {
       const headers = promptsRange.values[0];
       const idIdx = headers.indexOf("prompt_id");
       const contentIdx = headers.indexOf("content_he");
@@ -233,23 +206,22 @@ async function loadSheets() {
         if (pid && text) prompts[pid] = text;
       });
     }
+
     // Build settings map
-    const settings = toObj(
-      (settingsRange?.values || []).map((r) => r.slice())
-    );
+    const settings = toObj((settingsRange?.values || []).map((r) => r.slice()));
+
     // Build other tables
     const rowsToObjects = (range) => {
       const vals = (range?.values || []).map((r) => r.slice());
       if (!vals.length) return [];
-      const headers = vals.shift().map((h) =>
-        String(h || "").trim()
-      );
+      const headers = vals.shift().map((h) => String(h || "").trim());
       return vals.map((r) => {
         const o = {};
         headers.forEach((h, i) => (o[h] = r[i] || ""));
         return o;
       });
     };
+
     SHEETS = {
       loaded_at: new Date().toISOString(),
       prompts,
@@ -259,10 +231,9 @@ async function loadSheets() {
       suppliersImporters: rowsToObjects(suppliersRange),
       deliveryContacts: rowsToObjects(deliveryRange)
     };
+
     console.log(
-      `[SHEETS] Loaded prompts=${Object.keys(prompts).length}, settings=${Object.keys(
-        settings
-      ).length}`
+      `[SHEETS] Loaded prompts=${Object.keys(prompts).length}, settings=${Object.keys(settings).length}`
     );
   } catch (e) {
     console.error("[SHEETS] Failed to load", e.message);
@@ -292,35 +263,33 @@ function buildDoNotSayText() {
 function normalizePhoneDigits(raw) {
   let text = String(raw || "");
   const wordToDigit = {
-    "אפס": "0",
-    "אחת": "1",
-    "אחד": "1",
-    "שתיים": "2",
-    "שתים": "2",
-    "שניים": "2",
-    "שנים": "2",
-    "שלוש": "3",
-    "שלושה": "3",
-    "ארבע": "4",
-    "ארבעה": "4",
-    "חמש": "5",
-    "חמישה": "5",
-    "שש": "6",
-    "שישה": "6",
-    "שבע": "7",
-    "שבעה": "7",
-    "שמונה": "8",
-    "תשע": "9",
-    "תשעה": "9"
+    אפס: "0",
+    אחת: "1",
+    אחד: "1",
+    שתיים: "2",
+    שתים: "2",
+    שניים: "2",
+    שנים: "2",
+    שלוש: "3",
+    שלושה: "3",
+    ארבע: "4",
+    ארבעה: "4",
+    חמש: "5",
+    חמישה: "5",
+    שש: "6",
+    שישה: "6",
+    שבע: "7",
+    שבעה: "7",
+    שמונה: "8",
+    תשע: "9",
+    תשעה: "9"
   };
   for (const [word, digit] of Object.entries(wordToDigit)) {
     text = text.replace(new RegExp(`\\b${word}\\b`, "g"), digit);
   }
   let digits = text.replace(/\D+/g, "");
-  if (digits.startsWith("972") && digits.length > 3)
-    digits = "0" + digits.slice(3);
-  if (digits.startsWith("0") && digits.length > 10)
-    digits = digits.slice(0, 10);
+  if (digits.startsWith("972") && digits.length > 3) digits = "0" + digits.slice(3);
+  if (digits.startsWith("0") && digits.length > 10) digits = digits.slice(0, 10);
   return digits;
 }
 function isValidPhoneDigits(d) {
@@ -345,20 +314,10 @@ function extractBrandModel(text) {
 // Identify route by keywords. Returns one of 'sales', 'support', 'delivery', 'message', or ''.
 function extractRoute(text) {
   const low = String(text || "").toLowerCase();
-  if (
-    /(אחריות|תקלה|בעיה|שירות|החלפה|החזרה|לא עובד|תקול)/.test(low)
-  )
-    return "support";
-  if (/(משלוח|אספקה|אספקת|שליח|הזמנה|הגיע|לא הגיע|מוביל)/.test(low))
-    return "delivery";
-  if (
-    /(מחיר|קנ[יא]|רכישה|מוצר|דגם|מידה|צבע|מלאי|מבצע)/.test(low)
-  )
-    return "sales";
-  if (
-    /(הודעה|מנהל|עובד|לחזור אלי|השארת הודעה)/.test(low)
-  )
-    return "message";
+  if (/(אחריות|תקלה|בעיה|שירות|החלפה|החזרה|לא עובד|תקול)/.test(low)) return "support";
+  if (/(משלוח|אספקה|אספקת|שליח|הזמנה|הגיע|לא הגיע|מוביל)/.test(low)) return "delivery";
+  if (/(מחיר|קנ[יא]|רכישה|מוצר|דגם|מידה|צבע|מלאי|מבצע)/.test(low)) return "sales";
+  if (/(הודעה|מנהל|עובד|לחזור אלי|השארת הודעה)/.test(low)) return "message";
   return "";
 }
 
@@ -369,16 +328,16 @@ function isAfterHours() {
     getSetting("HOURS", "") ||
     getSetting("WORKING_HOURS", "") ||
     "";
-  const m = String(hoursStr || "").match(
-    /(\d{1,2}):(\d{2})\s*[-–]\s*(\d{1,2}):(\d{2})/
-  );
+  const m = String(hoursStr || "").match(/(\d{1,2}):(\d{2})\s*[-–]\s*(\d{1,2}):(\d{2})/);
   if (!m) return false;
+
   const aH = Number(m[1]);
   const aM = Number(m[2]);
   const bH = Number(m[3]);
   const bM = Number(m[4]);
   const start = aH * 60 + aM;
   const end = bH * 60 + bM;
+
   const now = new Date();
   const parts = new Intl.DateTimeFormat("en-US", {
     timeZone: TIME_ZONE,
@@ -386,12 +345,9 @@ function isAfterHours() {
     hour: "2-digit",
     minute: "2-digit"
   }).formatToParts(now);
-  const hh = Number(
-    parts.find((p) => p.type === "hour")?.value || 0
-  );
-  const mm = Number(
-    parts.find((p) => p.type === "minute")?.value || 0
-  );
+
+  const hh = Number(parts.find((p) => p.type === "hour")?.value || 0);
+  const mm = Number(parts.find((p) => p.type === "minute")?.value || 0);
   const cur = hh * 60 + mm;
   return cur < start || cur > end;
 }
@@ -406,49 +362,47 @@ function buildInstructions(sayText, extra = []) {
     "בכל שלב יש לשאול שאלה אחת בלבד ולהמתין לתשובה מלאה.",
     doNotSayText ? `DO_NOT_SAY (כללים מחייבים):\n${doNotSayText}` : ""
   ].filter(Boolean);
+
   if (!sayText) return rules.join("\n\n").trim();
+
   return [...rules, ...extra.filter(Boolean), `SAY:\n${sayText}`]
     .filter(Boolean)
     .join("\n\n");
 }
 
-// Twilio recording helper. Builds a public URL for a call recording if
-// PUBLIC_BASE_URL is configured.
+// Twilio recording helper. Builds a public URL for a call recording if PUBLIC_BASE_URL is configured.
 function makeRecordingPublicUrl(callSid) {
   if (!PUBLIC_BASE_URL) return "";
   const base = String(PUBLIC_BASE_URL).replace(/\/$/, "");
   return callSid ? `${base}/recording/${callSid}` : "";
 }
 
-// Send a webhook event with JSON payload. Respects MB_FINAL_WEBHOOK_ONLY.
+// Send a webhook event with JSON payload.
 async function sendWebhookEvent(event, payload, opts = {}) {
   if (!MB_WEBHOOK_URL) return false;
   try {
-    const callSid =
-      payload && payload.callSid ? String(payload.callSid) : "";
+    const callSid = payload && payload.callSid ? String(payload.callSid) : "";
+
     // wait for recording if needed
-    if (
-      callSid &&
-      (opts.wait_for_recording || opts.waitForRecording)
-    ) {
-      await waitForRecording(
-        callSid,
-        envNum("MB_RECORDING_WAIT_MS", 8000)
-      );
+    if (callSid && (opts.wait_for_recording || opts.waitForRecording)) {
+      await waitForRecording(callSid, envNum("MB_RECORDING_WAIT_MS", 8000));
     }
+
     const recording_url_public =
-      payload.recording_url_public ||
-      makeRecordingPublicUrl(callSid);
+      payload.recording_url_public || makeRecordingPublicUrl(callSid);
+
     const body = JSON.stringify({
       event,
       ...payload,
       recording_url_public
     });
+
     const resp = await fetch(MB_WEBHOOK_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body
     });
+
     if (!resp.ok) {
       console.error("[WEBHOOK] non-200", event, resp.status);
     }
@@ -477,17 +431,13 @@ async function twilioHasRecording(callSid) {
     const listUrl = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Recordings.json?CallSid=${encodeURIComponent(
       callSid
     )}&PageSize=1`;
-    const auth = Buffer.from(
-      `${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`
-    ).toString("base64");
+    const auth = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64");
     const resp = await fetch(listUrl, {
       headers: { Authorization: `Basic ${auth}` }
     });
     if (!resp.ok) return false;
     const data = await resp.json();
-    return (
-      Array.isArray(data.recordings) && data.recordings.length > 0
-    );
+    return Array.isArray(data.recordings) && data.recordings.length > 0;
   } catch (_) {
     return false;
   }
@@ -523,11 +473,15 @@ app.post("/twilio-voice", (req, res) => {
   res
     .type("text/xml")
     .send(
-      `\n<Response>\n  <Connect>\n    <Stream url="${wsUrl}">\n      <Parameter name="caller" value="${
-        req.body.From || ""
-      }" />\n      <Parameter name="called" value="${
-        req.body.To || ""
-      }" />\n    </Stream>\n  </Connect>\n</Response>`.trim()
+      `
+<Response>
+  <Connect>
+    <Stream url="${wsUrl}">
+      <Parameter name="caller" value="${req.body.From || ""}" />
+      <Parameter name="called" value="${req.body.To || ""}" />
+    </Stream>
+  </Connect>
+</Response>`.trim()
     );
 });
 
@@ -556,6 +510,7 @@ wss.on("connection", (twilioWs, req) => {
   let lastCallerFinal = "";
   let lastBotFinal = "";
   let recognizedPhones = [];
+
   // Conversation data collected. Fields correspond to required info per route.
   const convo = {
     product_desc: "",
@@ -568,10 +523,11 @@ wss.on("connection", (twilioWs, req) => {
     full_name: "",
     callback_phone: ""
   };
+
   // Track whether we've given the user the importer phone number.
   let importerOffered = false;
-  // Stage indicates which piece of information we are currently collecting. It is not
-  // used as a rigid state machine but helps determine the next question.
+
+  // Stage indicates which piece of information we are currently collecting.
   let stage = "routing";
 
   // Helper to log messages if MB_DEBUG is on.
@@ -607,32 +563,20 @@ wss.on("connection", (twilioWs, req) => {
 
   // Determine the next question based on current route and collected data.
   function determineNextQuestion() {
-    // If route is not set, ask routing question
     if (!route) {
       stage = "routing";
-      return (
-        getPrompt("FLOW_ROUTING") ||
-        "איך אפשר לעזור לך היום?"
-      );
+      return getPrompt("FLOW_ROUTING") || "איך אפשר לעזור לך היום?";
     }
+
     if (route === "sales") {
-      // Ask for product description
       if (!convo.product_desc) {
         stage = "sales_product";
-        return (
-          getPrompt("FLOW_SALES_PRODUCT") ||
-          "איזה מוצר מעניין אותך?"
-        );
+        return getPrompt("FLOW_SALES_PRODUCT") || "איזה מוצר מעניין אותך?";
       }
-      // Ask for full name
       if (!convo.full_name) {
         stage = "sales_name";
-        return (
-          getPrompt("FLOW_SALES_NAME") ||
-          "מה שמך המלא בבקשה?"
-        );
+        return getPrompt("FLOW_SALES_NAME") || "מה שמך המלא בבקשה?";
       }
-      // Ask brand/model details if not provided
       if (!convo.product_brand) {
         stage = "sales_brand";
         return "האם יש מותג מסוים? אם כן – אנא ציין אותו";
@@ -641,221 +585,146 @@ wss.on("connection", (twilioWs, req) => {
         stage = "sales_model";
         return "האם יש דגם מסוים? אם כן – אנא ציין את הדגם";
       }
-      // Ask phone confirmation
+
       const callerDigits = normalizePhoneDigits(caller);
       if (callerDigits && !convo.callback_phone) {
         stage = "sales_phone_confirm";
-        // Insert price claim sentence and coupon code before the question
         const priceClaim = getSetting("PRICE_CLAIM_SENTENCE", "");
         const salesCoupon = getSetting("SALES_COUPON_CODE", "");
         let prefix = "";
         if (priceClaim) prefix += `${priceClaim}\n`;
-        if (salesCoupon)
-          prefix += `קוד הקופון שלנו הוא ${salesCoupon}\n`;
-        return `${prefix}${getPrompt(
-          "FLOW_SALES_PHONE_CONFIRM"
-        )}`;
+        if (salesCoupon) prefix += `קוד הקופון שלנו הוא ${salesCoupon}\n`;
+        return `${prefix}${getPrompt("FLOW_SALES_PHONE_CONFIRM") || "האם לחזור למספר המזוהה?"}`;
       }
-      // If caller phone not provided or declined, ask new phone
+
       if (!convo.callback_phone) {
         stage = "sales_phone_new";
-        return (
-          getPrompt("FLOW_SALES_PHONE_NEW") ||
-          "מה מספר הטלפון שלך?"
-        );
+        return getPrompt("FLOW_SALES_PHONE_NEW") || "מה מספר הטלפון שלך?";
       }
-      // Confirm new phone
-      if (
-        stage === "sales_phone_new" &&
-        !convo.phone_confirmed
-      ) {
+
+      if (stage === "sales_phone_new" && !convo.phone_confirmed) {
         stage = "sales_phone_confirm_new";
-        const spaced = formatSpacedDigits(
-          convo.callback_phone
-        );
-        const tpl =
-          getPrompt("FLOW_SALES_PHONE_CONFIRM_NEW") ||
-          "${number}";
+        const spaced = formatSpacedDigits(convo.callback_phone);
+        const tpl = getPrompt("FLOW_SALES_PHONE_CONFIRM_NEW") || "רק לוודא, המספר הוא: {number} ?";
         return tpl.replace("{number}", spaced);
       }
-      // Done
+
       stage = "sales_done";
-      return (
-        getPrompt("FLOW_SALES_DONE") ||
-        "תודה, נציג יחזור אליך בהקדם."
-      );
+      return getPrompt("FLOW_SALES_DONE") || "תודה, נציג יחזור אליך בהקדם.";
     }
+
     if (route === "support") {
       if (!convo.issue_desc) {
         stage = "support_issue";
-        return (
-          getPrompt("FLOW_SUPPORT_ISSUE") ||
-          "ספר לי בבקשה מה התקלה"
-        );
+        return getPrompt("FLOW_SUPPORT_ISSUE") || "ספרו בבקשה מה התקלה.";
       }
       if (!convo.product_model) {
         stage = "support_model";
-        return (
-          getPrompt("FLOW_SUPPORT_PRODUCT") ||
-          "מה הדגם של המוצר?"
-        );
+        return getPrompt("FLOW_SUPPORT_PRODUCT") || "מה הדגם של המוצר?";
       }
       if (!convo.product_brand) {
         stage = "support_brand";
-        return "האם אתה יודע מה המותג של המוצר?";
+        return "האם אתם יודעים מה המותג של המוצר?";
       }
       if (!convo.full_name) {
         stage = "support_name";
-        return (
-          getPrompt("FLOW_SUPPORT_NAME") ||
-          "מה שמך המלא?"
-        );
+        return getPrompt("FLOW_SUPPORT_NAME") || "מה שמכם המלא?";
       }
+
       const callerDigits = normalizePhoneDigits(caller);
       if (callerDigits && !convo.callback_phone) {
         stage = "support_phone_confirm";
-        return (
-          getPrompt("FLOW_SUPPORT_PHONE_CONFIRM") ||
-          "האם זה מספר הטלפון שלך?"
-        );
+        return getPrompt("FLOW_SUPPORT_PHONE_CONFIRM") || "האם זה מספר הטלפון שלכם?";
       }
+
       if (!convo.callback_phone) {
         stage = "support_phone_new";
-        return (
-          getPrompt("FLOW_SUPPORT_PHONE_NEW") ||
-          "מה מספר הטלפון שלך?"
-        );
+        return getPrompt("FLOW_SUPPORT_PHONE_NEW") || "מה מספר הטלפון שלכם?";
       }
-      if (
-        stage === "support_phone_new" &&
-        !convo.phone_confirmed
-      ) {
+
+      if (stage === "support_phone_new" && !convo.phone_confirmed) {
         stage = "support_phone_confirm_new";
-        const spaced = formatSpacedDigits(
-          convo.callback_phone
-        );
+        const spaced = formatSpacedDigits(convo.callback_phone);
         const tpl =
-          getPrompt("FLOW_SUPPORT_PHONE_CONFIRM_NEW") ||
-          "${number}";
+          getPrompt("FLOW_SUPPORT_PHONE_CONFIRM_NEW") || "רק לוודא, המספר הוא: {number} ?";
         return tpl.replace("{number}", spaced);
       }
+
       stage = "support_done";
-      return (
-        getPrompt("FLOW_SUPPORT_DONE") ||
-        "תודה, נציג יחזור אליך בקרוב."
-      );
+      return getPrompt("FLOW_SUPPORT_DONE") || "תודה, נציג יחזור אליכם בקרוב.";
     }
+
     if (route === "delivery") {
-      // special handling: if after hours and desc not yet given
       if (!convo.delivery_desc) {
         stage = "delivery_desc";
-        return (
-          getPrompt("FLOW_DELIVERY_DESC") ||
-          "מהו נושא הבקשה למשלוח?"
-        );
+        return getPrompt("FLOW_DELIVERY_DESC") || "מהו נושא הבקשה למשלוח?";
       }
       if (!convo.full_name) {
         stage = "delivery_name";
-        return (
-          getPrompt("FLOW_DELIVERY_NAME") ||
-          "מה שמך המלא?"
-        );
+        return getPrompt("FLOW_DELIVERY_NAME") || "מה שמכם המלא?";
       }
+
       const callerDigits = normalizePhoneDigits(caller);
       if (callerDigits && !convo.callback_phone) {
         stage = "delivery_phone_confirm";
-        return (
-          getPrompt("FLOW_DELIVERY_PHONE_CONFIRM") ||
-          "זה מספר הטלפון שלך?"
-        );
+        return getPrompt("FLOW_DELIVERY_PHONE_CONFIRM") || "זה מספר הטלפון שלכם?";
       }
+
       if (!convo.callback_phone) {
         stage = "delivery_phone_new";
-        return (
-          getPrompt("FLOW_DELIVERY_PHONE_NEW") ||
-          "מה מספר הטלפון שלך?"
-        );
+        return getPrompt("FLOW_DELIVERY_PHONE_NEW") || "מה מספר הטלפון שלכם?";
       }
-      if (
-        stage === "delivery_phone_new" &&
-        !convo.phone_confirmed
-      ) {
+
+      if (stage === "delivery_phone_new" && !convo.phone_confirmed) {
         stage = "delivery_phone_confirm_new";
-        const spaced = formatSpacedDigits(
-          convo.callback_phone
-        );
+        const spaced = formatSpacedDigits(convo.callback_phone);
         const tpl =
-          getPrompt("FLOW_DELIVERY_PHONE_CONFIRM_NEW") ||
-          "${number}";
+          getPrompt("FLOW_DELIVERY_PHONE_CONFIRM_NEW") || "רק לוודא, המספר הוא: {number} ?";
         return tpl.replace("{number}", spaced);
       }
+
       stage = "delivery_done";
-      return (
-        getPrompt("FLOW_DELIVERY_DONE") ||
-        "תודה, נציג יחזור אליך בקרוב."
-      );
+      return getPrompt("FLOW_DELIVERY_DONE") || "תודה, נציג יחזור אליכם בקרוב.";
     }
+
     if (route === "message") {
       if (!convo.message_target) {
         stage = "message_target";
-        return (
-          getPrompt("FLOW_MESSAGE_TARGET") ||
-          "למי ההודעה מיועדת?"
-        );
+        return getPrompt("FLOW_MESSAGE_TARGET") || "למי ההודעה מיועדת?";
       }
       if (!convo.message_body) {
         stage = "message_body";
-        return (
-          getPrompt("FLOW_MESSAGE_BODY") ||
-          "מה תוכן ההודעה?"
-        );
+        return getPrompt("FLOW_MESSAGE_BODY") || "מה תוכן ההודעה?";
       }
       if (!convo.full_name) {
         stage = "message_name";
-        return (
-          getPrompt("FLOW_MESSAGE_NAME") ||
-          "מה שמך המלא?"
-        );
+        return getPrompt("FLOW_MESSAGE_NAME") || "מה שמכם המלא?";
       }
+
       const callerDigits = normalizePhoneDigits(caller);
       if (callerDigits && !convo.callback_phone) {
         stage = "message_phone_confirm";
-        return (
-          getPrompt("FLOW_MESSAGE_PHONE_CONFIRM") ||
-          "זה מספר הטלפון שלך?"
-        );
+        return getPrompt("FLOW_MESSAGE_PHONE_CONFIRM") || "זה מספר הטלפון שלכם?";
       }
+
       if (!convo.callback_phone) {
         stage = "message_phone_new";
-        return (
-          getPrompt("FLOW_MESSAGE_PHONE_NEW") ||
-          "מה מספר הטלפון שלך?"
-        );
+        return getPrompt("FLOW_MESSAGE_PHONE_NEW") || "מה מספר הטלפון שלכם?";
       }
-      if (
-        stage === "message_phone_new" &&
-        !convo.phone_confirmed
-      ) {
+
+      if (stage === "message_phone_new" && !convo.phone_confirmed) {
         stage = "message_phone_confirm_new";
-        const spaced = formatSpacedDigits(
-          convo.callback_phone
-        );
+        const spaced = formatSpacedDigits(convo.callback_phone);
         const tpl =
-          getPrompt("FLOW_MESSAGE_PHONE_CONFIRM_NEW") ||
-          "${number}";
+          getPrompt("FLOW_MESSAGE_PHONE_CONFIRM_NEW") || "רק לוודא, המספר הוא: {number} ?";
         return tpl.replace("{number}", spaced);
       }
+
       stage = "message_done";
-      return (
-        getPrompt("FLOW_MESSAGE_DONE") ||
-        "תודה, נציג יחזור אליך בקרוב."
-      );
+      return getPrompt("FLOW_MESSAGE_DONE") || "תודה, נציג יחזור אליכם בקרוב.";
     }
-    // fallback
-    return (
-      getPrompt("FLOW_FALLBACK") ||
-      "אשמח לעזור בעוד משהו?"
-    );
+
+    return getPrompt("FLOW_FALLBACK") || "אשמח לעזור בעוד משהו?";
   }
 
   // Send next question to the assistant.
@@ -876,15 +745,16 @@ wss.on("connection", (twilioWs, req) => {
   function handleCallerFinal(text) {
     const utterance = String(text || "").trim();
     if (!utterance) return;
+
     lastCallerFinal = utterance;
-    // If route not set, try to detect route.
+
     if (!route) {
       const detected = extractRoute(utterance);
-      route = detected || "message"; // default to message route
+      route = detected || "message";
       afterHours = isAfterHours();
       return requestNext();
     }
-    // Capture data based on stage
+
     if (route === "sales") {
       if (stage === "sales_product") {
         convo.product_desc = utterance;
@@ -892,7 +762,6 @@ wss.on("connection", (twilioWs, req) => {
         if (brand) convo.product_brand = brand;
         if (model) convo.product_model = model;
       } else if (stage === "sales_name") {
-        // extract name ignoring numbers
         let t = utterance.replace(/\d/g, "").trim();
         if (t) convo.full_name = t;
       } else if (stage === "sales_brand") {
@@ -900,9 +769,7 @@ wss.on("connection", (twilioWs, req) => {
       } else if (stage === "sales_model") {
         convo.product_model = utterance;
       } else if (stage === "sales_phone_confirm") {
-        if (
-          /(כן|נכון|מאשר|אישור|yes|ok|yep)/i.test(utterance)
-        ) {
+        if (/(כן|נכון|מאשר|אישור|yes|ok|yep)/i.test(utterance)) {
           const digits = normalizePhoneDigits(caller);
           if (isValidPhoneDigits(digits)) {
             convo.callback_phone = digits;
@@ -911,12 +778,9 @@ wss.on("connection", (twilioWs, req) => {
         }
       } else if (stage === "sales_phone_new") {
         const digits = normalizePhoneDigits(utterance);
-        if (isValidPhoneDigits(digits))
-          convo.callback_phone = digits;
+        if (isValidPhoneDigits(digits)) convo.callback_phone = digits;
       } else if (stage === "sales_phone_confirm_new") {
-        if (
-          /(כן|נכון|מאשר|אישור|yes|ok|yep)/i.test(utterance)
-        ) {
+        if (/(כן|נכון|מאשר|אישור|yes|ok|yep)/i.test(utterance)) {
           convo.phone_confirmed = true;
         } else {
           convo.callback_phone = "";
@@ -929,26 +793,19 @@ wss.on("connection", (twilioWs, req) => {
         convo.product_model = utterance;
       } else if (stage === "support_brand") {
         convo.product_brand = utterance;
-        // Check importer list for optional transfer
+
+        // Optional importer offer
         if (!importerOffered) {
-          const match = (
-            SHEETS.suppliersImporters || []
-          ).find(
-            (row) =>
-              String(row.brand_name || "").trim() ===
-              convo.product_brand
+          const match = (SHEETS.suppliersImporters || []).find(
+            (row) => String(row.brand_name || "").trim() === convo.product_brand
           );
           if (match && match.phone) {
             importerOffered = true;
-            const spaced = formatSpacedDigits(
-              normalizePhoneDigits(match.phone)
-            );
+            const spaced = formatSpacedDigits(normalizePhoneDigits(match.phone));
             const importerMsg =
               getPrompt("FLOW_SUPPORT_SUPPLIER_OPTIONAL") ||
-              `ניתן לדבר עם היבואן של ${convo.product_brand} במספר ${spaced}. תרצה שאתן לך את המספר?`;
-            const instructions = buildInstructions(
-              importerMsg
-            );
+              `ניתן לדבר עם היבואן של ${convo.product_brand} במספר ${spaced}. תרצו שאתן לכם את המספר?`;
+            const instructions = buildInstructions(importerMsg);
             awaitingResponse = true;
             safeOpenAISend({
               type: "response.create",
@@ -964,9 +821,7 @@ wss.on("connection", (twilioWs, req) => {
         let t = utterance.replace(/\d/g, "").trim();
         if (t) convo.full_name = t;
       } else if (stage === "support_phone_confirm") {
-        if (
-          /(כן|נכון|מאשר|אישור|yes|ok|yep)/i.test(utterance)
-        ) {
+        if (/(כן|נכון|מאשר|אישור|yes|ok|yep)/i.test(utterance)) {
           const digits = normalizePhoneDigits(caller);
           if (isValidPhoneDigits(digits)) {
             convo.callback_phone = digits;
@@ -975,12 +830,9 @@ wss.on("connection", (twilioWs, req) => {
         }
       } else if (stage === "support_phone_new") {
         const digits = normalizePhoneDigits(utterance);
-        if (isValidPhoneDigits(digits))
-          convo.callback_phone = digits;
+        if (isValidPhoneDigits(digits)) convo.callback_phone = digits;
       } else if (stage === "support_phone_confirm_new") {
-        if (
-          /(כן|נכון|מאשר|אישור|yes|ok|yep)/i.test(utterance)
-        ) {
+        if (/(כן|נכון|מאשר|אישור|yes|ok|yep)/i.test(utterance)) {
           convo.phone_confirmed = true;
         } else {
           convo.callback_phone = "";
@@ -993,9 +845,7 @@ wss.on("connection", (twilioWs, req) => {
         let t = utterance.replace(/\d/g, "").trim();
         if (t) convo.full_name = t;
       } else if (stage === "delivery_phone_confirm") {
-        if (
-          /(כן|נכון|מאשר|אישור|yes|ok|yep)/i.test(utterance)
-        ) {
+        if (/(כן|נכון|מאשר|אישור|yes|ok|yep)/i.test(utterance)) {
           const digits = normalizePhoneDigits(caller);
           if (isValidPhoneDigits(digits)) {
             convo.callback_phone = digits;
@@ -1004,12 +854,9 @@ wss.on("connection", (twilioWs, req) => {
         }
       } else if (stage === "delivery_phone_new") {
         const digits = normalizePhoneDigits(utterance);
-        if (isValidPhoneDigits(digits))
-          convo.callback_phone = digits;
+        if (isValidPhoneDigits(digits)) convo.callback_phone = digits;
       } else if (stage === "delivery_phone_confirm_new") {
-        if (
-          /(כן|נכון|מאשר|אישור|yes|ok|yep)/i.test(utterance)
-        ) {
+        if (/(כן|נכון|מאשר|אישור|yes|ok|yep)/i.test(utterance)) {
           convo.phone_confirmed = true;
         } else {
           convo.callback_phone = "";
@@ -1024,9 +871,7 @@ wss.on("connection", (twilioWs, req) => {
         let t = utterance.replace(/\d/g, "").trim();
         if (t) convo.full_name = t;
       } else if (stage === "message_phone_confirm") {
-        if (
-          /(כן|נכון|מאשר|אישור|yes|ok|yep)/i.test(utterance)
-        ) {
+        if (/(כן|נכון|מאשר|אישור|yes|ok|yep)/i.test(utterance)) {
           const digits = normalizePhoneDigits(caller);
           if (isValidPhoneDigits(digits)) {
             convo.callback_phone = digits;
@@ -1035,19 +880,16 @@ wss.on("connection", (twilioWs, req) => {
         }
       } else if (stage === "message_phone_new") {
         const digits = normalizePhoneDigits(utterance);
-        if (isValidPhoneDigits(digits))
-          convo.callback_phone = digits;
+        if (isValidPhoneDigits(digits)) convo.callback_phone = digits;
       } else if (stage === "message_phone_confirm_new") {
-        if (
-          /(כן|נכון|מאשר|אישור|yes|ok|yep)/i.test(utterance)
-        ) {
+        if (/(כן|נכון|מאשר|אישור|yes|ok|yep)/i.test(utterance)) {
           convo.phone_confirmed = true;
         } else {
           convo.callback_phone = "";
         }
       }
     }
-    // After capturing data, ask next question or complete.
+
     if (stage.endsWith("_done")) {
       finalizeCall();
     } else {
@@ -1058,6 +900,7 @@ wss.on("connection", (twilioWs, req) => {
   // Finalize the call: send webhook and send closing message.
   async function finalizeCall() {
     callEnd = new Date().toISOString();
+
     let event = "call_ended";
     let payload = {
       callSid,
@@ -1071,7 +914,7 @@ wss.on("connection", (twilioWs, req) => {
       transcript: [],
       recording_url_public: makeRecordingPublicUrl(callSid)
     };
-    // Build route-specific payload
+
     if (route === "sales") {
       event = "מתעניין במכירות";
       payload = {
@@ -1080,10 +923,7 @@ wss.on("connection", (twilioWs, req) => {
         product_type: convo.product_desc || "",
         product_brand: convo.product_brand || "",
         product_model: convo.product_model || "",
-        callback_phone:
-          convo.callback_phone ||
-          normalizePhoneDigits(caller) ||
-          "",
+        callback_phone: convo.callback_phone || normalizePhoneDigits(caller) || "",
         summary: convo.product_desc
       };
     } else if (route === "support") {
@@ -1094,10 +934,7 @@ wss.on("connection", (twilioWs, req) => {
         issue_desc: convo.issue_desc || "",
         product_brand: convo.product_brand || "",
         product_model: convo.product_model || "",
-        callback_phone:
-          convo.callback_phone ||
-          normalizePhoneDigits(caller) ||
-          "",
+        callback_phone: convo.callback_phone || normalizePhoneDigits(caller) || "",
         summary: convo.issue_desc
       };
     } else if (route === "delivery") {
@@ -1106,38 +943,24 @@ wss.on("connection", (twilioWs, req) => {
         ...payload,
         full_name: convo.full_name || "",
         delivery_desc: convo.delivery_desc || "",
-        callback_phone:
-          convo.callback_phone ||
-          normalizePhoneDigits(caller) ||
-          "",
+        callback_phone: convo.callback_phone || normalizePhoneDigits(caller) || "",
         summary: convo.delivery_desc,
-        carriers_offered:
-          afterHours &&
-          SHEETS.deliveryContacts.length > 0
+        carriers_offered: afterHours && (SHEETS.deliveryContacts || []).length > 0
       };
     } else if (route === "message") {
-      event = `הודעה עבור ${
-        convo.message_target || ""
-      }`;
+      event = `הודעה עבור ${convo.message_target || ""}`;
       payload = {
         ...payload,
         target: convo.message_target || "",
         full_name: convo.full_name || "",
         message_body: convo.message_body || "",
-        callback_phone:
-          convo.callback_phone ||
-          normalizePhoneDigits(caller) ||
-          "",
+        callback_phone: convo.callback_phone || normalizePhoneDigits(caller) || "",
         summary: convo.message_body
       };
-    } else {
-      event = "call_ended";
     }
-    // Send webhook if final only or always for this implementation
-    await sendWebhookEvent(event, payload, {
-      wait_for_recording: true
-    });
-    // Send closing message to the caller
+
+    await sendWebhookEvent(event, payload, { wait_for_recording: true });
+
     const closingText = getSetting(
       "CLOSING_SCRIPT",
       "תודה שפניתם אלינו. שיהיה יום נעים!"
@@ -1151,7 +974,7 @@ wss.on("connection", (twilioWs, req) => {
       }
     });
     awaitingResponse = true;
-    // Hang up after closing message
+
     setTimeout(() => {
       try {
         if (openaiWs) openaiWs.close();
@@ -1169,14 +992,17 @@ wss.on("connection", (twilioWs, req) => {
       console.error("[Twilio] invalid JSON", e.message);
       return;
     }
+
     if (msg.event === "start" && msg.start?.streamSid) {
       streamSid = msg.start.streamSid;
       callSid = msg.start.callSid || callSid;
       callStart = new Date().toISOString();
       caller = msg.start.customParameters?.caller || caller;
       called = msg.start.customParameters?.called || called;
+
       // lazy load sheets
       if (!SHEETS.loaded_at) await loadSheets();
+
       // connect to OpenAI
       openaiWs = new WebSocket(
         `wss://api.openai.com/v1/realtime?model=${OPENAI_REALTIME_MODEL}`,
@@ -1187,8 +1013,10 @@ wss.on("connection", (twilioWs, req) => {
           }
         }
       );
+
       openaiWs.on("open", () => {
         debug("OpenAI WS connected");
+
         // Start session
         const session = {
           modalities: ["audio", "text"],
@@ -1208,29 +1036,23 @@ wss.on("connection", (twilioWs, req) => {
             "אתם עוזרת קולית בשם נטע עבור גיל ספורט."
           )
         };
-        if (MB_ENABLE_TRANSCRIPTION)
-          session.input_audio_transcription = {
-            model:
-              getSetting(
-                "MB_TRANSCRIPTION_MODEL",
-                "whisper-1"
-              ) || "whisper-1"
-          };
 
-        // IMPORTANT FIX:
-        // Do NOT send unsupported session parameters for this realtime model.
-        // (OpenAI returns unknown_parameter for session.voice_style and session.speaking_rate)
-        // We intentionally do nothing here even if ENV vars exist:
-        // - OPENAI_VOICE_STYLE
-        // - OPENAI_SPEAKING_RATE
+        if (MB_ENABLE_TRANSCRIPTION) {
+          session.input_audio_transcription = {
+            model: getSetting("MB_TRANSCRIPTION_MODEL", "whisper-1") || "whisper-1"
+          };
+        }
+
+        // ✅ FIX: DO NOT send unsupported session parameters for this realtime model:
+        // - session.voice_style (from OPENAI_VOICE_STYLE)
+        // - session.speaking_rate (from OPENAI_SPEAKING_RATE)
+        // Keeping env vars only for future upgrades.
+        // (Intentionally do nothing here)
 
         safeOpenAISend({ type: "session.update", session });
 
         // Opening script
-        const opening = getSetting(
-          "OPENING_SCRIPT",
-          "שלום, מדברת נטע מגיל ספורט."
-        );
+        const opening = getSetting("OPENING_SCRIPT", "שלום, מדברת נטע מגיל ספורט.");
         const instr = buildInstructions(
           `תגידו עכשיו בדיוק את המשפט הבא מילה במילה ללא תוספות:\n${opening}`
         );
@@ -1252,15 +1074,23 @@ wss.on("connection", (twilioWs, req) => {
           console.error("[OpenAI] parse error", e.message);
           return;
         }
-        // Log transcripts if enabled
+
+        if (MB_LOG_RAW_OPENAI) {
+          try {
+            console.log("[OpenAI_RAW]", JSON.stringify(om));
+          } catch (_) {}
+        }
+
+        // Log bot transcripts if enabled
         if (
           MB_LOG_TRANSCRIPTS &&
           om.transcript &&
           om.type &&
           om.type.startsWith("response.audio_transcript")
         ) {
-          console.log("[BOT_PART]", om.transcript.trim());
+          console.log("[BOT_PART]", String(om.transcript || "").trim());
         }
+
         if (om.type === "response.audio.delta") {
           if (streamSid) {
             safeTwilioSend({
@@ -1271,32 +1101,33 @@ wss.on("connection", (twilioWs, req) => {
           }
           return;
         }
+
         if (om.type === "response.audio_transcript.done") {
           const t = String(om.transcript || "").trim();
-          if (t) {
-            lastBotFinal = t;
-          }
+          if (t) lastBotFinal = t;
           return;
         }
+
         // Caller final transcripts
         const doneLike = om.type && om.type.includes("done");
         const isInput =
           om.type &&
           (om.type.includes("input_audio_transcription") ||
             om.type.includes("input_audio_transcript") ||
-            om.type.includes(
-              "conversation.item.input_audio_transcription"
-            ));
+            om.type.includes("conversation.item.input_audio_transcription"));
+
         const utterance =
           om.transcript ||
           om.text ||
           om.item?.content?.[0]?.transcript ||
           om.item?.content?.[0]?.text ||
           "";
+
         if (doneLike && isInput && utterance) {
           awaitingResponse = false;
           handleCallerFinal(utterance);
         }
+
         if (om.type === "response.done") {
           awaitingResponse = false;
           if (pendingResponse) {
@@ -1304,6 +1135,7 @@ wss.on("connection", (twilioWs, req) => {
             requestNext();
           }
         }
+
         if (om.type === "error") {
           console.error("[OpenAI] error", om);
         }
@@ -1315,22 +1147,17 @@ wss.on("connection", (twilioWs, req) => {
           twilioWs.close();
         } catch (_) {}
       });
+
       openaiWs.on("error", (e) => {
         console.error("[OpenAI] error", e.message);
       });
+
       return;
     }
 
     if (msg.event === "media" && msg.media?.payload) {
-      // Forward audio to OpenAI
-      if (
-        openaiWs &&
-        openaiWs.readyState === WebSocket.OPEN
-      ) {
-        if (awaitingResponse) {
-          // Buffer audio while assistant speaking
-          return;
-        }
+      if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+        if (awaitingResponse) return;
         safeOpenAISend({
           type: "input_audio_buffer.append",
           audio: msg.media.payload
@@ -1341,7 +1168,7 @@ wss.on("connection", (twilioWs, req) => {
 
     if (msg.event === "stop") {
       callEnd = new Date().toISOString();
-      // If call ends before completion, send abandoned webhook
+
       if (!stage.endsWith("_done")) {
         const payload = {
           callSid,
@@ -1355,13 +1182,9 @@ wss.on("connection", (twilioWs, req) => {
           stage,
           recording_url_public: makeRecordingPublicUrl(callSid)
         };
-        await sendWebhookEvent(
-          "call_abandoned",
-          payload,
-          { wait_for_recording: true }
-        );
+        await sendWebhookEvent("call_abandoned", payload, { wait_for_recording: true });
       }
-      // Close sockets
+
       try {
         if (openaiWs) openaiWs.close();
         twilioWs.close();
@@ -1373,14 +1196,13 @@ wss.on("connection", (twilioWs, req) => {
   twilioWs.on("close", () => {
     debug("Twilio WS closed");
   });
+
   twilioWs.on("error", (e) => {
     console.error("[Twilio WS] error", e.message);
   });
 });
 
 server.listen(PORT, () => {
-  console.log(
-    `GilSport VoiceBot custom server running on port ${PORT}`
-  );
+  console.log(`GilSport VoiceBot custom server running on port ${PORT}`);
   loadSheets();
 });
