@@ -1,6 +1,7 @@
 // server.js
-// GilSport VoiceBot – Sheet-Driven, No-FSM, Realtime (Twilio + OpenAI)
-// PART 1/3 – Boot, ENV, Helpers, Sheets, Express, Core Guards
+// GilSport VoiceBot – Sheet-Driven, No FSM, Realtime (Twilio + OpenAI)
+// FIXED VERSION – PART 1 / 3
+// Boot, ENV, Helpers, Sheets, Express, Base Runtime
 
 require("dotenv").config();
 
@@ -8,6 +9,7 @@ const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
 const { google } = require("googleapis");
+const fetch = global.fetch || require("node-fetch");
 
 // --------------------------------------------------
 // ENV helpers
@@ -20,7 +22,7 @@ const envBool = (k, d = false) =>
   ["1", "true", "yes", "on"].includes(String(process.env[k] || "").toLowerCase()) || d;
 
 // --------------------------------------------------
-// Core ENV (voice/style strictly via ENV)
+// ENV – DO NOT TOUCH VOICE / STYLE LOGIC
 // --------------------------------------------------
 const PORT = envNum("PORT", 10000);
 
@@ -57,17 +59,9 @@ const MB_VAD_THRESHOLD = envNum("MB_VAD_THRESHOLD", 0.75);
 const MB_VAD_SILENCE_MS = envNum("MB_VAD_SILENCE_MS", 900);
 const MB_VAD_PREFIX_MS = envNum("MB_VAD_PREFIX_MS", 200);
 const MB_VAD_SUFFIX_MS = envNum("MB_VAD_SUFFIX_MS", 150);
-const MB_NO_BARGE_TAIL_MS = envNum("MB_NO_BARGE_TAIL_MS", 1600);
-
-const MB_IDLE_WARNING_MS = envNum("MB_IDLE_WARNING_MS", 60000);
-const MB_IDLE_HANGUP_MS = envNum("MB_IDLE_HANGUP_MS", 20000);
-const MB_HANGUP_GRACE_MS = envNum("MB_HANGUP_GRACE_MS", 4000);
-const MB_MAX_CALL_MS = envNum("MB_MAX_CALL_MS", 500000);
 
 const MB_ENABLE_TRANSCRIPTION = envBool("MB_ENABLE_TRANSCRIPTION", true);
 const MB_TRANSCRIPTION_MODEL = process.env.MB_TRANSCRIPTION_MODEL || "whisper-1";
-const MB_LOG_TRANSCRIPTS = envBool("MB_LOG_TRANSCRIPTS", true);
-const MB_LOG_RAW_OPENAI = envBool("MB_LOG_RAW_OPENAI", false);
 
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
@@ -87,12 +81,12 @@ const always = (...a) => console.log("[ALWAYS]", ...a);
 // --------------------------------------------------
 let SHEETS = {
   loaded_at: null,
-  prompts: {},            // PROMPTS: prompt_id -> content_he
-  settings: {},           // SETTINGS: key -> value
-  kbFacts: [],            // KB_FACTS rows
-  doNotSay: [],           // DO_NOT_SAY rows
-  suppliersImporters: [], // SUPPLIERS_IMPORTERS rows
-  deliveryContacts: []    // DELIVERY_CONTACTS rows
+  prompts: {},
+  settings: {},
+  kbFacts: [],
+  doNotSay: [],
+  suppliersImporters: [],
+  deliveryContacts: []
 };
 
 const rowsToObjects = (rows) => {
@@ -122,6 +116,7 @@ const parseTable = (rows, kCol, vCol) => {
 
 async function loadSheets() {
   if (!GSHEET_ID || !GOOGLE_SERVICE_ACCOUNT_JSON_B64) return;
+
   const json = JSON.parse(
     Buffer.from(GOOGLE_SERVICE_ACCOUNT_JSON_B64, "base64").toString("utf8")
   );
@@ -147,9 +142,8 @@ async function loadSheets() {
   const vr = res.data.valueRanges || [];
   const get = (n)=> vr.find(v=>String(v.range||"").startsWith(n))?.values || [];
 
-  // PROMPTS
-  const pRows = get("PROMPTS!").slice();
   const prompts = {};
+  const pRows = get("PROMPTS!").slice();
   if (pRows.length) {
     const h = pRows.shift();
     for (const r of pRows) {
@@ -160,9 +154,7 @@ async function loadSheets() {
     }
   }
 
-  // SETTINGS
-  const sRows = get("SETTINGS!").slice();
-  const settings = sRows.length ? parseTable(sRows, "key", "value") : {};
+  const settings = parseTable(get("SETTINGS!").slice(), "key", "value");
 
   SHEETS = {
     loaded_at: new Date().toISOString(),
@@ -176,9 +168,7 @@ async function loadSheets() {
 
   log("Sheets loaded", {
     prompts: Object.keys(prompts).length,
-    settings: Object.keys(settings).length,
-    kbFacts: SHEETS.kbFacts.length,
-    doNotSay: SHEETS.doNotSay.length
+    settings: Object.keys(settings).length
   });
 }
 
@@ -200,7 +190,6 @@ app.post("/sheets/reload", async (_,res)=>{
   res.json({ ok:true, at:SHEETS.loaded_at });
 });
 
-// Twilio Voice → Media Stream
 app.post("/twilio-voice",(req,res)=>{
   const host = req.headers.host;
   const wsUrl = `wss://${host}/twilio-media-stream`;
@@ -218,16 +207,15 @@ app.post("/twilio-voice",(req,res)=>{
 const server = http.createServer(app);
 
 // ==================================================
-// PART 2/3
-// WebSocket core, Intent detection, Smart Flow (NO FSM),
-// Data collection by missing fields, DO_NOT_SAY guards
+// PART 2 / 3
+// WebSocket core – Intent, Flow by Missing Fields
 // ==================================================
 
 const wss = new WebSocket.Server({ server, path: "/twilio-media-stream" });
 
-// -----------------------------
-// Utility – text & phone helpers
-// -----------------------------
+// --------------------------------------------------
+// Text & Phone helpers
+// --------------------------------------------------
 const normalizeText = (s) =>
   String(s || "")
     .toLowerCase()
@@ -251,21 +239,34 @@ const extractPhoneDigits = (raw) => {
   return digits;
 };
 const isValidPhone = (d)=> d.length===10 && d.startsWith("0");
-const spaced = (d)=> d.split("").join(" ");
+const spacedPhone = (d)=> d.split("").join(" ");
 
 const extractName = (text)=>{
   let t = String(text||"").trim();
-  if (!t) return "";
   t = t.replace(/\d+/g,"").trim();
   if (t.length<2 || t.length>40) return "";
   return t;
 };
 
-// -----------------------------
-// Intent detection (routing)
-// -----------------------------
+// --------------------------------------------------
+// Intent detection (KB_FACTS + fallback keywords)
+// --------------------------------------------------
 const detectIntent = (text)=>{
   const t = normalizeText(text);
+
+  // First: KB_FACTS routing
+  for (const row of SHEETS.kbFacts || []) {
+    if (String(row.category||"").toLowerCase()==="routing") {
+      const keys = String(row.keywords||"")
+        .split(",")
+        .map(k=>normalizeText(k));
+      if (keys.some(k=>k && t.includes(k))) {
+        return String(row.topic||"");
+      }
+    }
+  }
+
+  // Fallback
   if (/תקלה|בעיה|שירות|אחריות|לא עובד/.test(t)) return "support";
   if (/משלוח|אספקה|הגיע|לא הגיע|שליח/.test(t)) return "delivery";
   if (/לקנות|רכישה|מוצר|דגם|מחיר|מבצע/.test(t)) return "sales";
@@ -273,9 +274,9 @@ const detectIntent = (text)=>{
   return "";
 };
 
-// -----------------------------
-// DO_NOT_SAY hard guard
-// -----------------------------
+// --------------------------------------------------
+// DO_NOT_SAY guard
+// --------------------------------------------------
 const violatesDoNotSay = (text)=>{
   const t = normalizeText(text);
   for (const r of SHEETS.doNotSay||[]) {
@@ -289,22 +290,20 @@ const violatesDoNotSay = (text)=>{
   return "";
 };
 
-// -----------------------------
+// --------------------------------------------------
 // WebSocket per call
-// -----------------------------
-wss.on("connection",(twilioWs,req)=>{
-  let openaiWs = null;
+// --------------------------------------------------
+wss.on("connection",(twilioWs)=>{
   let streamSid = "";
   let callSid = "";
   let caller = "";
   let called = "";
 
   let transcript = [];
-  let lastCallerText = "";
-  let lastBotText = "";
+  let awaitingResponse = false;
 
   // -----------------------------
-  // Collected data (dynamic, no FSM)
+  // Collected data – NO FSM
   // -----------------------------
   const data = {
     intent: "",
@@ -318,11 +317,9 @@ wss.on("connection",(twilioWs,req)=>{
     message_body: "",
     callback_phone: "",
     extra_phone: "",
-    carrier_info_given: false
+    carrier_info_given: false,
+    reinforced: false
   };
-
-  let finished = false;
-  let awaitingResponse = false;
 
   const pushTurn = (from,text)=>{
     transcript.push({ from, text, at:new Date().toISOString() });
@@ -330,33 +327,27 @@ wss.on("connection",(twilioWs,req)=>{
   };
 
   // -----------------------------
-  // Decide next question purely by missing fields
+  // Decide next prompt by missing fields
   // -----------------------------
   const nextPrompt = ()=>{
-    // Intent not set
-    if (!data.intent) {
-      return getPrompt("FLOW_ROUTING");
-    }
+    if (!data.intent) return getPrompt("FLOW_ROUTING");
 
     // SALES
     if (data.intent==="sales") {
       if (!data.product_type) return getPrompt("FLOW_SALES_PRODUCT");
       if (!data.full_name) return getPrompt("FLOW_SALES_NAME");
 
-      // reinforcement + coupon (from sheets only)
-      if (!data._reinforced) {
-        data._reinforced = true;
-        const claim = getSetting("PRICE_CLAIM_SENTENCE","");
-        const promo = getPrompt("SALES_PROMPT","");
-        return [claim,promo].filter(Boolean).join(" ");
+      if (!data.reinforced) {
+        data.reinforced = true;
+        return [
+          getSetting("PRICE_CLAIM_SENTENCE",""),
+          getPrompt("SALES_PROMPT","")
+        ].filter(Boolean).join(" ");
       }
 
       if (!data.product_model) return getPrompt("FLOW_SALES_MODEL");
       if (!data.product_brand) return getPrompt("FLOW_SALES_BRAND");
-
-      if (!data.callback_phone) {
-        return getPrompt("FLOW_SALES_PHONE_CONFIRM");
-      }
+      if (!data.callback_phone) return getPrompt("FLOW_SALES_PHONE_CONFIRM");
       return getPrompt("FLOW_SALES_DONE");
     }
 
@@ -397,22 +388,18 @@ wss.on("connection",(twilioWs,req)=>{
     const guard = violatesDoNotSay(text);
     if (guard) return guard;
 
-    const norm = normalizeText(text);
-
     if (!data.intent) {
-      const i = detectIntent(norm);
+      const i = detectIntent(text);
       if (i) data.intent = i;
       return "";
     }
 
-    // phones
     const digits = extractPhoneDigits(text);
     if (isValidPhone(digits)) {
       if (!data.callback_phone) data.callback_phone = digits;
       else if (!data.extra_phone) data.extra_phone = digits;
     }
 
-    // names
     if (!data.full_name) {
       const n = extractName(text);
       if (n) data.full_name = n;
@@ -443,11 +430,11 @@ wss.on("connection",(twilioWs,req)=>{
   };
 
   // --------------------------------------------------
-  // OpenAI WS created in PART 3
+  // Twilio inbound
   // --------------------------------------------------
-
   twilioWs.on("message",(raw)=>{
     const msg = JSON.parse(raw.toString());
+
     if (msg.event==="start") {
       streamSid = msg.start.streamSid;
       callSid = msg.start.callSid;
@@ -456,80 +443,46 @@ wss.on("connection",(twilioWs,req)=>{
       return;
     }
 
-    if (msg.event==="media" && openaiWs) {
-      if (!awaitingResponse) {
-        openaiWs.send(JSON.stringify({
-          type:"input_audio_buffer.append",
-          audio: msg.media.payload
-        }));
-      }
+    if (msg.event==="media" && openaiWs && !awaitingResponse) {
+      openaiWs.send(JSON.stringify({
+        type:"input_audio_buffer.append",
+        audio: msg.media.payload
+      }));
       return;
     }
 
     if (msg.event==="stop") {
-      finished = true;
+      twilioWs.__ENDED__ = true;
     }
   });
 
-  // -----------------------------
-  // Expose helpers to PART 3
-  // -----------------------------
+  // expose state for PART 3
   twilioWs.__STATE__ = {
     data,
+    transcript,
     nextPrompt,
     consumeCaller,
     pushTurn,
-    getTranscript:()=>transcript,
-    setLast:(c,b)=>{ lastCallerText=c; lastBotText=b; },
-    getLast:()=>({ lastCallerText, lastBotText }),
+    meta:()=>({ callSid, streamSid, caller, called }),
     setAwait:(v)=>{ awaitingResponse=v; },
-    isFinished:()=>finished,
-    meta:()=>({ callSid, streamSid, caller, called })
+    isAwait:()=>awaitingResponse
   };
-
 });
 
 // ==================================================
-// PART 3/3
-// OpenAI Realtime bridge, audio/VAD handling,
-// webhook payloads, finalization & abandoned
+// PART 3 / 3
+// OpenAI Realtime bridge + Webhooks + Abandoned
 // ==================================================
 
-const fetch = global.fetch || require("node-fetch");
-
-// --------------------------------------------------
-// Webhook helpers
-// --------------------------------------------------
-const sendWebhook = async (event, payload) => {
-  if (!MB_WEBHOOK_URL) return;
-  try {
-    await fetch(MB_WEBHOOK_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ event, ...payload })
-    });
-  } catch (e) {
-    error("Webhook failed", e.message);
-  }
-};
-
-const publicRecordingUrl = (callSid) => {
-  if (!PUBLIC_BASE_URL || !callSid) return "";
-  return `${PUBLIC_BASE_URL.replace(/\/$/,"")}/recording/${callSid}`;
-};
-
-// --------------------------------------------------
-// OpenAI WS per connection
-// --------------------------------------------------
 wss.on("connection",(twilioWs)=>{
   const state = twilioWs.__STATE__;
   if (!state) return;
 
-  const { data, nextPrompt, consumeCaller, pushTurn } = state;
+  const { data, transcript, nextPrompt, consumeCaller, pushTurn } = state;
   const { callSid, streamSid, caller, called } = state.meta();
 
-  let awaitingResponse = false;
   let openaiWs = null;
+  let awaitingResponse = false;
   let ended = false;
 
   if (!OPENAI_API_KEY) {
@@ -537,6 +490,9 @@ wss.on("connection",(twilioWs)=>{
     return;
   }
 
+  // --------------------------------------------------
+  // OpenAI WebSocket
+  // --------------------------------------------------
   openaiWs = new WebSocket(
     `wss://api.openai.com/v1/realtime?model=${OPENAI_REALTIME_MODEL}`,
     {
@@ -568,7 +524,7 @@ wss.on("connection",(twilioWs)=>{
           suffix_padding_ms: MB_VAD_SUFFIX_MS,
           create_response:false
         },
-        instructions: [
+        instructions:[
           master,
           MB_BASE_STYLE,
           OPENAI_VOICE_STYLE ? `סטייל דיבור: ${OPENAI_VOICE_STYLE}` : ""
@@ -576,7 +532,7 @@ wss.on("connection",(twilioWs)=>{
       }
     }));
 
-    // Opening (from SETTINGS only)
+    // Opening – from SETTINGS only
     const opening = getSetting("OPENING_SCRIPT","");
     if (opening) {
       awaitingResponse = true;
@@ -590,14 +546,13 @@ wss.on("connection",(twilioWs)=>{
     }
   });
 
+  // --------------------------------------------------
+  // OpenAI inbound
+  // --------------------------------------------------
   openaiWs.on("message",async(raw)=>{
     const msg = JSON.parse(raw.toString());
 
-    if (MB_LOG_RAW_OPENAI) {
-      always("[OPENAI]", msg.type);
-    }
-
-    // caller transcript (final)
+    // Caller transcript (final)
     if (
       msg.type.includes("input_audio_transcription") &&
       (msg.type.includes("done") || msg.type.includes("completed")) &&
@@ -609,13 +564,7 @@ wss.on("connection",(twilioWs)=>{
       pushTurn("caller", text);
 
       const guardReply = consumeCaller(text);
-      let instructions = "";
-
-      if (guardReply) {
-        instructions = guardReply;
-      } else {
-        instructions = nextPrompt();
-      }
+      let instructions = guardReply || nextPrompt();
 
       if (instructions && !awaitingResponse) {
         awaitingResponse = true;
@@ -627,7 +576,7 @@ wss.on("connection",(twilioWs)=>{
       return;
     }
 
-    // bot transcript (final)
+    // Bot transcript (final)
     if (msg.type==="response.audio_transcript.done") {
       if (msg.transcript) {
         pushTurn("bot", msg.transcript);
@@ -635,7 +584,7 @@ wss.on("connection",(twilioWs)=>{
       return;
     }
 
-    // audio to twilio
+    // Audio to Twilio
     if (msg.type==="response.audio.delta" && streamSid) {
       twilioWs.send(JSON.stringify({
         event:"media",
@@ -645,18 +594,21 @@ wss.on("connection",(twilioWs)=>{
       return;
     }
 
-    // response finished
+    // Response finished
     if (msg.type==="response.done") {
       awaitingResponse = false;
 
-      // check completion
-      const done =
-        (data.intent==="sales" && data.product_type && data.full_name && data.callback_phone) ||
-        (data.intent==="support" && data.issue_desc && data.full_name && data.callback_phone) ||
-        (data.intent==="delivery" && data.delivery_desc && data.full_name && data.callback_phone) ||
-        (data.intent==="message" && data.message_body && data.full_name && data.callback_phone);
+      const isComplete =
+        (data.intent==="sales" &&
+          data.product_type && data.full_name && data.callback_phone) ||
+        (data.intent==="support" &&
+          data.issue_desc && data.full_name && data.callback_phone) ||
+        (data.intent==="delivery" &&
+          data.delivery_desc && data.full_name && data.callback_phone) ||
+        (data.intent==="message" &&
+          data.message_body && data.full_name && data.callback_phone);
 
-      if (done && !ended) {
+      if (isComplete && !ended) {
         ended = true;
 
         const payload = {
@@ -676,8 +628,11 @@ wss.on("connection",(twilioWs)=>{
           message_body: data.message_body,
           callback_phone: data.callback_phone,
           extra_phone: data.extra_phone,
-          recording_url_public: publicRecordingUrl(callSid),
-          transcript: state.getTranscript()
+          transcript,
+          recording_url_public:
+            PUBLIC_BASE_URL && callSid
+              ? `${PUBLIC_BASE_URL.replace(/\/$/,"")}/recording/${callSid}`
+              : ""
         };
 
         const eventMap = {
@@ -687,7 +642,14 @@ wss.on("connection",(twilioWs)=>{
           message:"message_taken"
         };
 
-        await sendWebhook(eventMap[data.intent]||"call_ended", payload);
+        await fetch(MB_WEBHOOK_URL,{
+          method:"POST",
+          headers:{ "Content-Type":"application/json" },
+          body: JSON.stringify({
+            event: eventMap[data.intent] || "call_ended",
+            ...payload
+          })
+        });
 
         try { openaiWs.close(); } catch(_){}
         try { twilioWs.close(); } catch(_){}
@@ -705,18 +667,26 @@ wss.on("connection",(twilioWs)=>{
     try { twilioWs.close(); } catch(_){}
   });
 
-  // -----------------------------
+  // --------------------------------------------------
   // Abandoned
-  // -----------------------------
+  // --------------------------------------------------
   twilioWs.on("close",()=>{
     if (!ended) {
-      sendWebhook("call_abandoned",{
-        at: new Date().toISOString(),
-        caller,
-        callSid,
-        stage: data.intent||"routing",
-        recording_url_public: publicRecordingUrl(callSid)
-      });
+      fetch(MB_WEBHOOK_URL,{
+        method:"POST",
+        headers:{ "Content-Type":"application/json" },
+        body: JSON.stringify({
+          event:"call_abandoned",
+          at:new Date().toISOString(),
+          caller,
+          callSid,
+          stage: data.intent || "routing",
+          recording_url_public:
+            PUBLIC_BASE_URL && callSid
+              ? `${PUBLIC_BASE_URL.replace(/\/$/,"")}/recording/${callSid}`
+              : ""
+        })
+      }).catch(()=>{});
     }
   });
 });
