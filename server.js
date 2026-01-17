@@ -3,7 +3,7 @@
 
  Custom voicebot for GilSport – realtime voice assistant without a rigid state machine.
  This implementation is inspired by the existing server.js file in the
- gilsport‑voicebot‑realtime repository but has been reorganised to
+ gilsport-voicebot-realtime repository but has been reorganised to
  reduce reliance on an explicit state machine while still following
  the required conversation flows. The bot reads prompts and settings
  from a Google Sheet (designated by GSHEET_ID) and uses OpenAI
@@ -58,13 +58,19 @@ function normalizeVoice(v) {
 }
 const OPENAI_VOICE = normalizeVoice(process.env.OPENAI_VOICE || "alloy");
 
-// Voice style (e.g. "warm_professional"). Will be passed directly to the
-// OpenAI API if provided. If empty, no style hint is sent.
+// Voice style (e.g. "warm_professional").
+// NOTE: Current OpenAI Realtime session API for this model rejects session.voice_style (unknown_parameter).
+// We keep the ENV for future use, but we DO NOT send it in session.update.
 const OPENAI_VOICE_STYLE = process.env.OPENAI_VOICE_STYLE || "";
-// Speaking rate (1.0 = normal speed). Must be positive.
+
+// Speaking rate (1.0 = normal speed).
+// NOTE: Current OpenAI Realtime session API for this model rejects session.speaking_rate (unknown_parameter).
+// IMPORTANT FIX: If ENV is missing/invalid -> return null (NOT 1.0), so we don't accidentally send it.
 const OPENAI_SPEAKING_RATE = (() => {
-  const rate = parseFloat(process.env.OPENAI_SPEAKING_RATE);
-  return Number.isFinite(rate) && rate > 0 ? rate : 1.0;
+  const raw = String(process.env.OPENAI_SPEAKING_RATE || "").trim();
+  if (!raw) return null;
+  const rate = parseFloat(raw);
+  return Number.isFinite(rate) && rate > 0 ? rate : null;
 })();
 
 // Base style override for responses. Operators can specify
@@ -76,7 +82,7 @@ const MB_BASE_STYLE =
 
 // Google Sheets configuration. The sheet ID points to the
 // VoiceBot Config (Client Controlled) spreadsheet. The service
-// account JSON must be provided as a base64‑encoded string in
+// account JSON must be provided as a base64-encoded string in
 // GOOGLE_SERVICE_ACCOUNT_JSON_B64.
 const GSHEET_ID = process.env.GSHEET_ID || "";
 const GOOGLE_SERVICE_ACCOUNT_JSON_B64 =
@@ -116,10 +122,10 @@ const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
 // Public URL of this service. Used to build public recording URLs.
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || "";
 
-// Time zone for after‑hours detection (defaults to Asia/Jerusalem).
+// Time zone for after-hours detection (defaults to Asia/Jerusalem).
 const TIME_ZONE = process.env.TIME_ZONE || "Asia/Jerusalem";
 
-// In‑memory store for sheet data. Populated by loadSheets().
+// In-memory store for sheet data. Populated by loadSheets().
 let SHEETS = {
   loaded_at: null,
   prompts: {}, // prompt_id -> content_he
@@ -325,7 +331,7 @@ function formatSpacedDigits(d) {
   return String(d || "").split("").join(" ");
 }
 
-// Extract brand and model names from a free‑form description.
+// Extract brand and model names from a free-form description.
 function extractBrandModel(text) {
   const t = String(text || "");
   const brandMatch = t.match(/מותג\s+([^,.\n\r]+)/);
@@ -535,7 +541,7 @@ const wss = new WebSocket.Server({
 
 // Main connection handler. Each new WS connection corresponds to a phone call.
 wss.on("connection", (twilioWs, req) => {
-  // Per‑call state variables
+  // Per-call state variables
   let openaiWs = null;
   let callSid = null;
   let streamSid = null;
@@ -1065,7 +1071,7 @@ wss.on("connection", (twilioWs, req) => {
       transcript: [],
       recording_url_public: makeRecordingPublicUrl(callSid)
     };
-    // Build route‑specific payload
+    // Build route-specific payload
     if (route === "sales") {
       event = "מתעניין במכירות";
       payload = {
@@ -1210,11 +1216,16 @@ wss.on("connection", (twilioWs, req) => {
                 "whisper-1"
               ) || "whisper-1"
           };
-        if (OPENAI_VOICE_STYLE)
-          session.voice_style = OPENAI_VOICE_STYLE;
-        if (OPENAI_SPEAKING_RATE)
-          session.speaking_rate = OPENAI_SPEAKING_RATE;
+
+        // IMPORTANT FIX:
+        // Do NOT send unsupported session parameters for this realtime model.
+        // (OpenAI returns unknown_parameter for session.voice_style and session.speaking_rate)
+        // We intentionally do nothing here even if ENV vars exist:
+        // - OPENAI_VOICE_STYLE
+        // - OPENAI_SPEAKING_RATE
+
         safeOpenAISend({ type: "session.update", session });
+
         // Opening script
         const opening = getSetting(
           "OPENING_SCRIPT",
@@ -1232,6 +1243,7 @@ wss.on("connection", (twilioWs, req) => {
           }
         });
       });
+
       openaiWs.on("message", async (raw) => {
         let om;
         try {
@@ -1296,6 +1308,7 @@ wss.on("connection", (twilioWs, req) => {
           console.error("[OpenAI] error", om);
         }
       });
+
       openaiWs.on("close", () => {
         debug("OpenAI WS closed");
         try {
@@ -1307,6 +1320,7 @@ wss.on("connection", (twilioWs, req) => {
       });
       return;
     }
+
     if (msg.event === "media" && msg.media?.payload) {
       // Forward audio to OpenAI
       if (
@@ -1324,6 +1338,7 @@ wss.on("connection", (twilioWs, req) => {
       }
       return;
     }
+
     if (msg.event === "stop") {
       callEnd = new Date().toISOString();
       // If call ends before completion, send abandoned webhook
@@ -1354,6 +1369,7 @@ wss.on("connection", (twilioWs, req) => {
       return;
     }
   });
+
   twilioWs.on("close", () => {
     debug("Twilio WS closed");
   });
