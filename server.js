@@ -1019,6 +1019,11 @@ wss.on("connection", (twilioWs, req) => {
   let openaiReady = false;
   const pendingAudio = [];
 
+  // Realtime API schema compatibility: prefer `output_modalities`, fall back to legacy `modalities`.
+  // Some model versions / deployments validate one or the other.
+  let USE_OUTPUT_MODALITIES = true;
+  let DID_FALLBACK_MODALITIES = false;
+
   const connTag = `conn_${Date.now().toString(36)}_${Math.random().toString(16).slice(2, 6)}`;
 
   // Stream parameters
@@ -1225,9 +1230,13 @@ wss.on("connection", (twilioWs, req) => {
     const instructions = [
       baseStyle,
       "אתם מקריא טקסט (TTS) בעברית בשם נטע.",
-      "החזירו בדיוק את הטקסט שניתן בקלט, מילה במילה, ללא תוספות, ללא שינויי ניסוח, ללא שאלה נוספת, וללא משפטי סיום כלליים.",
-      "פלטו רק את הטקסט עצמו, בלי שום הקדמה.",
-      "אם הטקסט כולל מספרים—להקריא ספרה-ספרה."
+      "המשימה: להפיק פלט שזהה *בדיוק* לטקסט שמופיע בין התגים <SAY> ו-</SAY>.",
+      "חובה: ללא תוספות, ללא שינויי ניסוח, ללא שאלה נוספת, ללא משפטי סיום כלליים.",
+      "אם יש מספרים — להקריא ספרה-ספרה.",
+      "פלטו רק את הטקסט עצמו (בלי התגים, בלי הקדמה).",
+      "<SAY>",
+      t,
+      "</SAY>"
     ]
       .filter(Boolean)
       .join("\n");
@@ -1237,10 +1246,17 @@ wss.on("connection", (twilioWs, req) => {
     // Critical: do NOT let the model see prior conversation; provide the text as input.
     safeOpenAISend({
       type: "response.create",
-      conversation: "none",
-      input: [{ type: "input_text", text: t }],
       response: {
-        modalities: ["audio", "text"],
+        // Do not write assistant output into the default conversation
+        conversation: "none",
+
+        // Clear context for this out-of-band response
+        input: [],
+
+        // Request audio (transcript is included with audio outputs)
+        ...(USE_OUTPUT_MODALITIES
+          ? { output_modalities: ["audio"] }
+          : { modalities: ["audio", "text"] }),
         instructions,
         temperature: 0,
         max_output_tokens: 400
@@ -1309,9 +1325,16 @@ wss.on("connection", (twilioWs, req) => {
 
     safeOpenAISend({
       type: "response.create",
-      conversation: "none",
       response: {
-        modalities: ["text"],
+        conversation: "none",
+        input: [
+          {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: u }]
+          }
+        ],
+        ...(USE_OUTPUT_MODALITIES ? { output_modalities: ["text"] } : { modalities: ["text"] }),
         instructions,
         temperature: 0,
         max_output_tokens: 500
@@ -1338,6 +1361,8 @@ wss.on("connection", (twilioWs, req) => {
     const has = (arr) => arr.some((k) => u.includes(k));
     if (has(["תקלה", "אחריות", "שירות", "תיקון", "לא עובד", "לא נדלק", "בעיה"])) return "support";
     if (has(["משלוח", "אספקה", "שליח", "מוביל", "הזמנה לא הגיעה", "מחכה למשלוח", "להיום"])) return "delivery";
+    if (has(["הודעה", "להשאיר", "השארת", "למסור", "למנהל", "לעובד"])) return "message";
+    if (has(["לקנות", "קניה", "קנייה", "רכישה", "רוצה", "מעוניין", "מתעניין", "מחפש", "מחפשת", "לקנות באתר"])) return "sales";
     if (has(["הודעה ל", "להשאיר הודעה", "מסר ל", "להעביר הודעה"])) return "message";
     if (has(["לקנות", "רכישה", "קנייה", "מתעניין", "מעוניין", "לקנות", "מחפש", "מוצר"])) return "sales";
 
@@ -1994,7 +2019,7 @@ wss.on("connection", (twilioWs, req) => {
 
     safeOpenAISend({ type: "session.update", session });
 
-    // Speak opening verbatim
+    // Speak opening verbatim (out-of-band, no conversation memory)
     awaitingResponse = true;
     state.awaiting = "opening";
     state.last_prompt_text = openingScript;
@@ -2002,9 +2027,23 @@ wss.on("connection", (twilioWs, req) => {
     safeOpenAISend({
       type: "response.create",
       response: {
-        modalities: ["audio", "text"],
-        instructions:
-          `תגידי עכשיו בדיוק את המשפט הבא מילה במילה, ללא תוספות וללא שאלות נוספות:\n${openingScript}`
+        conversation: "none",
+        // Clear context for opening so it is always verbatim
+        input: [],
+        ...(USE_OUTPUT_MODALITIES
+          ? { output_modalities: ["audio"] }
+          : { modalities: ["audio", "text"] }),
+        instructions: [
+          "אתם מקריא טקסט (TTS) בעברית בשם נטע.",
+          "המשימה: להפיק פלט שזהה *בדיוק* לטקסט שמופיע בין התגים <SAY> ו-</SAY>.",
+          "חובה: ללא תוספות, ללא שינויי ניסוח, ללא שאלה נוספת.",
+          "פלטו רק את הטקסט עצמו (בלי התגים, בלי הקדמה).",
+          "<SAY>",
+          openingScript,
+          "</SAY>"
+        ].join("\n"),
+        temperature: 0,
+        max_output_tokens: 200
       }
     });
 
@@ -2076,6 +2115,54 @@ wss.on("connection", (twilioWs, req) => {
 
     if (msg.type === "error") {
       error(`[${connTag}] OpenAI error event`, msg);
+
+      // Compatibility fallback: some deployments reject `output_modalities` and only accept legacy `modalities`.
+      try {
+        const e = msg.error || {};
+        const param = String(e.param || "");
+        const m = String(e.message || "");
+        const isOutputModalitiesErr =
+          e.code === "unknown_parameter" &&
+          (param.includes("output_modalities") || m.toLowerCase().includes("output_modalities"));
+
+        if (USE_OUTPUT_MODALITIES && !DID_FALLBACK_MODALITIES && isOutputModalitiesErr) {
+          DID_FALLBACK_MODALITIES = true;
+          USE_OUTPUT_MODALITIES = false;
+          always(`[${connTag}] Falling back to legacy response.modalities schema due to output_modalities rejection`);
+
+          // Best-effort retry once based on the current awaiting mode.
+          if (state.awaiting === "nlu" && state.last_user_final) {
+            state.nlu_text_buf = "";
+            nluExtract(state.last_user_final);
+          } else if ((state.awaiting === "speak" || state.awaiting === "opening") && state.last_prompt_text) {
+            // Re-send the last prompt verbatim in legacy mode.
+            const t = String(state.last_prompt_text || "").trim();
+            if (t) {
+              safeOpenAISend({
+                type: "response.create",
+                response: {
+                  conversation: "none",
+                  input: [],
+                  modalities: ["audio", "text"],
+                  instructions: [
+                    "אתם מקריא טקסט (TTS) בעברית בשם נטע.",
+                    "המשימה: להפיק פלט שזהה *בדיוק* לטקסט שמופיע בין התגים <SAY> ו-</SAY>.",
+                    "חובה: ללא תוספות, ללא שינויי ניסוח, ללא שאלה נוספת.",
+                    "אם יש מספרים — להקריא ספרה-ספרה.",
+                    "פלטו רק את הטקסט עצמו (בלי התגים, בלי הקדמה).",
+                    "<SAY>",
+                    t,
+                    "</SAY>"
+                  ].join("\n"),
+                  temperature: 0,
+                  max_output_tokens: 400
+                }
+              });
+            }
+          }
+        }
+      } catch (_) {}
+
       return;
     }
 
