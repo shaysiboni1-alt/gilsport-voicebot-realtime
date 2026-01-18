@@ -408,7 +408,7 @@ const isValidPhoneDigits = (digits) => {
 };
 
 // Hebrew-ish yes/no
-// IMPORTANT: keep this STRICT. Ambiguous acknowledgements ("Okay", "בסדר", "סבבה")
+// IMPORTANT: keep this STRICT. Ambiguous acknowledgements ("", "בסדר", "סבבה")
 // must NOT advance decision points like phone-confirm or importer/carriers offers.
 const isYes = (text) =>
   /(\bכן\b|נכון|מאשר|אישור|yes|yep|yeah)/i.test(String(text || "").trim());
@@ -1224,22 +1224,26 @@ wss.on("connection", (twilioWs, req) => {
     const baseStyle = MB_BASE_STYLE && MB_BASE_STYLE.trim() ? `סגנון כללי: ${MB_BASE_STYLE.trim()}` : "";
     const instructions = [
       baseStyle,
-      "אתם עוזרת קולית בעברית בשם נטע.",
-      "חובה להקריא בדיוק את הטקסט הבא מילה במילה, ללא תוספות, ללא שינויי ניסוח, ללא שאלות נוספות, וללא משפטי סיום כלליים.",
-      "אחרי שסיימתם לקרוא את הטקסט—להפסיק לדבר.",
-      "טקסט להקראה (verbatim):",
-      t
+      "אתם מקריא טקסט (TTS) בעברית בשם נטע.",
+      "החזירו בדיוק את הטקסט שניתן בקלט, מילה במילה, ללא תוספות, ללא שינויי ניסוח, ללא שאלה נוספת, וללא משפטי סיום כלליים.",
+      "פלטו רק את הטקסט עצמו, בלי שום הקדמה.",
+      "אם הטקסט כולל מספרים—להקריא ספרה-ספרה."
     ]
       .filter(Boolean)
       .join("\n");
 
     debug(`[${connTag}] response.create SPEAK purpose=${purpose} text=${preview(t, 160)}`);
+
+    // Critical: do NOT let the model see prior conversation; provide the text as input.
     safeOpenAISend({
       type: "response.create",
+      conversation: "none",
+      input: [{ type: "input_text", text: t }],
       response: {
-        // AUDIO ONLY: reduce any chance of the model trying to "help" with extra text.
         modalities: ["audio", "text"],
-        instructions
+        instructions,
+        temperature: 0,
+        max_output_tokens: 400
       }
     });
   };
@@ -1305,27 +1309,37 @@ wss.on("connection", (twilioWs, req) => {
 
     safeOpenAISend({
       type: "response.create",
+      conversation: "none",
       response: {
         modalities: ["text"],
-        instructions
+        instructions,
+        temperature: 0,
+        max_output_tokens: 500
       }
     });
   };
 
   const decideRouteFromKB = (utteranceNorm) => {
-    const matches = getKBFactsMatches(utteranceNorm);
-    if (!matches.length) return "";
-
-    // Prefer explicit route intents
-    for (const m of matches) {
-      const i = String(m.intent || "").toLowerCase();
-      if (ROUTES.has(i)) return i;
-      // support legacy hebrew labels
-      if (i === "sales" || i === "מכירה") return "sales";
-      if (i === "support" || i === "שירות") return "support";
-      if (i === "delivery" || i === "אספקה" || i === "משלוח") return "delivery";
-      if (i === "message" || i === "הודעה") return "message";
+    const u = String(utteranceNorm || "").trim();
+    const matches = getKBFactsMatches(u);
+    if (matches.length) {
+      // Prefer explicit route intents
+      for (const m of matches) {
+        const r = String(m.route || "").toLowerCase();
+        if (r === "sales" || r === "support" || r === "delivery" || r === "message") return r;
+      }
+      // Otherwise take first match
+      const r0 = String(matches[0].route || "").toLowerCase();
+      if (r0 === "sales" || r0 === "support" || r0 === "delivery" || r0 === "message") return r0;
     }
+
+    // Built-in fallback heuristics (do not rely on the model)
+    // Keep conservative: only strong keywords.
+    const has = (arr) => arr.some((k) => u.includes(k));
+    if (has(["תקלה", "אחריות", "שירות", "תיקון", "לא עובד", "לא נדלק", "בעיה"])) return "support";
+    if (has(["משלוח", "אספקה", "שליח", "מוביל", "הזמנה לא הגיעה", "מחכה למשלוח", "להיום"])) return "delivery";
+    if (has(["הודעה ל", "להשאיר הודעה", "מסר ל", "להעביר הודעה"])) return "message";
+    if (has(["לקנות", "רכישה", "קנייה", "מתעניין", "מעוניין", "לקנות", "מחפש", "מוצר"])) return "sales";
 
     return "";
   };
