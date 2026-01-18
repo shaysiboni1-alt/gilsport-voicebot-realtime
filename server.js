@@ -3,11 +3,14 @@
 // GilSport Realtime Voice Bot – "נטע" (MisterBot-style 1:1)
 // Twilio Media Streams <-> OpenAI Realtime API
 //
-// Fixes in this version:
-// 1) No-audio bug: do NOT send opening prompt until Twilio START (streamSid present).
-//    Also buffers early audio deltas until streamSid exists.
-// 2) Abandoned webhook missing caller/callSid: backfill streamSid from any event,
-//    and fetch caller number from Twilio REST if missing.
+// Key principles:
+// - All business content (opening/closing/prompts) is loaded ONLY from Google Sheets: SETTINGS + PROMPTS
+// - Realtime voice via OpenAI Realtime + Whisper transcription
+// - Smart lead parsing via Chat Completions model (MB_LEAD_PARSING_MODEL)
+// - ALWAYS send full call log payload to MB_CALL_LOG_WEBHOOK_URL (if enabled+URL)
+// - Send FINAL lead webhook to MB_WEBHOOK_URL only when full lead exists (is_lead=true + phone)
+// - Send ABANDONED webhook to MB_ABANDONED_WEBHOOK_URL when call ends without full lead (or disconnect scenarios)
+// - Optional Twilio Call Recording (MB_ENABLE_RECORDING=true)
 //
 // Dependencies:
 //   npm i express ws dotenv googleapis
@@ -54,8 +57,7 @@ const PORT = envNumber("PORT", 10000);
 
 // OpenAI
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const OPENAI_REALTIME_MODEL =
-  process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview-2024-12-17";
+const OPENAI_REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview-2024-12-17";
 const OPENAI_VOICE = process.env.OPENAI_VOICE || "alloy";
 
 // Parsing / Summary model (HTTP)
@@ -174,14 +176,29 @@ function isTranscriptGarbage(t, hasRealUserYet) {
   const s = String(t || "").trim();
   if (!s) return true;
 
+  // Common hallucinations early in call
   const low = s.toLowerCase();
-  const common = ["thank you", "thanks", "hello", "ok", "okay", "yes", "no", "bye", "goodbye"];
+  const common = [
+    "thank you",
+    "thanks",
+    "hello",
+    "ok",
+    "okay",
+    "yes",
+    "no",
+    "bye",
+    "goodbye",
+  ];
+
+  // If call just started and we have no meaningful user text yet, ignore short English fillers
   if (!hasRealUserYet && s.length <= 18 && common.includes(low)) return true;
 
+  // Very low letter ratio (mostly symbols/noise)
   const letters = (s.match(/[A-Za-z\u0590-\u05FF]/g) || []).length;
   const total = s.length;
   if (total >= 6 && letters / total < 0.25) return true;
 
+  // Single very short token (often noise)
   if (s.split(/\s+/).length === 1 && s.length <= 3 && !/^\d+$/.test(s)) return true;
 
   return false;
@@ -214,6 +231,7 @@ function isValidIsraeliPhone(digits) {
   if (!/^0\d{8,9}$/.test(digits)) return false;
   const prefix2 = digits.slice(0, 2);
   if (digits.length === 9) return ["02", "03", "04", "07", "08", "09"].includes(prefix2);
+  // 10 digits
   if (prefix2 === "05" || prefix2 === "07") return true;
   if (["02", "03", "04", "07", "08", "09"].includes(prefix2)) return true;
   return false;
@@ -239,6 +257,21 @@ function formatIsraeliPhoneForTts(ilLocalDigits) {
   return d;
 }
 
+function extractBestPhoneFromText(text) {
+  const s = String(text || '');
+  const candidates = s.match(/\+?\d[\d\s\-]{7,}\d/g) || [];
+  for (const c of candidates) {
+    const n = normalizePhoneNumber(c, null);
+    if (n) return n;
+  }
+  const digits = s.replace(/\D/g, '');
+  if (digits && digits.length >= 9) {
+    const n = normalizePhoneNumber(digits, null);
+    if (n) return n;
+  }
+  return null;
+}
+
 // -----------------------------
 // Normalize for closing phrase detection
 // -----------------------------
@@ -254,7 +287,11 @@ function normalizeForClosing(text) {
 // -----------------------------
 // Google Sheets loader (SETTINGS + PROMPTS only)
 // -----------------------------
-let sheetsCache = { loadedAt: 0, settings: {}, prompts: {} };
+let sheetsCache = {
+  loadedAt: 0,
+  settings: {}, // key->value
+  prompts: {},  // prompt_id->content_he
+};
 
 function decodeServiceAccountJsonB64(b64) {
   const raw = Buffer.from(b64, "base64").toString("utf8");
@@ -273,6 +310,7 @@ async function getSheetsClient() {
 }
 
 function parseSettingsRows(rows) {
+  // expected header: key | value | notes (notes optional)
   const out = {};
   for (let i = 1; i < rows.length; i++) {
     const r = rows[i] || [];
@@ -285,6 +323,7 @@ function parseSettingsRows(rows) {
 }
 
 function parsePromptsRows(rows) {
+  // expected header: prompt_id | content_he
   const out = {};
   for (let i = 1; i < rows.length; i++) {
     const r = rows[i] || [];
@@ -302,7 +341,12 @@ async function refreshSheetsCache(tag = "Sheets") {
 
   try {
     const sheets = await getSheetsClient();
-    const ranges = [`${GSHEETS_SETTINGS_TAB}!A:C`, `${GSHEETS_PROMPTS_TAB}!A:B`];
+
+    const ranges = [
+      `${GSHEETS_SETTINGS_TAB}!A:C`,
+      `${GSHEETS_PROMPTS_TAB}!A:B`,
+    ];
+
     const res = await sheets.spreadsheets.values.batchGet({
       spreadsheetId: GSHEET_ID,
       ranges,
@@ -316,7 +360,11 @@ async function refreshSheetsCache(tag = "Sheets") {
     const settings = parseSettingsRows(settingsRows);
     const prompts = parsePromptsRows(promptsRows);
 
-    sheetsCache = { loadedAt: now, settings, prompts };
+    sheetsCache = {
+      loadedAt: now,
+      settings,
+      prompts,
+    };
 
     logInfo(tag, "Sheets cache refreshed.", {
       loadedAt: nowIso(),
@@ -330,11 +378,11 @@ async function refreshSheetsCache(tag = "Sheets") {
 
 function getSetting(key, def = "") {
   const v = sheetsCache.settings[key];
-  return v !== undefined && v !== null && String(v).trim() !== "" ? String(v).trim() : def;
+  return (v !== undefined && v !== null && String(v).trim() !== "") ? String(v).trim() : def;
 }
 function getPrompt(id, def = "") {
   const v = sheetsCache.prompts[id];
-  return v !== undefined && v !== null && String(v).trim() !== "" ? String(v).trim() : def;
+  return (v !== undefined && v !== null && String(v).trim() !== "") ? String(v).trim() : def;
 }
 
 // -----------------------------
@@ -342,12 +390,12 @@ function getPrompt(id, def = "") {
 // -----------------------------
 const EXTRA_BEHAVIOR_RULES = `
 חוקי מערכת קבועים (גבוהים מהפרומפט העסקי):
-1. אל תתייחסי למוזיקה, רעשים או איכות הקו. אם לא הבנת – אמרי קצר: "לא שמעתי טוב, אפשר לחזור על זה?"
-2. אל תסיימי שיחה רק בגלל "תודה/זהו" וכו'. סיימי רק אחרי אישור ברור.
-3. כשמסיימים – אמרי את משפט הסגירה המדויק מהמערכת בלבד.
-4. תשובות קצרות (2–3 משפטים) ואז שאלה אחת.
-5. סיום טבעי: "לפני שאני מסיימת, יש עוד משהו שתרצו או שהכול ברור?" אם "לא" – אז משפט הסגירה.
-6. מספר טלפון: חזרי בדיוק ובקשי "זה נכון?" בלי לנחש.
+1. אל תתייחסי למוזיקה, רעשים או איכות הקו, גם אם את מזהה אותם. התייחסי רק לתוכן מילולי שנשמע כמו דיבור מכוון אלייך. אם לא הבנת משפט – אמרי בקצרה: "לא שמעתי טוב, אפשר לחזור על זה?" בלי לתאר את הרעש.
+2. לעולם אל תחליטי לסיים שיחה רק בגלל מילים שהלקוח אמר (כמו "תודה", "זהו", "לא צריך" וכדומה). המשיכי לענות עד שמערכת הטלפון מסיימת את השיחה או עד שהלקוח אומר במפורש שהוא רוצה לסיים.
+3. כאשר את מתבקשת לסיים שיחה, אמרי את משפט הסגירה המדויק שהוגדר במערכת בלבד, בלי להוסיף ובלי לשנות.
+4. שמרי על תשובות קצרות, ברורות וממוקדות (בדרך כלל עד 2–3 משפטים), ואז שאלה אחת להמשך.
+5. בסיום טבעי: שאלי "לפני שאני מסיימת, יש עוד משהו שתרצו או שהכול ברור?" אם עונים "לא/זהו/הכול ברור" – אז אמרי מיד את משפט הסגירה המדויק.
+6. מספרי טלפון: אם הלקוח מסר מספר – חזרי עליו בדיוק כפי שנמסר, ובקשי אישור קצר: "זה נכון?". אל תשני ספרות ואל תנחשי.
 `.trim();
 
 function buildSystemInstructionsFromSheets() {
@@ -379,34 +427,94 @@ function getClosingScriptFromSheets() {
 }
 
 // -----------------------------
-// Twilio REST helpers: auth + fetch caller + hangup + recordings
+// Lead parsing helper (uses LEAD_CAPTURE_PROMPT from Sheets)
+// -----------------------------
+async function extractLeadFromConversation(conversationLog, botName, businessName) {
+  const tag = "LeadParse";
+
+  if (!MB_ENABLE_SMART_LEAD_PARSING) {
+    logDebug(tag, "Smart lead parsing disabled via ENV.");
+    return null;
+  }
+  if (!OPENAI_API_KEY) {
+    logError(tag, "Missing OPENAI_API_KEY for lead parsing.");
+    return null;
+  }
+  if (!Array.isArray(conversationLog) || conversationLog.length === 0) {
+    logDebug(tag, "Empty conversationLog – skipping lead parsing.");
+    return null;
+  }
+
+  const leadCapturePrompt = getPrompt("LEAD_CAPTURE_PROMPT", "").trim();
+  const defaultSchemaPrompt = `
+החזר אך ורק json / JSON תקין, בלי טקסט נוסף. (json)
+סכמה:
+{"is_lead":boolean,"intent":"sales"|"support"|"delivery"|"message"|"unknown","full_name":string|null,"phone_number":string|null,"reason":string|null,"notes":string|null}
+`.trim();
+
+  const systemPrompt = (`Return ONLY a valid JSON object (json).\n` + (leadCapturePrompt || defaultSchemaPrompt)).trim();
+
+  const transcript = conversationLog
+    .map((m) => `${m.from === "user" ? "לקוח" : botName}: ${m.text}`)
+    .join("\n");
+
+  const userPrompt = `Please reply with json only. (json)\nתמלול שיחה בין לקוח לבין הבוט "${botName}" עבור העסק "${businessName}":\n${transcript}`;
+
+  try {
+    const res = await fetchWithTimeout("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: MB_LEAD_PARSING_MODEL,
+        response_format: { type: "json_object" },
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userPrompt },
+        ],
+      }),
+    }, 8500);
+
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      logError(tag, `OpenAI lead parsing HTTP ${res.status}`, txt);
+      return null;
+    }
+
+    const data = await res.json();
+    const raw = data.choices?.[0]?.message?.content;
+    if (!raw) return null;
+
+    let parsed = null;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (_) {
+      parsed = null;
+    }
+    if (!parsed || typeof parsed !== "object") return null;
+
+    // Normalize phone
+    if (MB_FORCE_DIGITS_PHONE) {
+      const normalized = normalizePhoneNumber(parsed.phone_number, null);
+      parsed.phone_number = normalized || null;
+    }
+
+    logInfo(tag, "Lead parsed.", parsed);
+    return parsed;
+  } catch (err) {
+    logError(tag, "Lead parsing error", err);
+    return null;
+  }
+}
+
+// -----------------------------
+// Twilio helpers: hangup, recording
 // -----------------------------
 function twilioAuthHeader() {
   if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) return null;
   return "Basic " + Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64");
-}
-
-async function fetchCallerNumberFromTwilio(callSid, tag = "Twilio") {
-  const auth = twilioAuthHeader();
-  if (!auth || !callSid) return null;
-  try {
-    const url = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls/${callSid}.json`;
-    const res = await fetchWithTimeout(
-      url,
-      { method: "GET", headers: { Authorization: auth } },
-      6500
-    );
-    if (!res.ok) {
-      const txt = await res.text().catch(() => "");
-      logError(tag, `fetchCallerNumberFromTwilio HTTP ${res.status}`, txt);
-      return null;
-    }
-    const data = await res.json().catch(() => null);
-    return data?.from || null;
-  } catch (err) {
-    logError(tag, "fetchCallerNumberFromTwilio error", err);
-    return null;
-  }
 }
 
 async function hangupTwilioCall(callSid, tag = "Twilio") {
@@ -418,15 +526,14 @@ async function hangupTwilioCall(callSid, tag = "Twilio") {
     const url = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls/${callSid}.json`;
     const body = new URLSearchParams({ Status: "completed" });
 
-    const res = await fetchWithTimeout(
-      url,
-      {
-        method: "POST",
-        headers: { Authorization: auth, "Content-Type": "application/x-www-form-urlencoded" },
-        body,
+    const res = await fetchWithTimeout(url, {
+      method: "POST",
+      headers: {
+        Authorization: auth,
+        "Content-Type": "application/x-www-form-urlencoded",
       },
-      6500
-    );
+      body,
+    }, 6500);
 
     if (!res.ok) {
       const txt = await res.text().catch(() => "");
@@ -452,11 +559,14 @@ async function startTwilioRecording(callSid, tag = "TwilioRec") {
       RecordingStatusCallbackEvent: "completed",
     });
 
-    const res = await fetchWithTimeout(
-      url,
-      { method: "POST", headers: { Authorization: auth, "Content-Type": "application/x-www-form-urlencoded" }, body },
-      6500
-    );
+    const res = await fetchWithTimeout(url, {
+      method: "POST",
+      headers: {
+        Authorization: auth,
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body,
+    }, 6500);
 
     if (!res.ok) {
       const txt = await res.text().catch(() => "");
@@ -482,7 +592,11 @@ async function fetchLatestRecordingForCall(callSid, tag = "TwilioRec") {
 
   try {
     const url = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls/${callSid}/Recordings.json?PageSize=20`;
-    const res = await fetchWithTimeout(url, { method: "GET", headers: { Authorization: auth } }, 6500);
+    const res = await fetchWithTimeout(url, {
+      method: "GET",
+      headers: { Authorization: auth },
+    }, 6500);
+
     if (!res.ok) {
       const txt = await res.text().catch(() => "");
       logError(tag, `Fetch recordings HTTP ${res.status}`, txt);
@@ -493,6 +607,7 @@ async function fetchLatestRecordingForCall(callSid, tag = "TwilioRec") {
     const recs = Array.isArray(data?.recordings) ? data.recordings : [];
     if (!recs.length) return null;
 
+    // Pick newest by date_created
     recs.sort((a, b) => String(b.date_created || "").localeCompare(String(a.date_created || "")));
     const r = recs[0];
     const recSid = r.sid || null;
@@ -520,80 +635,7 @@ async function fetchLatestRecordingForCall(callSid, tag = "TwilioRec") {
 }
 
 // -----------------------------
-// Lead parsing helper (uses LEAD_CAPTURE_PROMPT from Sheets)
-// -----------------------------
-async function extractLeadFromConversation(conversationLog, botName, businessName) {
-  const tag = "LeadParse";
-
-  if (!MB_ENABLE_SMART_LEAD_PARSING) return null;
-  if (!OPENAI_API_KEY) return null;
-  if (!Array.isArray(conversationLog) || conversationLog.length === 0) return null;
-
-  const leadCapturePrompt = getPrompt("LEAD_CAPTURE_PROMPT", "").trim();
-  const defaultSchemaPrompt = `
-החזר אך ורק JSON תקין, בלי טקסט נוסף.
-סכמה:
-{"is_lead":boolean,"intent":"sales"|"support"|"delivery"|"message"|"unknown","full_name":string|null,"phone_number":string|null,"reason":string|null,"notes":string|null}
-`.trim();
-
-  const systemPrompt = leadCapturePrompt || defaultSchemaPrompt;
-
-  const transcript = conversationLog
-    .map((m) => `${m.from === "user" ? "לקוח" : botName}: ${m.text}`)
-    .join("\n");
-
-  const userPrompt = `תמלול שיחה בין לקוח לבין הבוט "${botName}" עבור העסק "${businessName}":\n${transcript}`;
-
-  try {
-    const res = await fetchWithTimeout(
-      "https://api.openai.com/v1/chat/completions",
-      {
-        method: "POST",
-        headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: MB_LEAD_PARSING_MODEL,
-          response_format: { type: "json_object" },
-          messages: [
-            { role: "system", content: systemPrompt },
-            { role: "user", content: userPrompt },
-          ],
-        }),
-      },
-      8500
-    );
-
-    if (!res.ok) {
-      const txt = await res.text().catch(() => "");
-      logError(tag, `Lead parsing HTTP ${res.status}`, txt);
-      return null;
-    }
-
-    const data = await res.json();
-    const raw = data.choices?.[0]?.message?.content;
-    if (!raw) return null;
-
-    let parsed = null;
-    try {
-      parsed = JSON.parse(raw);
-    } catch (_) {
-      parsed = null;
-    }
-    if (!parsed || typeof parsed !== "object") return null;
-
-    if (MB_FORCE_DIGITS_PHONE) {
-      const normalized = normalizePhoneNumber(parsed.phone_number, null);
-      parsed.phone_number = normalized || null;
-    }
-
-    return parsed;
-  } catch (err) {
-    logError(tag, "Lead parsing error", err);
-    return null;
-  }
-}
-
-// -----------------------------
-// Webhook helpers
+// Webhook senders
 // -----------------------------
 function mapCallStatus(reason) {
   const r = String(reason || "").toLowerCase();
@@ -602,14 +644,25 @@ function mapCallStatus(reason) {
   return "completed";
 }
 
+function isAbandonedReason(reason) {
+  const r = String(reason || '').toLowerCase();
+  return [
+    'twilio_stop',
+    'twilio_ws_closed',
+    'twilio_ws_error',
+    'openai_ws_closed',
+    'openai_ws_error',
+  ].includes(r);
+}
+
 async function postJson(url, payload, timeoutMs = 6500) {
   if (!url) return { ok: false, status: 0 };
   try {
-    const res = await fetchWithTimeout(
-      url,
-      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) },
-      timeoutMs
-    );
+    const res = await fetchWithTimeout(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }, timeoutMs);
     return { ok: res.ok, status: res.status, text: await res.text().catch(() => "") };
   } catch (err) {
     return { ok: false, status: 0, text: String(err?.message || err) };
@@ -624,14 +677,18 @@ app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
 app.get("/health", async (req, res) => {
-  await refreshSheetsCache("Health");
-  res.status(200).json({
-    ok: true,
-    ts: nowIso(),
-    sheets_loaded_at: sheetsCache.loadedAt ? new Date(sheetsCache.loadedAt).toISOString() : null,
-    settings_keys: Object.keys(sheetsCache.settings || {}).length,
-    prompt_ids: Object.keys(sheetsCache.prompts || {}).length,
-  });
+  try {
+    await refreshSheetsCache("Health");
+    res.status(200).json({
+      ok: true,
+      ts: nowIso(),
+      sheets_loaded_at: sheetsCache.loadedAt ? new Date(sheetsCache.loadedAt).toISOString() : null,
+      settings_keys: Object.keys(sheetsCache.settings || {}).length,
+      prompt_ids: Object.keys(sheetsCache.prompts || {}).length,
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: "health_failed" });
+  }
 });
 
 // Twilio Voice Webhook (TwiML)
@@ -669,7 +726,12 @@ const wss = new WebSocket.Server({ server, path: "/twilio-media-stream" });
 
 wss.on("connection", (twilioWs, req) => {
   const connId = `conn_${Date.now().toString(36)}_${Math.random().toString(16).slice(2, 6)}`;
-  logAlways(`WS connection`, { at: nowIso(), ip: req.socket?.remoteAddress, ua: req.headers["user-agent"], url: req.url });
+  logAlways(`WS connection`, {
+    at: nowIso(),
+    ip: req.socket?.remoteAddress,
+    ua: req.headers["user-agent"],
+    url: req.url,
+  });
 
   let streamSid = null;
   let callSid = null;
@@ -678,13 +740,13 @@ wss.on("connection", (twilioWs, req) => {
   let callDirection = null;
 
   let openAiReady = false;
-  let twilioStarted = false;
-
   let twilioClosed = false;
   let openAiClosed = false;
   let callEnded = false;
 
   let conversationLog = [];
+  let capturedPhoneIL = null; // from caller speech (best effort)
+
   let currentBotText = "";
   let callStartTs = Date.now();
   let lastMediaTs = Date.now();
@@ -705,12 +767,10 @@ wss.on("connection", (twilioWs, req) => {
   let leadWebhookSent = false;
   let abandonedWebhookSent = false;
 
+  let recordingStartSid = null; // returned by start recording
   let recordingInfo = null;
 
-  // Buffer early OpenAI audio deltas until streamSid exists (prevents silence)
-  const earlyAudioBuffer = [];
-  const EARLY_AUDIO_MAX = 120; // about a short burst; protects memory
-
+  // Load sheets (non-blocking)
   refreshSheetsCache("OnConnect").catch(() => {});
 
   function getGraceMs() {
@@ -719,33 +779,12 @@ wss.on("connection", (twilioWs, req) => {
     return Math.max(2000, Math.min(raw, 8000));
   }
 
-  function sendTwilioAudioDelta(b64) {
-    if (!b64) return;
-
-    if (!streamSid) {
-      // buffer until start event arrives
-      if (earlyAudioBuffer.length < EARLY_AUDIO_MAX) earlyAudioBuffer.push(b64);
-      return;
-    }
-
-    if (twilioWs.readyState === WebSocket.OPEN) {
-      twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload: b64 } }));
-    }
-  }
-
-  function flushEarlyAudioIfAny() {
-    if (!streamSid) return;
-    if (!earlyAudioBuffer.length) return;
-    while (earlyAudioBuffer.length) {
-      const b64 = earlyAudioBuffer.shift();
-      sendTwilioAudioDelta(b64);
-    }
-  }
-
   function safeCancelResponseIfNeeded(openAiWs) {
     if (!openAiReady || openAiWs.readyState !== WebSocket.OPEN) return;
     if (!hasActiveResponse) return;
-    try { openAiWs.send(JSON.stringify({ type: "response.cancel" })); } catch (_) {}
+    try {
+      openAiWs.send(JSON.stringify({ type: "response.cancel" }));
+    } catch (_) {}
     hasActiveResponse = false;
     botSpeaking = false;
     botTurnActive = false;
@@ -757,10 +796,13 @@ wss.on("connection", (twilioWs, req) => {
 
     openAiWs.send(JSON.stringify({
       type: "conversation.item.create",
-      item: { type: "message", role: "user", content: [{ type: "input_text", text }] },
+      item: {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text }],
+      },
     }));
     openAiWs.send(JSON.stringify({ type: "response.create" }));
-
     hasActiveResponse = true;
     botTurnActive = true;
     logDebug(connId, `response.create SPEAK purpose=${purpose || "n/a"} text=${text}`);
@@ -770,6 +812,7 @@ wss.on("connection", (twilioWs, req) => {
     if (callEnded) return;
     if (graceHangupTimer) return;
     const graceMs = getGraceMs();
+
     graceHangupTimer = setTimeout(() => {
       graceHangupTimer = null;
       endCall(reason, closingMessage).catch(() => {});
@@ -790,6 +833,7 @@ wss.on("connection", (twilioWs, req) => {
       return;
     }
 
+    // Fallback: force end even if model didn't finish
     setTimeout(() => {
       if (callEnded) return;
       if (!pendingHangup) return;
@@ -804,6 +848,7 @@ wss.on("connection", (twilioWs, req) => {
     const closing = normalizeForClosing(getClosingScriptFromSheets());
     const norm = normalizeForClosing(text);
     if (!closing || !norm) return;
+
     if (norm.includes(closing) || closing.includes(norm)) {
       scheduleForceEndAfterGrace("bot_closing_config", getClosingScriptFromSheets());
     }
@@ -836,11 +881,18 @@ wss.on("connection", (twilioWs, req) => {
     else logInfo(connId, `ABANDONED webhook delivered status=${r.status}`);
   }
 
+  // -----------------------------
+  // endCall (single exit)
+  // -----------------------------
   async function endCall(reason, closingMessage) {
     if (callEnded) return;
     callEnded = true;
 
-    if (graceHangupTimer) { clearTimeout(graceHangupTimer); graceHangupTimer = null; }
+    if (graceHangupTimer) {
+      clearTimeout(graceHangupTimer);
+      graceHangupTimer = null;
+    }
+
     if (idleCheckInterval) clearInterval(idleCheckInterval);
     if (maxCallTimeout) clearTimeout(maxCallTimeout);
     if (maxCallWarningTimeout) clearTimeout(maxCallWarningTimeout);
@@ -848,34 +900,36 @@ wss.on("connection", (twilioWs, req) => {
     const botName = getSetting("BOT_NAME", "נטע");
     const businessName = getSetting("BUSINESS_NAME", "גיל ספורט");
 
-    // Ensure latest sheets available for close/log (best effort)
-    await refreshSheetsCache("EndCall").catch(() => {});
-
-    // Backfill caller from Twilio REST if missing
-    if (!callerNumber && callSid) {
-      const from = await fetchCallerNumberFromTwilio(callSid, connId).catch(() => null);
-      if (from) callerNumber = from;
-    }
-
     const endedAt = nowIso();
     const startedAt = new Date(callStartTs).toISOString();
     const durationSec = Math.max(0, Math.round((Date.now() - callStartTs) / 1000));
 
     const lastUser = [...conversationLog].reverse().find((m) => m.from === "user")?.text || null;
-    const transcript = conversationLog.map((m) => `${m.from === "user" ? "לקוח" : botName}: ${m.text}`).join("\n");
+    const transcript = conversationLog
+      .map((m) => `${m.from === "user" ? "לקוח" : botName}: ${m.text}`)
+      .join("\n");
 
+    // Recording info
     if (MB_ENABLE_RECORDING && callSid) {
-      try { recordingInfo = await fetchLatestRecordingForCall(callSid, connId); } catch (_) {}
+      try {
+        recordingInfo = await fetchLatestRecordingForCall(callSid, connId);
+      } catch (_) {}
     }
 
+    // Parse lead (best effort)
     let parsedLead = null;
-    try { parsedLead = await extractLeadFromConversation(conversationLog, botName, businessName); } catch (_) {}
+    try {
+      parsedLead = await extractLeadFromConversation(conversationLog, botName, businessName);
+    } catch (_) {
+      parsedLead = null;
+    }
 
+    // Enrich caller id
     const callerRaw = callerNumber ? String(callerNumber) : null;
     const callerIL = toIsraeliLocalFromAny(callerRaw) || null;
-    const callerE164 =
-      toE164FromIsraeliLocal(callerIL) || (callerRaw && callerRaw.startsWith("+") ? callerRaw : null);
+    const callerE164 = toE164FromIsraeliLocal(callerIL) || (callerRaw && callerRaw.startsWith("+") ? callerRaw : null);
 
+    // Determine full lead
     let normalizedPhone = null;
     if (parsedLead && typeof parsedLead === "object") {
       normalizedPhone = normalizePhoneNumber(parsedLead.phone_number, callerRaw);
@@ -883,8 +937,8 @@ wss.on("connection", (twilioWs, req) => {
     }
     const isFullLead = !!(parsedLead && parsedLead.is_lead === true && (parsedLead.phone_number || normalizedPhone));
 
+    // Common payload fields
     const basePayload = {
-      event: "call_log",
       call_id: callSid || streamSid || `${connId}`,
       callSid: callSid || null,
       streamSid: streamSid || null,
@@ -907,24 +961,45 @@ wss.on("connection", (twilioWs, req) => {
       bot_name: botName,
 
       recording: recordingInfo || null,
+
       public_base_url: PUBLIC_BASE_URL || null,
-      parsedLead: parsedLead || null,
-      isFullLead,
     };
 
-    // 1) ALWAYS call log (full documentation)
-    await sendCallLogWebhook(basePayload);
+    // 1) ALWAYS send call log (full documentation)
+    await sendCallLogWebhook({
+      ...basePayload,
+      parsedLead: parsedLead || null,
+      isFullLead,
+      lead_sent: leadWebhookSent,
+    });
 
-    // 2) Final lead only if full lead
+    // 2) FINAL lead webhook only if full lead
     if (isFullLead) {
-      await sendFinalLeadWebhook({ ...basePayload, event: "lead_final", phone_number: parsedLead.phone_number, isFullLead: true });
+      const finalPayload = {
+        ...basePayload,
+        parsedLead,
+        isFullLead: true,
+        phone_number: parsedLead.phone_number,
+      };
+      await sendFinalLeadWebhook(finalPayload);
     } else {
-      // 3) Abandoned if not full lead (includes caller id as best effort)
-      await sendAbandonedWebhook({ ...basePayload, event: "call_abandoned", isFullLead: false });
+      // 3) ABANDONED webhook ONLY when the call truly ended unexpectedly
+      if (isAbandonedReason(reason)) {
+        const abandonmentPayload = {
+          ...basePayload,
+          parsedLead: parsedLead || null,
+          isFullLead: false,
+        };
+        await sendAbandonedWebhook(abandonmentPayload);
+      } else {
+        logInfo(connId, 'No full lead, but call ended normally; abandoned webhook will NOT be sent.');
+      }
     }
 
+    // Hangup call (best effort)
     if (callSid) hangupTwilioCall(callSid, connId).catch(() => {});
 
+    // Close sockets
     if (!openAiClosed) {
       openAiClosed = true;
       try { openAiWs.close(); } catch (_) {}
@@ -938,45 +1013,30 @@ wss.on("connection", (twilioWs, req) => {
   // -----------------------------
   // OpenAI Realtime WS
   // -----------------------------
-  const openAiWs = new WebSocket(
-    `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_REALTIME_MODEL)}`,
-    { headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "OpenAI-Beta": "realtime=v1" } }
-  );
+  const openAiWs = new WebSocket(`wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_REALTIME_MODEL)}`, {
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      "OpenAI-Beta": "realtime=v1",
+    },
+  });
 
   logDebug(connId, `Creating OpenAI WS... model=${OPENAI_REALTIME_MODEL} voice=${OPENAI_VOICE}`);
-
-  let sessionConfigured = false;
-  let openingSent = false;
-
-  function maybeSendOpening() {
-    if (!openAiReady) return;
-    if (!twilioStarted) return;
-    if (!streamSid) return;
-    if (!sessionConfigured) return;
-    if (openingSent) return;
-
-    const opening = getOpeningScriptFromSheets();
-    openingSent = true;
-
-    sendModelPrompt(
-      openAiWs,
-      `פתחי את השיחה עם הלקוח במשפט הבא (אפשר לשנות מעט את הניסוח אבל לא להאריך): "${opening}" ואז עצרי והמתיני לתשובה שלו.`,
-      "opening_greeting"
-    );
-  }
 
   openAiWs.on("open", async () => {
     openAiReady = true;
     logDebug(connId, "OpenAI connected");
 
-    await refreshSheetsCache("Startup").catch(() => {});
+    // Ensure latest sheets loaded now (before session.update)
+    await refreshSheetsCache("Startup");
+
     const instructions = buildSystemInstructionsFromSheets();
+    const opening = getOpeningScriptFromSheets();
 
     logAlways(`[${connId}] SOURCES`, {
       sheets_loaded_at: sheetsCache.loadedAt ? new Date(sheetsCache.loadedAt).toISOString() : null,
       opening_from: "SETTINGS.OPENING_SCRIPT",
       master_from: "PROMPTS.MASTER_PROMPT (+ KB + GUARDRAILS)",
-      opening_preview: (getOpeningScriptFromSheets() || "").slice(0, 120),
+      opening_preview: opening.slice(0, 120),
       master_preview: (getPrompt("MASTER_PROMPT", "") || "").slice(0, 160),
     });
 
@@ -997,24 +1057,30 @@ wss.on("connection", (twilioWs, req) => {
           silence_duration_ms: effectiveSilenceMs,
           prefix_padding_ms: MB_VAD_PREFIX_MS,
         },
-        // must be >= 0.6 (API constraint you already saw)
+        // IMPORTANT: keep >= 0.6 to avoid API min constraint
         temperature: 0.7,
         instructions,
       },
     };
 
     openAiWs.send(JSON.stringify(sessionUpdate));
-    sessionConfigured = true;
 
-    // IMPORTANT: opening is sent only after Twilio start/streamSid exists
-    maybeSendOpening();
+    // Opening prompt (MisterBot style)
+    sendModelPrompt(openAiWs, `פתחי את השיחה עם הלקוח במשפט הבא (אפשר לשנות מעט את הניסוח אבל לא להאריך): "${opening}" ואז עצרי והמתיני לתשובה שלו.`, "opening_greeting");
   });
 
   openAiWs.on("message", (data) => {
     let msg;
-    try { msg = JSON.parse(data.toString()); } catch (err) { logError(connId, "Failed to parse OpenAI message", err); return; }
+    try {
+      msg = JSON.parse(data.toString());
+    } catch (err) {
+      logError(connId, "Failed to parse OpenAI message", err);
+      return;
+    }
 
-    switch (msg.type) {
+    const type = msg.type;
+
+    switch (type) {
       case "response.created":
         currentBotText = "";
         hasActiveResponse = true;
@@ -1045,12 +1111,18 @@ wss.on("connection", (twilioWs, req) => {
 
       case "response.audio.delta": {
         const b64 = msg.delta;
-        if (!b64) break;
+        if (!b64 || !streamSid) break;
+
         botSpeaking = true;
         noListenUntilTs = Date.now() + MB_NO_BARGE_TAIL_MS;
 
-        // This now buffers if streamSid not ready
-        sendTwilioAudioDelta(b64);
+        if (twilioWs.readyState === WebSocket.OPEN) {
+          twilioWs.send(JSON.stringify({
+            event: "media",
+            streamSid,
+            media: { payload: b64 },
+          }));
+        }
         break;
       }
 
@@ -1080,18 +1152,31 @@ wss.on("connection", (twilioWs, req) => {
       }
 
       case "conversation.item.input_audio_transcription.completed": {
-        if (!MB_ENABLE_TRANSCRIPTION || !MB_LOG_TRANSCRIPTS) break;
+        if (!MB_ENABLE_TRANSCRIPTION) break;
+        if (!MB_LOG_TRANSCRIPTS) break;
 
         const raw = String(msg.transcript || "").trim();
         const hasRealUserYet = conversationLog.some((m) => m.from === "user" && (m.text || "").trim().length >= 4);
+
         if (!raw) break;
-        if (isTranscriptGarbage(raw, hasRealUserYet)) { logDebug(connId, `Filtered garbage transcript: "${raw}"`); break; }
+        if (isTranscriptGarbage(raw, hasRealUserYet)) {
+          logDebug(connId, `Filtered garbage transcript: "${raw}"`);
+          break;
+        }
 
         const t = raw.replace(/\s+/g, " ").replace(/\s+([,.:;!?])/g, "$1").trim();
         if (!t) break;
 
         conversationLog.push({ from: "user", text: t });
         logAlways(`[CALLER][${connId}] ${t}`);
+
+        // Best-effort deterministic phone capture from caller speech
+        const phoneFromSpeech = extractBestPhoneFromText(t);
+        if (phoneFromSpeech) {
+          capturedPhoneIL = phoneFromSpeech;
+          logDebug(connId, `Captured phone from speech: ${capturedPhoneIL}`);
+        }
+
         break;
       }
 
@@ -1101,6 +1186,7 @@ wss.on("connection", (twilioWs, req) => {
         botSpeaking = false;
         botTurnActive = false;
         noListenUntilTs = 0;
+        // if API errors, end call gracefully
         if (!callEnded) endCall("openai_error", getClosingScriptFromSheets()).catch(() => {});
         break;
 
@@ -1117,38 +1203,36 @@ wss.on("connection", (twilioWs, req) => {
 
   openAiWs.on("error", (err) => {
     logError(connId, "OpenAI WS error", err);
-    if (!openAiClosed) { openAiClosed = true; try { openAiWs.close(); } catch (_) {} }
+    if (!openAiClosed) {
+      openAiClosed = true;
+      try { openAiWs.close(); } catch (_) {}
+    }
     if (!callEnded) endCall("openai_ws_error", getClosingScriptFromSheets()).catch(() => {});
   });
 
   // -----------------------------
   // Twilio Media Stream handlers
   // -----------------------------
-  function backfillStreamSidFromAnyMsg(m) {
-    if (streamSid) return;
-    const sid = m?.streamSid || m?.start?.streamSid || null;
-    if (sid) streamSid = sid;
-  }
-
   twilioWs.on("message", async (data) => {
     let msg;
-    try { msg = JSON.parse(data.toString()); } catch (err) { logError(connId, "Failed to parse Twilio WS message", err); return; }
+    try {
+      msg = JSON.parse(data.toString());
+    } catch (err) {
+      logError(connId, "Failed to parse Twilio WS message", err);
+      return;
+    }
 
     const event = msg.event;
 
-    // Backfill streamSid from any message shape
-    backfillStreamSidFromAnyMsg(msg);
-
     if (event === "start") {
-      streamSid = msg.start?.streamSid || streamSid || null;
+      streamSid = msg.start?.streamSid || null;
       callSid = msg.start?.callSid || null;
 
       const cp = msg.start?.customParameters || {};
-      callerNumber = cp.caller || cp.From || cp.from || msg.start?.caller || msg.start?.from || callerNumber || null;
-      calledNumber = cp.called || cp.To || cp.to || msg.start?.to || calledNumber || null;
+      callerNumber = cp.caller || cp.From || cp.from || msg.start?.caller || msg.start?.from || null;
+      calledNumber = cp.called || cp.To || cp.to || msg.start?.to || null;
       callDirection = cp.direction || msg.start?.direction || "inbound";
 
-      twilioStarted = true;
       callStartTs = Date.now();
       lastMediaTs = Date.now();
 
@@ -1156,15 +1240,12 @@ wss.on("connection", (twilioWs, req) => {
 
       // Start recording if enabled
       if (MB_ENABLE_RECORDING && callSid) {
-        startTwilioRecording(callSid, connId).catch(() => {});
+        startTwilioRecording(callSid, connId).then((sid) => {
+          recordingStartSid = sid || null;
+        }).catch(() => {});
       }
 
-      // Now streamSid exists -> flush any early audio
-      flushEarlyAudioIfAny();
-
-      // If OpenAI session already configured, send opening now
-      maybeSendOpening();
-
+      // Idle checks
       idleCheckInterval = setInterval(() => {
         const now = Date.now();
         const sinceMedia = now - lastMediaTs;
@@ -1186,6 +1267,7 @@ wss.on("connection", (twilioWs, req) => {
         }
       }, 1000);
 
+      // Max call duration
       if (MB_MAX_CALL_MS > 0) {
         if (MB_MAX_WARN_BEFORE_MS > 0 && MB_MAX_CALL_MS > MB_MAX_WARN_BEFORE_MS) {
           maxCallWarningTimeout = setTimeout(() => {
@@ -1213,6 +1295,7 @@ wss.on("connection", (twilioWs, req) => {
       if (!openAiReady || openAiWs.readyState !== WebSocket.OPEN) return;
 
       const now = Date.now();
+
       if (!MB_ALLOW_BARGE_IN) {
         if (botTurnActive || botSpeaking || now < noListenUntilTs) return;
       }
@@ -1220,9 +1303,6 @@ wss.on("connection", (twilioWs, req) => {
       openAiWs.send(JSON.stringify({ type: "input_audio_buffer.append", audio: payload }));
 
     } else if (event === "stop") {
-      // stop sometimes includes streamSid at top-level
-      if (msg.streamSid && !streamSid) streamSid = msg.streamSid;
-
       logAlways(`[TWILIO_STOP][${connId}] stream stopped`);
       twilioClosed = true;
       if (!callEnded) endCall("twilio_stop", getClosingScriptFromSheets()).catch(() => {});
