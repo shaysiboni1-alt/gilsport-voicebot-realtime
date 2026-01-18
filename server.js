@@ -1021,7 +1021,7 @@ wss.on("connection", (twilioWs, req) => {
 
   // Realtime API schema compatibility: prefer `output_modalities`, fall back to legacy `modalities`.
   // Some model versions / deployments validate one or the other.
-  let USE_OUTPUT_MODALITIES = true;
+  let USE_OUTPUT_MODALITIES = false;
   let DID_FALLBACK_MODALITIES = false;
 
   const connTag = `conn_${Date.now().toString(36)}_${Math.random().toString(16).slice(2, 6)}`;
@@ -1255,10 +1255,10 @@ wss.on("connection", (twilioWs, req) => {
 
         // Request audio (transcript is included with audio outputs)
         ...(USE_OUTPUT_MODALITIES
-          ? { output_modalities: ["audio"] }
+          ? { output_modalities: ["audio","text"] }
           : { modalities: ["audio", "text"] }),
         instructions,
-        temperature: 0,
+        temperature: 0.7,
         max_output_tokens: 400
       }
     });
@@ -1336,7 +1336,7 @@ wss.on("connection", (twilioWs, req) => {
         ],
         ...(USE_OUTPUT_MODALITIES ? { output_modalities: ["text"] } : { modalities: ["text"] }),
         instructions,
-        temperature: 0,
+        temperature: 0.7,
         max_output_tokens: 500
       }
     });
@@ -2031,7 +2031,7 @@ wss.on("connection", (twilioWs, req) => {
         // Clear context for opening so it is always verbatim
         input: [],
         ...(USE_OUTPUT_MODALITIES
-          ? { output_modalities: ["audio"] }
+          ? { output_modalities: ["audio","text"] }
           : { modalities: ["audio", "text"] }),
         instructions: [
           "אתם מקריא טקסט (TTS) בעברית בשם נטע.",
@@ -2042,7 +2042,7 @@ wss.on("connection", (twilioWs, req) => {
           openingScript,
           "</SAY>"
         ].join("\n"),
-        temperature: 0,
+        temperature: 0.7,
         max_output_tokens: 200
       }
     });
@@ -2154,7 +2154,7 @@ wss.on("connection", (twilioWs, req) => {
                     t,
                     "</SAY>"
                   ].join("\n"),
-                  temperature: 0,
+                  temperature: 0.7,
                   max_output_tokens: 400
                 }
               });
