@@ -640,19 +640,20 @@ async function fetchLatestRecordingForCall(callSid, tag = "TwilioRec") {
 function mapCallStatus(reason) {
   const r = String(reason || "").toLowerCase();
   if (r.includes("error")) return "error";
-  if (r.includes("ws_closed") || r.includes("twilio_stop") || r.includes("stop")) return "abandoned";
+  if (isAbandonedReason(reason)) return "abandoned";
   return "completed";
 }
 
 function isAbandonedReason(reason) {
-  const r = String(reason || '').toLowerCase();
-  return [
-    'twilio_stop',
-    'twilio_ws_closed',
-    'twilio_ws_error',
-    'openai_ws_closed',
-    'openai_ws_error',
-  ].includes(r);
+  const r = String(reason || "").toLowerCase();
+  // Only treat as abandoned when the call ended unexpectedly.
+  return (
+    r.startsWith("abandoned_") ||
+    r.includes("openai_ws_closed") ||
+    r.includes("openai_ws_error") ||
+    r.includes("twilio_ws_closed") ||
+    r.includes("twilio_ws_error")
+  );
 }
 
 async function postJson(url, payload, timeoutMs = 6500) {
@@ -764,6 +765,10 @@ wss.on("connection", (twilioWs, req) => {
   let pendingHangup = null;
   let graceHangupTimer = null;
 
+  // Used to avoid misclassifying a normal Twilio STOP (which happens at the end of every call) as abandonment
+  let plannedEnd = false;
+  let plannedEndReason = null;
+
   let leadWebhookSent = false;
   let abandonedWebhookSent = false;
 
@@ -811,6 +816,12 @@ wss.on("connection", (twilioWs, req) => {
   function scheduleForceEndAfterGrace(reason, closingMessage) {
     if (callEnded) return;
     if (graceHangupTimer) return;
+
+    const r = String(reason || '').toLowerCase();
+    if (!r.startsWith('abandoned_') && !r.includes('ws_error') && !r.includes('ws_closed')) {
+      plannedEnd = true;
+      plannedEndReason = plannedEndReason || reason || 'completed';
+    }
     const graceMs = getGraceMs();
 
     graceHangupTimer = setTimeout(() => {
@@ -822,6 +833,9 @@ wss.on("connection", (twilioWs, req) => {
   function scheduleEndCall(openAiWs, reason, closingMessage) {
     if (callEnded) return;
     if (pendingHangup) return;
+
+    plannedEnd = true;
+    plannedEndReason = plannedEndReason || reason || 'completed';
 
     const msg = closingMessage || getClosingScriptFromSheets();
     pendingHangup = { reason, closingMessage: msg };
@@ -850,6 +864,8 @@ wss.on("connection", (twilioWs, req) => {
     if (!closing || !norm) return;
 
     if (norm.includes(closing) || closing.includes(norm)) {
+      plannedEnd = true;
+      plannedEndReason = plannedEndReason || 'bot_closing_config';
       scheduleForceEndAfterGrace("bot_closing_config", getClosingScriptFromSheets());
     }
   }
@@ -917,6 +933,12 @@ wss.on("connection", (twilioWs, req) => {
     }
 
     // Parse lead (best effort)
+    // Resolve caller-id early (used for normalization)
+    const callerRaw = callerNumber ? String(callerNumber) : null;
+    const callerIL = toIsraeliLocalFromAny(callerRaw) || null;
+    const callerE164 =
+      toE164FromIsraeliLocal(callerIL) || (callerRaw && callerRaw.startsWith("+") ? callerRaw : null);
+
     let parsedLead = null;
     try {
       parsedLead = await extractLeadFromConversation(conversationLog, botName, businessName);
@@ -924,10 +946,75 @@ wss.on("connection", (twilioWs, req) => {
       parsedLead = null;
     }
 
-    // Enrich caller id
-    const callerRaw = callerNumber ? String(callerNumber) : null;
-    const callerIL = toIsraeliLocalFromAny(callerRaw) || null;
-    const callerE164 = toE164FromIsraeliLocal(callerIL) || (callerRaw && callerRaw.startsWith("+") ? callerRaw : null);
+    // --- Normalize / coerce lead fields (the parser may return Hebrew keys) ---
+    function _normKey(k) {
+      return String(k || "")
+        .toLowerCase()
+        .replace(/[֑-ׇ]/g, "") // remove niqqud/cantillation
+        .replace(/[^\p{L}\p{N}]+/gu, "")
+        .trim();
+    }
+    function _getByKeys(obj, keys) {
+      if (!obj || typeof obj !== "object") return null;
+      for (const k of keys) {
+        if (obj[k] !== undefined && obj[k] !== null && String(obj[k]).trim() !== "") return obj[k];
+      }
+      return null;
+    }
+    function _getByNormContains(obj, needles) {
+      if (!obj || typeof obj !== "object") return null;
+      const entries = Object.entries(obj);
+      for (const [k, v] of entries) {
+        const nk = _normKey(k);
+        if (!nk) continue;
+        if (needles.some((n) => nk.includes(n))) {
+          if (v !== undefined && v !== null && String(v).trim() !== "") return v;
+        }
+      }
+      return null;
+    }
+    function coerceParsedLead(obj, capturedPhone, callerRawLocal) {
+      if (!obj || typeof obj !== "object") obj = {};
+
+      // Pull candidates from common fields / Hebrew keys
+      const phoneCandidate =
+        _getByKeys(obj, ["phone_number", "phone", "טלפון", "טלפון_לחזרה", "טלפון לחזרה"]) ||
+        _getByNormContains(obj, ["טלפון", "טלפ", "phone"]);
+
+      const nameCandidate =
+        _getByKeys(obj, ["full_name", "name", "שם_מלא", "שם מלא"]) ||
+        _getByNormContains(obj, ["שםמלא", "שם", "fullname", "name"]);
+
+      const reasonCandidate =
+        _getByKeys(obj, ["reason", "סיבת_פנייה", "סיבת פנייה", "סיבתפנייה"]) ||
+        _getByNormContains(obj, ["סיבת", "פניה", "reason"]);
+
+      // Normalize phone using our deterministic captures as fallback
+      let phone = normalizePhoneNumber(phoneCandidate, callerRawLocal);
+      if (!phone && capturedPhone) phone = normalizePhoneNumber(capturedPhone, callerRawLocal) || capturedPhone;
+
+      // If still empty, use caller-id as last resort (still a valid callback target)
+      if (!phone && callerRawLocal) {
+        const il = toIsraeliLocalFromAny(callerRawLocal);
+        if (il) phone = il;
+      }
+
+      const fullName = nameCandidate ? String(nameCandidate).trim() : null;
+      const reason = reasonCandidate ? String(reasonCandidate).trim() : null;
+
+      const isLead = !!(phone || fullName || reason);
+
+      return {
+        ...obj,
+        is_lead: obj.is_lead === true ? true : isLead,
+        lead_type: obj.lead_type || (isLead ? "new" : "unknown"),
+        full_name: obj.full_name || fullName,
+        phone_number: phone,
+        reason: obj.reason || reason,
+      };
+    }
+
+    parsedLead = coerceParsedLead(parsedLead, capturedPhoneIL, callerRaw);
 
     // Determine full lead
     let normalizedPhone = null;
@@ -935,7 +1022,7 @@ wss.on("connection", (twilioWs, req) => {
       normalizedPhone = normalizePhoneNumber(parsedLead.phone_number, callerRaw);
       parsedLead.phone_number = normalizedPhone || parsedLead.phone_number || null;
     }
-    const isFullLead = !!(parsedLead && parsedLead.is_lead === true && (parsedLead.phone_number || normalizedPhone));
+    const isFullLead = !!(parsedLead && (parsedLead.phone_number || normalizedPhone));
 
     // Common payload fields
     const basePayload = {
@@ -1198,7 +1285,9 @@ wss.on("connection", (twilioWs, req) => {
   openAiWs.on("close", () => {
     openAiClosed = true;
     logDebug(connId, "OpenAI closed");
-    if (!callEnded) endCall("openai_ws_closed", getClosingScriptFromSheets()).catch(() => {});
+    if (callEnded) return;
+    if (plannedEnd) endCall(plannedEndReason || 'completed', getClosingScriptFromSheets()).catch(() => {});
+    else endCall("openai_ws_closed", getClosingScriptFromSheets()).catch(() => {});
   });
 
   openAiWs.on("error", (err) => {
@@ -1305,7 +1394,15 @@ wss.on("connection", (twilioWs, req) => {
     } else if (event === "stop") {
       logAlways(`[TWILIO_STOP][${connId}] stream stopped`);
       twilioClosed = true;
-      if (!callEnded) endCall("twilio_stop", getClosingScriptFromSheets()).catch(() => {});
+      if (callEnded) return;
+
+      // Twilio sends STOP at the end of every call (including normal hangups).
+      // If we already planned a normal end, do NOT classify as abandoned.
+      if (plannedEnd) {
+        endCall(plannedEndReason || 'completed', getClosingScriptFromSheets()).catch(() => {});
+      } else {
+        endCall('abandoned_twilio_stop', getClosingScriptFromSheets()).catch(() => {});
+      }
     }
   });
 
