@@ -64,6 +64,11 @@ const MB_FINAL_WEBHOOK_ONLY = envBool("MB_FINAL_WEBHOOK_ONLY", true);
 const MB_RECORDING_WAIT_MS = envNum("MB_RECORDING_WAIT_MS", 8000);
 const MB_DEBUG = envBool("MB_DEBUG", false);
 
+// NLU layer (safe rollout)
+const MB_NLU_MODE = String(process.env.MB_NLU_MODE || 'off').toLowerCase();
+// off | shadow | assist | assist_routing
+const MB_NLU_CONFIDENCE_MIN = envNum('MB_NLU_CONFIDENCE_MIN', 0.78);
+
 const MB_VAD_THRESHOLD = envNum("MB_VAD_THRESHOLD", 0.65);
 const MB_VAD_SILENCE_MS = envNum("MB_VAD_SILENCE_MS", 900);
 const MB_VAD_PREFIX_MS = envNum("MB_VAD_PREFIX_MS", 200);
@@ -581,6 +586,36 @@ const findImporterByBrand = (brand) => {
   }
 
   return null;
+};
+
+// Canonicalize a brand against SUPPLIERS_IMPORTERS aliases (even if the row has no phone).
+// Returns canonical brand_name if matched, else empty string.
+const matchBrandAlias = (brand) => {
+  const b = String(brand || '').trim();
+  if (!b) return '';
+  const bNorm = normalizeForMatch(b);
+  const rows = Array.isArray(SHEETS.suppliersImporters) ? SHEETS.suppliersImporters : [];
+
+  for (const r of rows) {
+    const keywords = String(r.brand_keyword || r.brand_keywords || '').trim();
+    const brandName = String(r.brand_name || '').trim();
+
+    const candidates = [];
+    if (brandName) candidates.push(brandName);
+    if (keywords) {
+      candidates.push(...keywords.split(',').map((x) => String(x || '').trim()).filter(Boolean));
+    }
+
+    for (const c of candidates) {
+      const cNorm = normalizeForMatch(c);
+      if (!cNorm) continue;
+      if (cNorm === bNorm || cNorm.includes(bNorm) || bNorm.includes(cNorm)) {
+        return brandName || b;
+      }
+    }
+  }
+
+  return '';
 };
 
 const buildCarriersList = () => {
@@ -1287,7 +1322,8 @@ wss.on("connection", (twilioWs, req) => {
       message_body: "string or empty",
       phone_digits: "10 digits starting 0 or empty",
       mentions_same_day: "true|false",
-      mentions_after_hours: "true|false"
+      mentions_after_hours: "true|false",
+      confidence: "0..1"
     };
 
     const context = {
@@ -1312,6 +1348,7 @@ wss.on("connection", (twilioWs, req) => {
       "המשימה: לחלץ רק מידע שמופיע במפורש במשפט האחרון של הלקוח. לא להמציא. לא לנחש.",
       "אם פרט לא מופיע במפורש—החזירו מחרוזת ריקה או unknown בהתאם.",
       "החזירו JSON בלבד. בלי טקסט נוסף. בלי Markdown.",
+      "הוסיפו שדה confidence בין 0 ל-1 שמייצג ביטחון בחילוץ מהמשפט האחרון בלבד.",
       `request_id: ${state.nlu_request_id}`,
       "--- SCHEMA ---",
       JSON.stringify(schema),
@@ -1816,36 +1853,67 @@ wss.on("connection", (twilioWs, req) => {
   const applyNLUToSlots = (nluObj, utterance) => {
     if (!nluObj || typeof nluObj !== "object") return;
 
-    // Route (only if not set)
+    const mode = MB_NLU_MODE;
+    if (mode === "off") return;
+
+    const conf = Number(nluObj.confidence);
+    const confidence = Number.isFinite(conf) ? conf : 0;
+
+    // Summarize extracted fields for logging
+    const summary = {
+      confidence,
+      route: String(nluObj.route || "").trim(),
+      yes_no: String(nluObj.yes_no || "").trim(),
+      full_name: String(nluObj.full_name || "").trim(),
+      phone_digits: String(nluObj.phone_digits || "").trim(),
+      product_type: String(nluObj.product_type || "").trim(),
+      product_model: String(nluObj.product_model || "").trim(),
+      product_brand: String(nluObj.product_brand || "").trim(),
+      issue_desc: String(nluObj.issue_desc || "").trim(),
+      delivery_desc: String(nluObj.delivery_desc || "").trim(),
+      message_target: String(nluObj.message_target || "").trim(),
+      message_body: String(nluObj.message_body || "").trim()
+    };
+
+    debug(`[${connTag}] NLU parsed: ${JSON.stringify(summary)}`);
+
+    // Shadow mode: log only
+    if (mode === "shadow") return;
+
+    // Confidence gate
+    if (confidence < MB_NLU_CONFIDENCE_MIN) return;
+
+    // Route (only if not set; only if mode allows)
     const r = String(nluObj.route || "").trim().toLowerCase();
-    if (!state.route && ROUTES.has(r)) state.route = r;
+    if (!state.route && mode === "assist_routing" && ROUTES.has(r)) state.route = r;
 
-    // yes/no can be used by subflows; but we already parse with isYes/isNo.
-
-    // Names
+    // Names (only if valid and missing)
     const full = String(nluObj.full_name || "").trim();
     if (full && !state.slots.full_name && isNameValid(full)) {
       state.slots.full_name = full;
     }
 
-    // Phone
+    // Phone (candidate) — only apply during phone collection stages
     const phoneDigits = normalizePhoneDigits(String(nluObj.phone_digits || ""));
     if (isValidPhoneDigits(phoneDigits)) {
-      // Only store as candidate if we are in phone collect mode
       if (state.phone_mode === "collect_new" || state.phone_mode === "confirm_new") {
         state.slots.additional_phone = phoneDigits;
       }
     }
 
-    // Sales
+    // Sales/Support common product descriptors
     const pType = String(nluObj.product_type || "").trim();
     if (pType && !state.slots.product_type) state.slots.product_type = pType;
 
     const pModel = String(nluObj.product_model || "").trim();
     if (pModel && !state.slots.product_model) state.slots.product_model = pModel;
 
-    const pBrand = String(nluObj.product_brand || "").trim();
-    if (pBrand && !state.slots.product_brand) state.slots.product_brand = pBrand;
+    // Brand: accept any, but canonicalize if matches SUPPLIERS_IMPORTERS aliases
+    const rawBrand = String(nluObj.product_brand || "").trim();
+    if (rawBrand && !state.slots.product_brand) {
+      const canon = matchBrandAlias(rawBrand);
+      state.slots.product_brand = canon || rawBrand;
+    }
 
     // Support
     const issue = String(nluObj.issue_desc || "").trim();
