@@ -1238,7 +1238,7 @@ wss.on("connection", (twilioWs, req) => {
       type: "response.create",
       response: {
         // AUDIO ONLY: reduce any chance of the model trying to "help" with extra text.
-        modalities: ["audio"],
+        modalities: ["audio", "text"],
         instructions
       }
     });
@@ -1988,7 +1988,7 @@ wss.on("connection", (twilioWs, req) => {
     safeOpenAISend({
       type: "response.create",
       response: {
-        modalities: ["audio"],
+        modalities: ["audio", "text"],
         instructions:
           `תגידי עכשיו בדיוק את המשפט הבא מילה במילה, ללא תוספות וללא שאלות נוספות:\n${openingScript}`
       }
