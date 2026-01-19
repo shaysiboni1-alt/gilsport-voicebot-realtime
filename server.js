@@ -1145,6 +1145,8 @@ wss.on("connection", async (twilioWs, req) => {
   let plannedEnd = false;
   let callStartTs = Date.now();
   let lastMediaTs = Date.now();
+  let lastInboundAudioAt = 0;
+  let lastAllowedInboundAudioAt = 0;
   let idleCheckInterval = null;
   let idleWarningSent = false;
   let idleHangupScheduled = false;
@@ -1556,10 +1558,27 @@ wss.on("connection", async (twilioWs, req) => {
       return openingResponseCount === 0;
     }
 
-    // After user spoke: allow at most one response per userTurnSeq, only if it's recent.
-    if (userTurnSeq <= consumedUserTurnSeq) return false;
-    if (now - lastUserTurnAt > 15000) return false;
-    return true;
+    // After user spoke: allow at most one response per userTurnSeq (transcript-based),
+    // BUT do not block legitimate responses when server_vad triggers before the transcription-completed
+    // event arrives (a common ordering in realtime).
+
+    // Primary path: transcript-driven gating.
+    if (userTurnSeq > consumedUserTurnSeq) {
+      if (now - lastUserTurnAt > 15000) return false;
+      return true;
+    }
+
+    // Fallback path: audio-driven gating. If we recently appended inbound audio and we have not
+    // already allowed a response for that inbound-audio moment, allow this response.
+    if (lastInboundAudioAt && lastInboundAudioAt !== lastAllowedInboundAudioAt) {
+      const inboundAge = now - lastInboundAudioAt;
+      const createdDelta = Math.abs((activeResponseCreatedAt || now) - lastInboundAudioAt);
+      if (inboundAge <= 1500 && createdDelta <= 2000) {
+        return true;
+      }
+    }
+
+    return false;
   }
 
   function maybeCancelResponse(reason) {
@@ -1699,6 +1718,9 @@ wss.on("connection", async (twilioWs, req) => {
           const allow = decideAllowForThisResponse();
           activeResponseAllowed = allow;
           activeResponseDecisionPending = false;
+          if (allow && lastInboundAudioAt) {
+            lastAllowedInboundAudioAt = lastInboundAudioAt;
+          }
           if (!allow) {
             // Do not forward any audio; cancel to save tokens.
             maybeCancelResponse("disallowed_output");
@@ -1935,6 +1957,8 @@ wss.on("connection", async (twilioWs, req) => {
       if (!MB_ALLOW_BARGE_IN) {
         if (botTurnActive || botSpeaking) return;
       }
+
+      lastInboundAudioAt = now;
 
       openAiWs.send(JSON.stringify({ type: "input_audio_buffer.append", audio: payload }));
     } else if (event === "stop") {
