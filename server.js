@@ -317,6 +317,7 @@ const MB_NO_BARGE_TAIL_MS = envNumber("MB_NO_BARGE_TAIL_MS", 1600);
 const MB_BARGE_IN_COOLDOWN_MS = envNumber("MB_BARGE_IN_COOLDOWN_MS", 500);
 const MB_ALLOW_BARGE_IN = envBool("MB_ALLOW_BARGE_IN", false);
 const MB_HANGUP_AFTER_GOODBYE = envBool("MB_HANGUP_AFTER_GOODBYE", true);
+const MB_MANUAL_TURNS = envBool("MB_MANUAL_TURNS", false);
 
 const MB_VAD_THRESHOLD = envNumber("MB_VAD_THRESHOLD", 0.65);
 const MB_VAD_SILENCE_MS = envNumber("MB_VAD_SILENCE_MS", 900);
@@ -1131,6 +1132,10 @@ wss.on("connection", async (twilioWs, req) => {
   let phoneCorrectionSent = false;
   let phoneHallucinationCorrectionSent = false;
 
+  const manualTurnsEnabled = MB_MANUAL_TURNS;
+  let openingResponsePending = false;
+  let manualTurnsArmed = false;
+
   let preferredGender = null;
   let genderInstructionSent = false;
   let baseInstructions = null;
@@ -1518,6 +1523,8 @@ wss.on("connection", async (twilioWs, req) => {
             threshold: MB_VAD_THRESHOLD,
             silence_duration_ms: effectiveSilenceMs,
             prefix_padding_ms: MB_VAD_PREFIX_MS,
+            // Manual turn control (optional): prevent auto assistant responses; we will call response.create after passing transcript gates.
+            create_response: manualTurnsEnabled ? false : undefined,
           },
           max_response_output_tokens: "inf",
           instructions,
@@ -1527,6 +1534,7 @@ wss.on("connection", async (twilioWs, req) => {
 
     flushSessionAddons();
 
+    openingResponsePending = true;
     sendModelPrompt(
       openAiWs,
       `פתחי את השיחה עם הלקוח במשפט הבא (אפשר לשנות מעט את הניסוח אבל לא להאריך): "${opening}" ואז עצרי והמתיני לתשובה שלו.`,
@@ -1628,6 +1636,12 @@ wss.on("connection", async (twilioWs, req) => {
         botSpeaking = false;
         botTurnActive = false;
 
+        if (manualTurnsEnabled && openingResponsePending && !manualTurnsArmed) {
+          manualTurnsArmed = true;
+          openingResponsePending = false;
+          logInfo(connId, "Manual turns armed after opening.");
+        }
+
         // Always apply a small post-TTS cooldown to avoid echo / background noise false turns.
         noListenUntilTs = Date.now() + (MB_ALLOW_BARGE_IN ? MB_BARGE_IN_COOLDOWN_MS : MB_NO_BARGE_TAIL_MS);
 
@@ -1666,6 +1680,25 @@ wss.on("connection", async (twilioWs, req) => {
 
         conversationLog.push({ from: "user", text: t });
         logAlways(`[CALLER][${connId}] ${t}`);
+
+        if (manualTurnsEnabled && manualTurnsArmed) {
+          // In manual mode, the Realtime server_vad will still commit and transcribe user audio,
+          // but it will NOT auto-generate an assistant response. We explicitly create one here.
+          if (openAiReady && openAiWs.readyState === WebSocket.OPEN) {
+            if (!hasActiveResponse && !botSpeaking && !botTurnActive) {
+              try {
+                openAiWs.send(JSON.stringify({ type: "response.create" }));
+                hasActiveResponse = true;
+                botTurnActive = true;
+                logDebug(connId, "response.create (manual turn accepted)");
+              } catch (err) {
+                hasActiveResponse = false;
+                botTurnActive = false;
+                logError(connId, "response.create failed", err);
+              }
+            }
+          }
+        }
 
         const gPref = detectGenderPreference(t);
         if (gPref && gPref !== preferredGender) {
