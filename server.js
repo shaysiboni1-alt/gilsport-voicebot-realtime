@@ -1562,6 +1562,10 @@ wss.on("connection", async (twilioWs, req) => {
 
   // Track the currently active response id when available, so we never attempt a cancel when nothing is active.
   let activeResponseId = null;
+  // If the caller speaks while a response is being created (hasActiveResponse=true but we don't yet have a response id),
+  // queue the utterance and perform a barge-in cancel immediately once the id becomes available.
+  let pendingUserBargeText = null;
+  let pendingUserBargeTag = null;
 
   function shouldCreateUserTurn(t) {
     // Enforce a hard gate so the bot never responds to background noise, breath, or one-word fillers.
@@ -1626,6 +1630,22 @@ wss.on("connection", async (twilioWs, req) => {
         activeResponseId = msg.response?.id || msg.response_id || msg.id || null;
         noListenUntilTs = Date.now() + (MB_ALLOW_BARGE_IN ? MB_BARGE_IN_COOLDOWN_MS : MB_NO_BARGE_TAIL_MS);
         currentBotText = "";
+        // If the user spoke during response creation (no id yet), execute the queued barge-in now.
+        if (MB_ALLOW_BARGE_IN && pendingUserBargeText && activeResponseId) {
+          const queued = pendingUserBargeText;
+          const queuedTag = pendingUserBargeTag || "user_transcript";
+          pendingUserBargeText = null;
+          pendingUserBargeTag = null;
+          try {
+            openAiWs.send(JSON.stringify({ type: "response.cancel", response_id: activeResponseId }));
+          } catch (_) {}
+          activeResponseId = null;
+          hasActiveResponse = false;
+          botSpeaking = false;
+          botTurnActive = false;
+          // Immediately create a new response for the queued utterance.
+          createResponseForUserText(queued, queuedTag);
+        }
         break;
 
       case "response.output_text.delta":
@@ -1719,6 +1739,15 @@ wss.on("connection", async (twilioWs, req) => {
         botSpeaking = false;
         botTurnActive = false;
         activeResponseId = null;
+        // If a barge-in utterance was queued but we never got a chance to cancel,
+        // respond now that the prior response completed.
+        if (pendingUserBargeText) {
+          const queued = pendingUserBargeText;
+          const queuedTag = pendingUserBargeTag || "user_transcript";
+          pendingUserBargeText = null;
+          pendingUserBargeTag = null;
+          createResponseForUserText(queued, queuedTag);
+        }
         break;
 
       case "conversation.item.input_audio_transcription.completed": {
@@ -1761,6 +1790,14 @@ wss.on("connection", async (twilioWs, req) => {
         // IMPORTANT: Create a model response only after the transcript passes a strict validity gate.
         // This prevents the bot from speaking "on its own" due to noise/echo.
         if (shouldCreateUserTurn(t)) {
+          // If a response is already in-flight but we don't yet have its id, we cannot cancel it.
+          // Queue the caller's utterance and cancel as soon as we receive response.created.
+          if (MB_ALLOW_BARGE_IN && hasActiveResponse && !activeResponseId) {
+            pendingUserBargeText = t;
+            pendingUserBargeTag = "user_transcript";
+            logDebug(connId, `Queued barge-in (awaiting response id): "${t}"`);
+            break;
+          }
           // If barge-in is enabled and the model is currently speaking, attempt a best-effort cancel.
           if (MB_ALLOW_BARGE_IN && (botSpeaking || botTurnActive) && activeResponseId) {
             try {
