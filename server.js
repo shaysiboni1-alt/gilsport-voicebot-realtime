@@ -316,8 +316,8 @@ const MB_LOG_TRANSCRIPTS = envBool("MB_LOG_TRANSCRIPTS", true);
 const MB_NO_BARGE_TAIL_MS = envNumber("MB_NO_BARGE_TAIL_MS", 1600);
 const MB_BARGE_IN_COOLDOWN_MS = envNumber("MB_BARGE_IN_COOLDOWN_MS", 500);
 const MB_ALLOW_BARGE_IN = envBool("MB_ALLOW_BARGE_IN", false);
-const MB_MANUAL_TURNS = envBool("MB_MANUAL_TURNS", false);
 const MB_HANGUP_AFTER_GOODBYE = envBool("MB_HANGUP_AFTER_GOODBYE", true);
+const MB_MANUAL_TURNS = envBool("MB_MANUAL_TURNS", false);
 
 const MB_VAD_THRESHOLD = envNumber("MB_VAD_THRESHOLD", 0.65);
 const MB_VAD_SILENCE_MS = envNumber("MB_VAD_SILENCE_MS", 900);
@@ -1091,6 +1091,10 @@ async function sendWebhook(url, payload, connId, label) {
 // -----------------------------
 wss.on("connection", async (twilioWs, req) => {
   const connId = `conn_${Date.now().toString(36)}_${Math.random().toString(16).slice(2, 6)}`;
+  logInfo(connId, 'Runtime flags (connection)', { MB_MANUAL_TURNS, MB_ALLOW_BARGE_IN, MB_NO_BARGE_TAIL_MS, MB_BARGE_IN_COOLDOWN_MS, MB_VAD_THRESHOLD, MB_VAD_PREFIX_MS, MB_VAD_SILENCE_MS, MB_VAD_SUFFIX_MS, MB_IDLE_WARNING_MS, MB_IDLE_HANGUP_MS });
+  if (MB_MANUAL_TURNS) {
+    logInfo(connId, 'MB_MANUAL_TURNS=true is enabled in ENV. NOTE: v33 baseline logs this flag but does not change turn-taking behavior by itself.', {});
+  }
   logAlways(`WS connection`, { at: nowIso(), ua: req.headers["user-agent"], url: req.url });
 
   if (!OPENAI_API_KEY) {
@@ -1112,15 +1116,6 @@ wss.on("connection", async (twilioWs, req) => {
   let botSpeaking = false;
   let botTurnActive = false;
   let noListenUntilTs = 0;
-
-  let activeResponseId = null;
-
-  // Manual Turn Control (Stage 2): keep server_vad but disable auto-response generation.
-  const manualTurnsEnabled = MB_MANUAL_TURNS;
-  let manualArmed = false;           // armed only after opening finishes
-  let openingInProgress = false;     // true while opening response is active
-  let openingResponseId = null;      // response id of opening
-  let pendingManualTranscript = null; // last meaningful user transcript while a response is active
 
   let plannedEnd = false;
   let callStartTs = Date.now();
@@ -1525,8 +1520,6 @@ wss.on("connection", async (twilioWs, req) => {
           input_audio_transcription: { model: "whisper-1" },
           turn_detection: {
             type: "server_vad",
-            create_response: !manualTurnsEnabled,
-            interrupt_response: MB_ALLOW_BARGE_IN,
             threshold: MB_VAD_THRESHOLD,
             silence_duration_ms: effectiveSilenceMs,
             prefix_padding_ms: MB_VAD_PREFIX_MS,
@@ -1539,13 +1532,6 @@ wss.on("connection", async (twilioWs, req) => {
 
     flushSessionAddons();
 
-    if (manualTurnsEnabled) {
-      openingInProgress = true;
-      manualArmed = false;
-      openingResponseId = null;
-      pendingManualTranscript = null;
-    }
-
     sendModelPrompt(
       openAiWs,
       `פתחי את השיחה עם הלקוח במשפט הבא (אפשר לשנות מעט את הניסוח אבל לא להאריך): "${opening}" ואז עצרי והמתיני לתשובה שלו.`,
@@ -1555,38 +1541,7 @@ wss.on("connection", async (twilioWs, req) => {
 
   let currentBotText = "";
 
-  
-  function manualShouldRespondToTranscript(t) {
-    if (!manualTurnsEnabled || !manualArmed) return false;
-    const cleaned = normalizeTextLoose(t || "");
-    if (!cleaned) return false;
-    // Use existing gates but allow common greetings.
-    const allowGreetings = /^(שלום|היי|הלו|אלו|אהלן|aloha|hello|hi)\b/i.test(cleaned);
-    if (!allowGreetings) {
-      if (isTranscriptGarbage(cleaned) || isLowValueUtterance(cleaned)) return false;
-    }
-    return true;
-  }
-
-  function triggerManualResponseCreate(reason) {
-    if (!manualTurnsEnabled || !manualArmed) return;
-    if (!openAiReady || !openAiWs || openAiWs.readyState !== WebSocket.OPEN) return;
-
-    // If a response is active (opening or ongoing), wait for response.completed.
-    if (hasActiveResponse) return;
-
-    try {
-      openAiWs.send(JSON.stringify({ type: "response.create" }));
-      hasActiveResponse = true;
-      botTurnActive = true;
-      botSpeaking = false;
-      noListenUntilTs = Date.now() + (MB_ALLOW_BARGE_IN ? MB_BARGE_IN_COOLDOWN_MS : MB_NO_BARGE_TAIL_MS);
-      logInfo(connId, `Manual response.create sent (${reason}).`);
-    } catch (e) {
-      logError(connId, "Failed to send manual response.create", e);
-    }
-  }
-openAiWs.on("message", (data) => {
+  openAiWs.on("message", (data) => {
     let msg;
     try {
       msg = JSON.parse(data.toString());
@@ -1596,28 +1551,13 @@ openAiWs.on("message", (data) => {
     }
 
     switch (msg.type) {
-      case "response.created": {
-        const rid = (msg && msg.response && msg.response.id) || msg.response_id || msg.id || null;
-        activeResponseId = rid;
+      case "response.created":
         hasActiveResponse = true;
         botTurnActive = true;
         botSpeaking = false;
         noListenUntilTs = Date.now() + (MB_ALLOW_BARGE_IN ? MB_BARGE_IN_COOLDOWN_MS : MB_NO_BARGE_TAIL_MS);
         currentBotText = "";
-        if (manualTurnsEnabled && openingInProgress && !openingResponseId) {
-          openingResponseId = rid;
-        }
-        // Manual Turn Control: explicitly create a model response only after a meaningful transcript.
-        if (manualTurnsEnabled && manualArmed && manualShouldRespondToTranscript(t)) {
-          if (hasActiveResponse) {
-            pendingManualTranscript = t;
-          } else {
-            triggerManualResponseCreate("user_transcript");
-          }
-        }
-
         break;
-      }
 
       case "response.output_text.delta":
       case "response.audio_transcript.delta": {
@@ -1702,35 +1642,22 @@ openAiWs.on("message", (data) => {
         }
         break;
 
-      case "response.completed": {
-        const rid = (msg && msg.response && msg.response.id) || msg.response_id || msg.id || null;
-
-        activeResponseId = null;
+      case "response.completed":
         hasActiveResponse = false;
         botSpeaking = false;
         botTurnActive = false;
-
-        if (manualTurnsEnabled && openingInProgress && openingResponseId && rid && rid === openingResponseId) {
-          openingInProgress = false;
-          manualArmed = true;
-          logInfo(connId, "Manual turns armed after opening.");
-          if (pendingManualTranscript) {
-            // Consume pending transcript captured during opening.
-            pendingManualTranscript = null;
-            triggerManualResponseCreate("pending_after_opening");
-          }
-        } else if (manualTurnsEnabled && manualArmed && pendingManualTranscript) {
-          pendingManualTranscript = null;
-          triggerManualResponseCreate("pending_after_completed");
-        }
-
         break;
-      }
 
       case "conversation.item.input_audio_transcription.completed": {
-        const shouldLogTranscript = MB_LOG_TRANSCRIPTS;
+        if (!MB_LOG_TRANSCRIPTS) break;
 
         const raw = String(msg.transcript || "").trim();
+        const __norm = normalizeTextLoose(raw);
+        const __isGarbage = isTranscriptGarbage(raw);
+        const __isLowValue = isLowValueUtterance(raw);
+        if (MB_MANUAL_TURNS || MB_DEBUG) {
+          logInfo(connId, 'Transcript received', { raw: raw.slice(0, 120), norm: __norm.slice(0, 120), is_garbage: __isGarbage, is_low_value: __isLowValue, len: raw.length });
+        }
         const hasRealUserYet = conversationLog.some((m) => m.from === "user" && (m.text || "").trim().length >= 4);
 
         if (!raw) break;
@@ -1931,5 +1858,6 @@ openAiWs.on("message", (data) => {
 server.listen(PORT, () => {
   console.log(`==> Your service is live`);
   console.log(`==> Available at your primary URL ${process.env.RENDER_EXTERNAL_URL || ""}`);
+  console.log(`[INFO] [Startup] Runtime flags`, { MB_MANUAL_TURNS, MB_ALLOW_BARGE_IN, MB_NO_BARGE_TAIL_MS, MB_BARGE_IN_COOLDOWN_MS, MB_VAD_THRESHOLD, MB_VAD_PREFIX_MS, MB_VAD_SILENCE_MS, MB_VAD_SUFFIX_MS, MB_IDLE_WARNING_MS, MB_IDLE_HANGUP_MS });
   loadSheetsCache("Startup").catch((err) => console.error("[ERROR] Startup sheets load failed", err));
 });
