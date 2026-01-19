@@ -896,6 +896,26 @@ app.use(express.json());
 
 app.get("/health", (req, res) => {
   res.status(200).json({ ok: true, ts: Date.now(), sheets_loaded_at: sheetsCache.loadedAt });
+
+
+// Manual reload of Google Sheets cache (admin)
+app.post("/admin/reload-sheets", async (req, res) => {
+  try {
+    await loadSheetsCache("ManualReload");
+    res.status(200).json({
+      ok: true,
+      reloaded_at: sheetsCache.loadedAt,
+      settings_keys: Object.keys(sheetsCache.settings || {}).length,
+      prompt_ids: Object.keys(sheetsCache.prompts || {}).length,
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      error: String(err?.message || err),
+    });
+  }
+});
+
 });
 
 // Twilio Voice webhook -> returns TwiML with Stream
