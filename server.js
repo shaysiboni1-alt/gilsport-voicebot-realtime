@@ -218,6 +218,52 @@ function isTranscriptGarbage(t, hasRealUserYet) {
   return true;
 }
 
+// Additional speech validity gate to prevent background noise / fillers from triggering turns.
+// Returns true when the transcript is too short / low-signal to be treated as a real user turn.
+function isLowValueUtterance(raw) {
+  const t = String(raw || "").trim();
+  if (!t) return true;
+
+  const norm = normalizeTextLoose(t); // lowercase, no niqqud, punctuation stripped
+  if (!norm) return true;
+
+  // Count words on the loose-normalized text
+  const words = norm.split(" ").filter(Boolean);
+  const hasDigits = /\d/.test(norm);
+  const lettersOnly = norm.replace(/[^a-z֐-׿]/g, "");
+
+  // Common fillers / acknowledgements (Hebrew + English) that should not advance the flow.
+  const fillers = new Set([
+    "אה",
+    "אהה",
+    "אממ",
+    "הממ",
+    "אהמ",
+    "אוקיי",
+    "אוקי",
+    "בסדר",
+    "כן",
+    "לא",
+    "טוב",
+    "אחלה",
+    "ok",
+    "okay",
+    "yes",
+    "no",
+  ]);
+
+  if (words.length <= 1 && fillers.has(norm)) return true;
+
+  // Very short utterances with no digits are almost always noise / breath.
+  if (!hasDigits) {
+    if (words.length < 2) return true;
+    if (lettersOnly.length < 6) return true;
+    if (norm.length < 6) return true;
+  }
+
+  return false;
+}
+
 // For robust matching (goodbye detection / phone correction)
 function normalizeTextLoose(str) {
   return String(str || "")
@@ -268,6 +314,7 @@ const OPENAI_VOICE = process.env.OPENAI_VOICE || "alloy";
 const MB_DEBUG = envBool("MB_DEBUG", true);
 const MB_LOG_TRANSCRIPTS = envBool("MB_LOG_TRANSCRIPTS", true);
 const MB_NO_BARGE_TAIL_MS = envNumber("MB_NO_BARGE_TAIL_MS", 1600);
+const MB_BARGE_IN_COOLDOWN_MS = envNumber("MB_BARGE_IN_COOLDOWN_MS", 500);
 const MB_ALLOW_BARGE_IN = envBool("MB_ALLOW_BARGE_IN", false);
 const MB_HANGUP_AFTER_GOODBYE = envBool("MB_HANGUP_AFTER_GOODBYE", true);
 
@@ -1503,7 +1550,7 @@ wss.on("connection", async (twilioWs, req) => {
         hasActiveResponse = true;
         botTurnActive = true;
         botSpeaking = false;
-        noListenUntilTs = Date.now() + MB_NO_BARGE_TAIL_MS;
+        noListenUntilTs = Date.now() + (MB_ALLOW_BARGE_IN ? MB_BARGE_IN_COOLDOWN_MS : MB_NO_BARGE_TAIL_MS);
         currentBotText = "";
         break;
 
@@ -1569,7 +1616,7 @@ wss.on("connection", async (twilioWs, req) => {
         botSpeaking = true;
 
         const now = Date.now();
-        noListenUntilTs = now + MB_NO_BARGE_TAIL_MS;
+        noListenUntilTs = now + (MB_ALLOW_BARGE_IN ? MB_BARGE_IN_COOLDOWN_MS : MB_NO_BARGE_TAIL_MS);
 
         if (twilioWs.readyState === WebSocket.OPEN) {
           twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload: b64 } }));
@@ -1580,6 +1627,9 @@ wss.on("connection", async (twilioWs, req) => {
       case "response.audio.done":
         botSpeaking = false;
         botTurnActive = false;
+
+        // Always apply a small post-TTS cooldown to avoid echo / background noise false turns.
+        noListenUntilTs = Date.now() + (MB_ALLOW_BARGE_IN ? MB_BARGE_IN_COOLDOWN_MS : MB_NO_BARGE_TAIL_MS);
 
         if (goodbyePendingHangup && MB_HANGUP_AFTER_GOODBYE && !callEnded) {
           plannedEnd = true;
@@ -1602,6 +1652,12 @@ wss.on("connection", async (twilioWs, req) => {
         if (!raw) break;
         if (isTranscriptGarbage(raw, hasRealUserYet)) {
           logDebug(connId, `Filtered garbage transcript: "${raw}"`);
+          break;
+        }
+
+        // Additional gate: ignore low-signal utterances (breath/noise/fillers) so the bot does not respond "on its own".
+        if (isLowValueUtterance(raw)) {
+          logDebug(connId, `Filtered low-value utterance: "${raw}"`);
           break;
         }
 
@@ -1723,13 +1779,13 @@ wss.on("connection", async (twilioWs, req) => {
 
         if (!idleWarningSent && sinceMedia >= MB_IDLE_WARNING_MS && !callEnded) {
           idleWarningSent = true;
-          sendModelPrompt(openAiWs, `אני עדיין כאן על הקו, אתם איתי?`, "idle_warning");
+          sendModelPrompt(openAiWs, `אני כאן, אם תרצו להמשיך.`, "idle_warning");
         }
 
         if (!idleHangupScheduled && sinceMedia >= MB_IDLE_HANGUP_MS && !callEnded) {
           idleHangupScheduled = true;
           plannedEnd = true;
-          sendModelPrompt(openAiWs, `נראה שהשיחה התנתקה. אם תרצו, אפשר להתקשר שוב ולהשאיר פרטים.`, "idle_timeout");
+          sendModelPrompt(openAiWs, `נראה שאין מענה. אפשר להתקשר שוב או להשאיר פרטים לחזרה.`, "idle_timeout");
           scheduleForceEndAfterGrace("idle_timeout", null);
         }
       }, 1000);
@@ -1754,8 +1810,13 @@ wss.on("connection", async (twilioWs, req) => {
       if (!openAiReady || openAiWs.readyState !== WebSocket.OPEN) return;
 
       const now = Date.now();
+
+      // Always respect a short post-TTS cooldown (even when barge-in is enabled) to avoid false turns from echo/noise.
+      if (now < noListenUntilTs) return;
+
+      // If barge-in is disabled, block user audio while the bot is speaking or has an active turn.
       if (!MB_ALLOW_BARGE_IN) {
-        if (botTurnActive || botSpeaking || now < noListenUntilTs) return;
+        if (botTurnActive || botSpeaking) return;
       }
 
       openAiWs.send(JSON.stringify({ type: "input_audio_buffer.append", audio: payload }));
