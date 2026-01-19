@@ -1112,6 +1112,12 @@ wss.on("connection", async (twilioWs, req) => {
   let botTurnActive = false;
   let noListenUntilTs = 0;
 
+  // Manual response gating: keep VAD events but do not auto-respond until transcript passes validity checks
+  let inUserSpeech = false;
+  let audioBufferHasData = false;
+  let pendingTranscript = false;
+  let pendingTranscriptAt = 0;
+
   let plannedEnd = false;
   let callStartTs = Date.now();
   let lastMediaTs = Date.now();
@@ -1518,6 +1524,10 @@ wss.on("connection", async (twilioWs, req) => {
             threshold: MB_VAD_THRESHOLD,
             silence_duration_ms: effectiveSilenceMs,
             prefix_padding_ms: MB_VAD_PREFIX_MS,
+            // Keep VAD events, but prevent automatic assistant responses.
+            // We will call input_audio_buffer.commit + response.create only after transcript passes validity gates.
+            create_response: false,
+            interrupt_response: true,
           },
           max_response_output_tokens: "inf",
           instructions,
@@ -1643,21 +1653,56 @@ wss.on("connection", async (twilioWs, req) => {
         botTurnActive = false;
         break;
 
-      case "conversation.item.input_audio_transcription.completed": {
-        if (!MB_LOG_TRANSCRIPTS) break;
+      case "input_audio_buffer.speech_started": {
+        inUserSpeech = true;
+        audioBufferHasData = false;
+        // If the user starts speaking while the bot is responding and barge-in is enabled, allow the model to be interrupted.
+        if (MB_ALLOW_BARGE_IN && hasActiveResponse) {
+          try {
+            openAiWs.send(JSON.stringify({ type: "response.cancel" }));
+          } catch (_) {}
+          hasActiveResponse = false;
+          botSpeaking = false;
+          botTurnActive = false;
+        }
+        break;
+      }
 
+      case "input_audio_buffer.speech_stopped": {
+        inUserSpeech = false;
+        // Commit the audio buffer to create a user message item.
+        // Because turn_detection.create_response=false, the model will NOT respond until we explicitly call response.create.
+        if (openAiReady && openAiWs.readyState === WebSocket.OPEN) {
+          if (audioBufferHasData) {
+            pendingTranscript = true;
+            pendingTranscriptAt = Date.now();
+            try {
+              openAiWs.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+              logDebug(connId, "input_audio_buffer.commit (awaiting transcript)");
+            } catch (err) {
+              pendingTranscript = false;
+              logError(connId, "input_audio_buffer.commit failed", err);
+            }
+          }
+        }
+        break;
+      }
+
+      case "conversation.item.input_audio_transcription.completed": {
         const raw = String(msg.transcript || "").trim();
         const hasRealUserYet = conversationLog.some((m) => m.from === "user" && (m.text || "").trim().length >= 4);
 
         if (!raw) break;
         if (isTranscriptGarbage(raw, hasRealUserYet)) {
           logDebug(connId, `Filtered garbage transcript: "${raw}"`);
+          pendingTranscript = false;
           break;
         }
 
         // Additional gate: ignore low-signal utterances (breath/noise/fillers) so the bot does not respond "on its own".
         if (isLowValueUtterance(raw)) {
           logDebug(connId, `Filtered low-value utterance: "${raw}"`);
+          pendingTranscript = false;
           break;
         }
 
@@ -1665,7 +1710,28 @@ wss.on("connection", async (twilioWs, req) => {
         if (!t) break;
 
         conversationLog.push({ from: "user", text: t });
-        logAlways(`[CALLER][${connId}] ${t}`);
+        if (MB_LOG_TRANSCRIPTS) logAlways(`[CALLER][${connId}] ${t}`);
+
+
+        // Mark that we received a real user turn
+        pendingTranscript = false;
+
+        // With turn_detection.create_response=false, we must explicitly trigger the assistant response.
+        // Only do so for valid, high-signal user turns.
+        if (openAiReady && openAiWs.readyState === WebSocket.OPEN) {
+          if (!hasActiveResponse && !botSpeaking && !botTurnActive) {
+            try {
+              openAiWs.send(JSON.stringify({ type: "response.create" }));
+              hasActiveResponse = true;
+              botTurnActive = true;
+              logDebug(connId, "response.create (user turn accepted)");
+            } catch (err) {
+              hasActiveResponse = false;
+              botTurnActive = false;
+              logError(connId, "response.create failed", err);
+            }
+          }
+        }
 
         const gPref = detectGenderPreference(t);
         if (gPref && gPref !== preferredGender) {
@@ -1820,6 +1886,7 @@ wss.on("connection", async (twilioWs, req) => {
       }
 
       openAiWs.send(JSON.stringify({ type: "input_audio_buffer.append", audio: payload }));
+      audioBufferHasData = true;
     } else if (event === "stop") {
       logAlways(`[TWILIO_STOP][${connId}] stream stopped`);
       if (!plannedEnd && !callEnded) {
