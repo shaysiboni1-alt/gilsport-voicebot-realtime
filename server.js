@@ -1287,6 +1287,19 @@ wss.on("connection", async (twilioWs, req) => {
       parsedLead.phone_number = coercedPhone;
     }
 
+    // If the model forgot to set is_lead=true on a completed "message" flow,
+    // we still want the webhook to go to the FINAL webhook (not ABANDONED).
+    // Keep this override narrowly scoped to intent="message" to avoid changing
+    // behavior in other flows.
+    if (parsedLead && parsedLead.intent === "message") {
+      const hasPhone = !!coercedPhone;
+      const hasName = !!String(parsedLead.full_name || "").trim();
+      const hasContent = !!String(parsedLead.notes || parsedLead.reason || "").trim();
+      if (hasPhone && (hasName || hasContent)) {
+        parsedLead.is_lead = true;
+      }
+    }
+
     const isFullLead = !!(parsedLead && parsedLead.is_lead === true && coercedPhone);
     const call_status = mapCallStatus(reason, plannedEnd);
 
