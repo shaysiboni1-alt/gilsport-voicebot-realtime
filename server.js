@@ -653,6 +653,7 @@ wss.on("connection", async (twilioWs, req) => {
   let streamSid = null;
   let callSid = null;
   let callerRaw = null;
+  let callerIL = null;
 
   let recordingSid = null;
   let recordingUrl = null;
@@ -683,6 +684,10 @@ wss.on("connection", async (twilioWs, req) => {
   let preferredGender = null;
   let genderInstructionSent = false;
   let baseInstructions = null;
+
+  // Session add-ons that depend on Twilio start data (caller id, captured phone, etc.)
+  // These may arrive before OpenAI WS is ready.
+  const pendingSessionAddons = [];
 
   let conversationLog = [];
 
@@ -723,6 +728,16 @@ wss.on("connection", async (twilioWs, req) => {
     logInfo(connId, `session.update (${label || "addon"}) applied.`);
   }
 
+  function queueSessionAddon(addon, label) {
+    const text = String(addon || "").trim();
+    if (!text) return;
+    if (openAiReady && openAiWs && openAiWs.readyState === WebSocket.OPEN && String(baseInstructions || "").trim()) {
+      updateSessionInstructions(openAiWs, text, label);
+      return;
+    }
+    pendingSessionAddons.push({ addon: text, label: label || "addon" });
+  }
+
   function scheduleForceEndAfterGrace(reason, closingMessage) {
     const graceMs = getGraceMs();
     setTimeout(() => {
@@ -750,12 +765,12 @@ wss.on("connection", async (twilioWs, req) => {
       parsedLead = await extractLeadFromConversation(conversationLog, connId, botName, businessName);
     } catch (_) {}
 
-    const callerIL = toIsraeliLocalFromAny(callerRaw) || null;
+    const callerILLocal = callerIL || toIsraeliLocalFromAny(callerRaw) || null;
 
     const coercedPhone =
       normalizePhoneNumber(parsedLead?.phone_number, callerRaw) ||
       normalizePhoneNumber(capturedPhoneIL, callerRaw) ||
-      normalizePhoneNumber(callerIL, callerRaw) ||
+      normalizePhoneNumber(callerILLocal, callerRaw) ||
       null;
 
     if (parsedLead && typeof parsedLead === "object") {
@@ -764,6 +779,17 @@ wss.on("connection", async (twilioWs, req) => {
 
     const isFullLead = !!(parsedLead && parsedLead.is_lead === true && coercedPhone);
     const call_status = mapCallStatus(reason, plannedEnd);
+
+    const EVENT =
+      parsedLead?.intent === "support"
+        ? "שירות לקוחות"
+        : parsedLead?.intent === "sales"
+          ? "מכירות"
+          : parsedLead?.intent === "delivery"
+            ? "אספקה"
+            : parsedLead?.intent === "message"
+              ? "הודעה"
+              : null;
 
     if (recordingSid && !recordingUrl) {
       recordingUrl = await buildRecordingUrl(recordingSid);
@@ -783,14 +809,18 @@ wss.on("connection", async (twilioWs, req) => {
       duration_sec: durationSec,
 
       caller_id_raw: callerRaw || null,
-      caller_id_il: callerIL || null,
-      caller_id_e164: toE164FromIsraeliLocal(callerIL) || (callerRaw && String(callerRaw).startsWith("+") ? callerRaw : null),
+      caller_id_il: callerILLocal || null,
+      caller_id_e164:
+        toE164FromIsraeliLocal(callerILLocal) || (callerRaw && String(callerRaw).startsWith("+") ? callerRaw : null),
 
       collected_phone_il: coercedPhone || null,
       collected_phone_e164: coercedPhone ? toE164FromIsraeliLocal(coercedPhone) : null,
 
       business_name: businessName,
       bot_name: botName,
+
+      EVENT,
+      EVENT,
 
       call_status,
       reason: reason || null,
@@ -804,6 +834,19 @@ wss.on("connection", async (twilioWs, req) => {
       parsedLead: parsedLead || null,
       isFullLead,
     };
+
+    // Human-readable event label for downstream automations (requested field name)
+    const EVENT =
+      parsedLead?.intent === "support"
+        ? "שירות לקוחות"
+        : parsedLead?.intent === "sales"
+          ? "מכירות"
+          : parsedLead?.intent === "delivery"
+            ? "אספקה"
+            : parsedLead?.intent === "message"
+              ? "הודעה"
+              : null;
+    payloadBase.EVENT = EVENT;
 
     if (MB_CALL_LOG_ENABLED && MB_CALL_LOG_WEBHOOK_URL) {
       await sendWebhook(MB_CALL_LOG_WEBHOOK_URL, payloadBase, connId, "CallLog");
@@ -884,6 +927,15 @@ wss.on("connection", async (twilioWs, req) => {
         },
       })
     );
+
+    // Apply any queued instruction add-ons (caller id, captured phone, etc.)
+    // that arrived before the OpenAI session was ready.
+    while (pendingSessionAddons.length) {
+      const item = pendingSessionAddons.shift();
+      try {
+        updateSessionInstructions(openAiWs, item.addon, item.label);
+      } catch (_) {}
+    }
 
     sendModelPrompt(
       openAiWs,
@@ -1014,6 +1066,13 @@ wss.on("connection", async (twilioWs, req) => {
         if (phoneFromSpeech) {
           capturedPhoneIL = phoneFromSpeech;
           logDebug(connId, `Captured phone from speech: ${capturedPhoneIL}`);
+
+          // Inject the captured phone number so the model will repeat it digit-by-digit reliably.
+          const spaced = formatDigitsForTts(capturedPhoneIL);
+          queueSessionAddon(
+            `המספר שנקלט מהלקוח לחזרה הוא: "${spaced}". כשאת מאשרת מספר טלפון—חובה לקרוא ספרה-ספרה עם רווחים בין הספרות בדיוק כפי שמופיע כאן, ואז לשאול: "זה נכון?". אין להשמיט או לשנות ספרות.`,
+            "captured_phone"
+          );
         }
 
         break;
@@ -1083,6 +1142,17 @@ wss.on("connection", async (twilioWs, req) => {
 
       const cp = msg.start?.customParameters || {};
       callerRaw = cp.caller || cp.From || cp.from || msg.start?.caller || msg.start?.from || null;
+
+      // Derive caller id (IL local) and inject into the model instructions.
+      // This prevents the bot from claiming it cannot see the caller ID and enables proper caller-id validation.
+      callerIL = toIsraeliLocalFromAny(callerRaw) || null;
+      if (callerIL) {
+        const callerSpaced = formatDigitsForTts(callerIL);
+        queueSessionAddon(
+          `מספר הטלפון המזוהה של המתקשר הוא: "${callerSpaced}". כשאת שואלת האם לחזור למספר המזוהה—חובה קודם להציע לחזור למספר הזה ולהקריא אותו במלואו ספרה-ספרה בדיוק כפי שמופיע כאן. לעולם אל תגידי שאינך רואה/יודעת את המספר.`,
+          "caller_id"
+        );
+      }
 
       callStartTs = Date.now();
       lastMediaTs = Date.now();
