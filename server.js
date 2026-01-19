@@ -657,6 +657,9 @@ wss.on("connection", async (twilioWs, req) => {
   let recordingSid = null;
   let recordingUrl = null;
 
+  // OpenAI Realtime WS (kept as a variable so we can close it on endCall)
+  let openAiWs = null;
+
   let openAiReady = false;
   let hasActiveResponse = false;
   let botSpeaking = false;
@@ -822,6 +825,19 @@ wss.on("connection", async (twilioWs, req) => {
 
     if (callSid) hangupTwilioCall(callSid, connId).catch(() => {});
 
+    // IMPORTANT: Close OpenAI WS when the call ends.
+    // This prevents orphaned OpenAI sessions that later emit "session_expired" after ~60 minutes.
+    try {
+      if (openAiWs) {
+        if (openAiWs.readyState === WebSocket.OPEN) {
+          openAiWs.close(1000, "call_end");
+        } else if (openAiWs.readyState === WebSocket.CONNECTING) {
+          // If still connecting, force-terminate to avoid leaks
+          if (typeof openAiWs.terminate === "function") openAiWs.terminate();
+        }
+      }
+    } catch (_) {}
+
     try {
       if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close();
     } catch (_) {}
@@ -830,7 +846,7 @@ wss.on("connection", async (twilioWs, req) => {
   // -----------------------------
   // OpenAI Realtime WS
   // -----------------------------
-  const openAiWs = new WebSocket(
+  openAiWs = new WebSocket(
     `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_REALTIME_MODEL)}`,
     {
       headers: {
@@ -1003,13 +1019,36 @@ wss.on("connection", async (twilioWs, req) => {
         break;
       }
 
-      case "error":
+      case "error": {
+        const code = msg?.error?.code || null;
+
+        // If the call already ended, ignore late OpenAI error events (prevents log noise).
+        if (callEnded) {
+          logDebug(connId, `OpenAI error after call ended (ignored) code=${code || "unknown"}`, msg?.error || msg);
+          break;
+        }
+
+        // OpenAI Realtime hard-limits sessions (commonly 60 minutes).
+        // Handle it as a controlled call end instead of emitting an error log.
+        if (code === "session_expired") {
+          plannedEnd = true;
+          logInfo(connId, "OpenAI session expired (max duration). Ending call.", msg?.error || msg);
+          hasActiveResponse = false;
+          botSpeaking = false;
+          botTurnActive = false;
+          noListenUntilTs = 0;
+
+          endCall("openai_session_expired", null).catch(() => {});
+          break;
+        }
+
         logError(connId, "OpenAI error event", msg);
         hasActiveResponse = false;
         botSpeaking = false;
         botTurnActive = false;
         noListenUntilTs = 0;
         break;
+      }
 
       default:
         break;
