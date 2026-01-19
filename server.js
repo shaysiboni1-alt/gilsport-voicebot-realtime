@@ -626,6 +626,93 @@ function coerceLeadFields(obj) {
   return out;
 }
 
+function hasHebrew(s) {
+  return /[\u0590-\u05FF]/.test(String(s || ""));
+}
+
+function mostlyLatin(s) {
+  const t = String(s || "").trim();
+  if (!t) return false;
+  const letters = (t.match(/[a-zA-Z]/g) || []).length;
+  const heb = (t.match(/[\u0590-\u05FF]/g) || []).length;
+  return letters >= 3 && heb === 0;
+}
+
+async function ensureHebrewLeadFields(lead, conversationText, connId, botName, businessName) {
+  // Goal: keep webhook human-friendly in Hebrew, even if the caller spoke some English.
+  // We do NOT force Hebrew for phone numbers; only narrative fields.
+  if (!OPENAI_API_KEY) return lead;
+  if (!lead || typeof lead !== "object") return lead;
+
+  const needs = mostlyLatin(lead.full_name) || mostlyLatin(lead.reason) || mostlyLatin(lead.notes);
+  if (!needs) return lead;
+
+  try {
+    const systemPrompt = `
+You normalize call lead objects.
+Return ONLY valid JSON (no extra text).
+Output MUST keep the exact schema keys:
+{"is_lead":boolean,"intent":"sales"|"support"|"delivery"|"message"|"unknown","full_name":string|null,"phone_number":string|null,"prefers_caller_id":boolean|null,"brand":string|null,"model":string|null,"reason":string|null,"notes":string|null}
+Rules:
+- Translate reason and notes to Hebrew, professional and clear.
+- Expand notes to be explicit (what happened, what was requested, any number given such as importer/delivery).
+- Keep phone_number exactly as-is.
+- Keep full_name as spoken; if it is Latin and a Hebrew equivalent is clear from transcript, prefer Hebrew.
+- If unknown, keep null.
+JSON only.
+`.trim();
+
+    const userPrompt = `
+Business: ${businessName}
+Bot: ${botName}
+
+Transcript:
+${conversationText}
+
+Current lead object:
+${JSON.stringify(lead)}
+`.trim();
+
+    const response = await fetchWithTimeout(
+      "https://api.openai.com/v1/chat/completions",
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: MB_LEAD_PARSING_MODEL,
+          response_format: { type: "json_object" },
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: userPrompt },
+          ],
+        }),
+      },
+      6000
+    );
+
+    if (!response.ok) return lead;
+    const data = await response.json();
+    const raw = data.choices?.[0]?.message?.content;
+    if (!raw) return lead;
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (_) {
+      parsed = null;
+    }
+    if (!parsed || typeof parsed !== "object") return lead;
+    const coerced = coerceLeadFields(parsed);
+    // Prefer ensured Hebrew narratives, but don't erase an existing Hebrew reason/notes.
+    if (coerced.reason && (!lead.reason || mostlyLatin(lead.reason) || !hasHebrew(lead.reason))) lead.reason = coerced.reason;
+    if (coerced.notes && (!lead.notes || mostlyLatin(lead.notes) || !hasHebrew(lead.notes))) lead.notes = coerced.notes;
+    if (coerced.full_name && mostlyLatin(lead.full_name) && hasHebrew(coerced.full_name)) lead.full_name = coerced.full_name;
+    return lead;
+  } catch (err) {
+    logError(connId, "Lead Hebrew normalize error", err);
+    return lead;
+  }
+}
+
 async function extractLeadFromConversation(conversationLog, connId, botName, businessName) {
   const tag = "LeadParse";
   if (!OPENAI_API_KEY) return null;
@@ -683,11 +770,86 @@ async function extractLeadFromConversation(conversationLog, connId, botName, bus
     if (!parsed || typeof parsed !== "object") return null;
 
     const coerced = coerceLeadFields(parsed);
-    logInfo(connId, "Lead parsed.", coerced);
-    return coerced;
+    const ensured = await ensureHebrewLeadFields(coerced, conversationText, connId, botName, businessName);
+    logInfo(connId, "Lead parsed.", ensured);
+    return ensured;
   } catch (err) {
     logError(connId, "Lead parse error", err);
     return null;
+  }
+}
+
+function hasHebrew(text) {
+  return /[\u0590-\u05FF]/.test(String(text || ""));
+}
+
+function isMostlyNonHebrew(text) {
+  const s = String(text || "").trim();
+  if (!s) return false;
+  const heb = (s.match(/[\u0590-\u05FF]/g) || []).length;
+  const lat = (s.match(/[A-Za-z]/g) || []).length;
+  // If there's meaningful Latin and almost no Hebrew, treat as non-Hebrew.
+  return lat >= 6 && heb < 3;
+}
+
+async function ensureHebrewLeadFields(leadObj, conversationText, connId, botName, businessName) {
+  // We only enforce Hebrew for reason/notes (names can legitimately be in Latin).
+  const reasonBad = isMostlyNonHebrew(leadObj?.reason);
+  const notesBad = isMostlyNonHebrew(leadObj?.notes);
+  if (!reasonBad && !notesBad) return leadObj;
+  if (!OPENAI_API_KEY) return leadObj;
+
+  try {
+    const systemPrompt = `
+You normalize call-lead JSON fields. Return ONLY valid JSON (no extra text).
+Goal: reason and notes MUST be in Hebrew, detailed, and business-useful.
+If the caller spoke English, translate to Hebrew.
+Include: what the customer reported, brand/model if present, and if an importer phone was provided (mention it).
+Keep the same schema keys.
+`.trim();
+
+    const userPrompt = `
+Bot name: "${botName}". Business: "${businessName}".
+Original extracted lead JSON:
+${JSON.stringify(leadObj)}
+
+Transcript:
+${conversationText}
+`.trim();
+
+    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: MB_LEAD_PARSING_MODEL,
+        response_format: { type: "json_object" },
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userPrompt },
+        ],
+      }),
+    });
+
+    if (!response.ok) return leadObj;
+    const data = await response.json();
+    const raw = data.choices?.[0]?.message?.content;
+    if (!raw) return leadObj;
+
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (_) {
+      parsed = null;
+    }
+    if (!parsed || typeof parsed !== "object") return leadObj;
+
+    const coerced = coerceLeadFields(parsed);
+    // Preserve phone_number if we already normalized it later.
+    if (leadObj?.phone_number) coerced.phone_number = leadObj.phone_number;
+    return coerced;
+  } catch (err) {
+    logError(connId, "ensureHebrewLeadFields error", err);
+    return leadObj;
   }
 }
 
@@ -714,6 +876,15 @@ function mapCallStatus(reason, plannedEnd) {
   if (plannedEnd) return "completed";
   if (isAbandonedReason(reason)) return "abandoned";
   return "completed";
+}
+
+function mapEventHe(intent) {
+  const i = String(intent || "").toLowerCase().trim();
+  if (i === "support") return "שירות לקוחות";
+  if (i === "sales") return "מכירות";
+  if (i === "delivery") return "אספקה ומשלוחים";
+  if (i === "message") return "הודעה";
+  return "לא ידוע";
 }
 
 // -----------------------------
@@ -890,6 +1061,9 @@ wss.on("connection", async (twilioWs, req) => {
     if (!allowedPhonesDigits || allowedPhonesDigits.size === 0) return false;
 
     const seqs = extractDigitSequences(botText);
+    // Also handle common speech formatting like "0 5 0 ..." where digits aren't contiguous.
+    const joined = digitsOnly(botText);
+    if (joined && joined.length >= 7 && joined.length <= 12) seqs.push(joined);
     for (const seq of seqs) {
       const m = bestAllowedPhoneMatch(seq);
       if (!m) continue;
@@ -1031,7 +1205,7 @@ wss.on("connection", async (twilioWs, req) => {
       .map((m) => `${m.from === "user" ? "לקוח" : botName}: ${m.text}`)
       .join("\n");
 
-    const EVENT = parsedLead?.intent === "support" ? "שירות לקוחות" : parsedLead?.intent || "unknown";
+    const EVENT = mapEventHe(parsedLead?.intent);
 
     const payloadBase = {
       call_id: callSid || streamSid || `call_${Date.now()}`,
