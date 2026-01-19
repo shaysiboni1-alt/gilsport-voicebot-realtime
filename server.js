@@ -1163,6 +1163,14 @@ wss.on("connection", async (twilioWs, req) => {
   let phoneCorrectionSent = false;
   let phoneHallucinationCorrectionSent = false;
 
+  // Phone confirmation (code-enforced): after capturing a phone number from user speech,
+  // we force the bot to repeat it digit-by-digit and ask for confirmation.
+  // Only after confirmation do we proceed to closing + hangup.
+  let phoneConfirmPending = false;
+  let phoneConfirmNumberIL = null;
+  let phoneConfirmAskedAt = 0;
+  let closingAfterPhoneConfirm = false;
+
   let preferredGender = null;
   let genderInstructionSent = false;
   let baseInstructions = null;
@@ -1335,6 +1343,55 @@ wss.on("connection", async (twilioWs, req) => {
 
     const keywords = ["להתראות", "יום נעים", "תודה שפניתם", "תודה שפנית", "נסיים", "ביי"];
     return keywords.some((k) => t.includes(normalizeTextLoose(k)));
+  }
+
+  function isAffirmativeUtterance(norm) {
+    const t = String(norm || "");
+    return (
+      t === "כן" ||
+      t.includes("כן נכון") ||
+      t.includes("נכון") ||
+      t.includes("בדיוק") ||
+      t.includes("מאשר") ||
+      t.includes("מאשרת") ||
+      t.includes("אמת")
+    );
+  }
+
+  function isNegativeUtterance(norm) {
+    const t = String(norm || "");
+    if (!t) return false;
+    // avoid treating "לא יודע" as a strict rejection for phone confirmation
+    if (t.includes("לא יודע") || t.includes("לא זוכר")) return false;
+    return t === "לא" || t.includes("לא נכון") || t.includes("לא זה") || t.includes("טעית") || t.includes("שגוי");
+  }
+
+  function forcePhoneConfirmation(phoneIL) {
+    const d = digitsOnly(phoneIL);
+    if (!d || d.length < 9 || d.length > 10) return;
+    const spoken = formatDigitsForHebrewSpeech(d);
+
+    phoneConfirmPending = true;
+    phoneConfirmNumberIL = d;
+    phoneConfirmAskedAt = Date.now();
+
+    // cancel any in-flight model response to avoid overlaps
+    try {
+      if (openAiWs && openAiWs.readyState === WebSocket.OPEN) {
+        openAiWs.send(JSON.stringify({ type: "response.cancel" }));
+      }
+    } catch (_) {}
+    hasActiveResponse = false;
+    botSpeaking = false;
+    botTurnActive = false;
+    activeResponseId = null;
+    activeResponseDecisionPending = false;
+
+    sendModelPrompt(
+      openAiWs,
+      `כדי לוודא שחוזרים אליכם נכון, זה המספר לחזרה: ${spoken}. זה נכון?`,
+      "phone_confirm"
+    );
   }
 
   function getGraceMs() {
@@ -1762,6 +1819,14 @@ wss.on("connection", async (twilioWs, req) => {
           plannedEnd = true;
           scheduleForceEndAfterGrace("goodbye", goodbyePendingText);
         }
+
+        // If we just played the closing after an explicit phone confirmation, end the call cleanly.
+        if (closingAfterPhoneConfirm && !callEnded) {
+          closingAfterPhoneConfirm = false;
+          plannedEnd = true;
+          const { closing } = buildSystemInstructionsFromSheets();
+          scheduleForceEndAfterGrace("lead_completed", String(closing || ""));
+        }
         break;
 
       case "response.completed":
@@ -1806,6 +1871,26 @@ wss.on("connection", async (twilioWs, req) => {
         conversationLog.push({ from: "user", text: t });
         if (shouldLog) logAlways(`[CALLER][${connId}] ${t}`);
 
+        // If we are waiting for phone confirmation, treat the next user utterance as confirm/reject.
+        // This is code-enforced so the call does not end immediately after the phone is spoken.
+        if (phoneConfirmPending) {
+          if (isAffirmativeUtterance(norm)) {
+            phoneConfirmPending = false;
+            capturedPhoneIL = phoneConfirmNumberIL;
+
+            const { closing } = buildSystemInstructionsFromSheets();
+            closingAfterPhoneConfirm = true;
+            sendModelPrompt(openAiWs, String(closing || "תודה שפניתם. יום טוב."), "closing_after_phone_confirm");
+          } else if (isNegativeUtterance(norm)) {
+            phoneConfirmPending = false;
+            phoneConfirmNumberIL = null;
+            capturedPhoneIL = null;
+            sendModelPrompt(openAiWs, `אין בעיה. מה מספר הטלפון הנכון לחזרה?`, "phone_confirm_retry");
+          }
+          // Either way, don't try to capture a new number from the same short confirm/reject utterance.
+          break;
+        }
+
         const gPref = detectGenderPreference(t);
         if (gPref && gPref !== preferredGender) {
           preferredGender = gPref;
@@ -1823,10 +1908,18 @@ wss.on("connection", async (twilioWs, req) => {
         if (phoneFromSpeech) {
           capturedPhoneIL = phoneFromSpeech;
           logDebug(connId, `Captured phone from speech: ${capturedPhoneIL}`);
+          // Force confirmation immediately (code-enforced) so we always read back digit-by-digit.
+          forcePhoneConfirmation(capturedPhoneIL);
           try {
             const d = digitsOnly(capturedPhoneIL);
             if (d && d.length >= 7 && d.length <= 12) allowedPhonesDigits.add(d);
           } catch (_) {}
+
+          // Force a confirmation turn immediately after a phone was spoken.
+          // This prevents "silent hangup" moments and ensures we never send a lead with an unconfirmed phone.
+          if (!phoneConfirmPending) {
+            forcePhoneConfirmation(capturedPhoneIL);
+          }
         }
 
         break;
