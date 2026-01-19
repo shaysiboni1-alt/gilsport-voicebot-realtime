@@ -264,26 +264,6 @@ function isLowValueUtterance(raw) {
   return false;
 }
 
-// Strong utterances should be allowed to cut through short post-TTS cooldown windows.
-// This prevents a "choked" experience where a caller speaks immediately after the bot finishes and gets ignored.
-function isStrongUserUtterance(raw) {
-  const t = String(raw || "").trim();
-  if (!t) return false;
-
-  const norm = normalizeTextLoose(t);
-  if (!norm) return false;
-
-  const words = norm.split(" ").filter(Boolean);
-  const hasDigits = /\d/.test(norm);
-  const heb = /[\u0590-\u05FF]/.test(t);
-  const lettersOnly = norm.replace(/[^a-z\u0590-\u05FF]/g, "");
-
-  if (hasDigits && norm.length >= 4) return true;
-  if (words.length >= 2 && lettersOnly.length >= 6) return true;
-  if (heb && t.length >= 6) return true;
-  return false;
-}
-
 // For robust matching (goodbye detection / phone correction)
 function normalizeTextLoose(str) {
   return String(str || "")
@@ -1243,12 +1223,10 @@ wss.on("connection", async (twilioWs, req) => {
           mode: mentionsCallerId ? "caller_id" : "captured_phone",
         });
 
-        // Cancel only when we have an active response id (prevents response_cancel_not_active errors).
-        if (activeResponseId) {
+        if (hasActiveResponse) {
           try {
-            openAiWs.send(JSON.stringify({ type: "response.cancel", response_id: activeResponseId }));
+            openAiWs.send(JSON.stringify({ type: "response.cancel" }));
           } catch (_) {}
-          activeResponseId = null;
         }
 
         hasActiveResponse = false;
@@ -1280,12 +1258,11 @@ wss.on("connection", async (twilioWs, req) => {
 
       logError(connId, "Model spoke a business phone number incorrectly; forcing correction.", m);
 
-      // Cancel only when we have an active response id (prevents response_cancel_not_active errors).
-      if (activeResponseId) {
+      // Attempt to cancel only if a response is currently active; otherwise ignore.
+      if (hasActiveResponse) {
         try {
-          openAiWs.send(JSON.stringify({ type: "response.cancel", response_id: activeResponseId }));
+          openAiWs.send(JSON.stringify({ type: "response.cancel" }));
         } catch (_) {}
-        activeResponseId = null;
       }
 
       hasActiveResponse = false;
@@ -1541,9 +1518,6 @@ wss.on("connection", async (twilioWs, req) => {
             threshold: MB_VAD_THRESHOLD,
             silence_duration_ms: effectiveSilenceMs,
             prefix_padding_ms: MB_VAD_PREFIX_MS,
-            // IMPORTANT: do not auto-create model responses on VAD.
-            // We create responses only after a validated transcript passes our Speech Validity Gate.
-            create_response: false,
           },
           max_response_output_tokens: "inf",
           instructions,
@@ -1559,57 +1533,6 @@ wss.on("connection", async (twilioWs, req) => {
       "opening_greeting"
     );
   });
-
-  // Track the currently active response id when available, so we never attempt a cancel when nothing is active.
-  let activeResponseId = null;
-  // If the caller speaks while a response is being created (hasActiveResponse=true but we don't yet have a response id),
-  // queue the utterance and perform a barge-in cancel immediately once the id becomes available.
-  let pendingUserBargeText = null;
-  let pendingUserBargeTag = null;
-
-  function shouldCreateUserTurn(t) {
-    // Enforce a hard gate so the bot never responds to background noise, breath, or one-word fillers.
-    const raw = String(t || "").trim();
-    if (!raw) return false;
-
-    // Post-TTS cooldown (echo/noise protection).
-    // Allow strong, clearly-intended utterances (e.g., "שלום נטע") to pass even if they arrive
-    // immediately after TTS; otherwise the bot can appear "choked" and never respond.
-    const now = Date.now();
-    const strong = isStrongUserUtterance(raw);
-    if (!strong && now < noListenUntilTs) return false;
-
-    // If barge-in is disabled, do not create a user turn while the bot is speaking/has a response.
-    if (!MB_ALLOW_BARGE_IN && (botSpeaking || botTurnActive || hasActiveResponse)) return false;
-
-    // Low-value utterances (yes/no/ok) should not advance flows unless we already collected meaningful user content.
-    const hasRealUserYet = conversationLog.some((m) => m.from === "user" && (m.text || "").trim().length >= 4);
-    if (isTranscriptGarbage(raw, hasRealUserYet)) return false;
-    if (isLowValueUtterance(raw)) return false;
-
-    // Extra minimum-signal gate
-    const cleaned = raw.replace(/[\u0591-\u05C7]/g, "").replace(/[^\p{L}\p{N}\s]/gu, " ").replace(/\s+/g, " ").trim();
-    const words = cleaned.split(" ").filter(Boolean);
-    if (words.length < 2 && cleaned.length < 6) return false;
-
-    return true;
-  }
-
-  function createResponseForUserText(text, tag) {
-    if (!openAiReady || openAiWs.readyState !== WebSocket.OPEN) return;
-    if (hasActiveResponse) return;
-
-    openAiWs.send(
-      JSON.stringify({
-        type: "conversation.item.create",
-        item: { type: "message", role: "user", content: [{ type: "input_text", text }] },
-      })
-    );
-    openAiWs.send(JSON.stringify({ type: "response.create" }));
-    hasActiveResponse = true;
-    botTurnActive = true;
-    logDebug(connId, `response.create USER_TURN tag=${tag || "user"} text=${text}`);
-  }
 
   let currentBotText = "";
 
@@ -1627,25 +1550,8 @@ wss.on("connection", async (twilioWs, req) => {
         hasActiveResponse = true;
         botTurnActive = true;
         botSpeaking = false;
-        activeResponseId = msg.response?.id || msg.response_id || msg.id || null;
         noListenUntilTs = Date.now() + (MB_ALLOW_BARGE_IN ? MB_BARGE_IN_COOLDOWN_MS : MB_NO_BARGE_TAIL_MS);
         currentBotText = "";
-        // If the user spoke during response creation (no id yet), execute the queued barge-in now.
-        if (MB_ALLOW_BARGE_IN && pendingUserBargeText && activeResponseId) {
-          const queued = pendingUserBargeText;
-          const queuedTag = pendingUserBargeTag || "user_transcript";
-          pendingUserBargeText = null;
-          pendingUserBargeTag = null;
-          try {
-            openAiWs.send(JSON.stringify({ type: "response.cancel", response_id: activeResponseId }));
-          } catch (_) {}
-          activeResponseId = null;
-          hasActiveResponse = false;
-          botSpeaking = false;
-          botTurnActive = false;
-          // Immediately create a new response for the queued utterance.
-          createResponseForUserText(queued, queuedTag);
-        }
         break;
 
       case "response.output_text.delta":
@@ -1680,12 +1586,9 @@ wss.on("connection", async (twilioWs, req) => {
                 captured: cap,
                 model_said: said,
               });
-              if (activeResponseId) {
-                try {
-                  openAiWs.send(JSON.stringify({ type: "response.cancel", response_id: activeResponseId }));
-                } catch (_) {}
-                activeResponseId = null;
-              }
+              try {
+                openAiWs.send(JSON.stringify({ type: "response.cancel" }));
+              } catch (_) {}
               hasActiveResponse = false;
               botSpeaking = false;
               botTurnActive = false;
@@ -1738,80 +1641,31 @@ wss.on("connection", async (twilioWs, req) => {
         hasActiveResponse = false;
         botSpeaking = false;
         botTurnActive = false;
-        activeResponseId = null;
-        // If a barge-in utterance was queued but we never got a chance to cancel,
-        // respond now that the prior response completed.
-        if (pendingUserBargeText) {
-          const queued = pendingUserBargeText;
-          const queuedTag = pendingUserBargeTag || "user_transcript";
-          pendingUserBargeText = null;
-          pendingUserBargeTag = null;
-          createResponseForUserText(queued, queuedTag);
-        }
         break;
 
       case "conversation.item.input_audio_transcription.completed": {
+        if (!MB_LOG_TRANSCRIPTS) break;
+
         const raw = String(msg.transcript || "").trim();
         const hasRealUserYet = conversationLog.some((m) => m.from === "user" && (m.text || "").trim().length >= 4);
 
         if (!raw) break;
+        if (isTranscriptGarbage(raw, hasRealUserYet)) {
+          logDebug(connId, `Filtered garbage transcript: "${raw}"`);
+          break;
+        }
+
+        // Additional gate: ignore low-signal utterances (breath/noise/fillers) so the bot does not respond "on its own".
+        if (isLowValueUtterance(raw)) {
+          logDebug(connId, `Filtered low-value utterance: "${raw}"`);
+          break;
+        }
 
         const t = raw.replace(/\s+/g, " ").replace(/\s+([,.:;!?])/g, "$1").trim();
         if (!t) break;
 
-        // Meaningfulness gate for logging/history (independent of cooldown/barge-in).
-        // We do not want breath/noise/one-word fillers to pollute conversation history or lead extraction.
-        const meaningful = (() => {
-          if (isTranscriptGarbage(t, hasRealUserYet)) return false;
-          if (isLowValueUtterance(t)) return false;
-          const cleaned = t
-            .replace(/[\u0591-\u05C7]/g, "")
-            .replace(/[^\p{L}\p{N}\s]/gu, " ")
-            .replace(/\s+/g, " ")
-            .trim();
-          const words = cleaned.split(" ").filter(Boolean);
-          if (words.length < 2 && cleaned.length < 6) return false;
-          return true;
-        })();
-
-        if (!meaningful) {
-          logDebug(connId, `Meaningfulness gate: ignored transcript: "${t}"`);
-          break;
-        }
-
-        // Log caller transcript if enabled.
-        if (MB_LOG_TRANSCRIPTS) {
-          logAlways(`[CALLER][${connId}] ${t}`);
-        }
-
-        // Push to conversation history (used for lead extraction and intent routing).
         conversationLog.push({ from: "user", text: t });
-
-        // IMPORTANT: Create a model response only after the transcript passes a strict validity gate.
-        // This prevents the bot from speaking "on its own" due to noise/echo.
-        if (shouldCreateUserTurn(t)) {
-          // If a response is already in-flight but we don't yet have its id, we cannot cancel it.
-          // Queue the caller's utterance and cancel as soon as we receive response.created.
-          if (MB_ALLOW_BARGE_IN && hasActiveResponse && !activeResponseId) {
-            pendingUserBargeText = t;
-            pendingUserBargeTag = "user_transcript";
-            logDebug(connId, `Queued barge-in (awaiting response id): "${t}"`);
-            break;
-          }
-          // If barge-in is enabled and the model is currently speaking, attempt a best-effort cancel.
-          if (MB_ALLOW_BARGE_IN && (botSpeaking || botTurnActive) && activeResponseId) {
-            try {
-              openAiWs.send(JSON.stringify({ type: "response.cancel", response_id: activeResponseId }));
-            } catch (_) {}
-            activeResponseId = null;
-            hasActiveResponse = false;
-            botSpeaking = false;
-            botTurnActive = false;
-          }
-          createResponseForUserText(t, "user_transcript");
-        } else {
-          logDebug(connId, `Speech Validity Gate: ignored transcript: "${t}"`);
-        }
+        logAlways(`[CALLER][${connId}] ${t}`);
 
         const gPref = detectGenderPreference(t);
         if (gPref && gPref !== preferredGender) {
@@ -1842,12 +1696,6 @@ wss.on("connection", async (twilioWs, req) => {
       case "error":
         logError(connId, "OpenAI error event", msg);
 
-        // Benign in noisy environments: server_vad may attempt to commit a too-small buffer.
-        // With create_response=false, this should not cause the bot to speak; avoid resetting state.
-        if (msg && msg.error && msg.error.code === "input_audio_buffer_commit_empty") {
-          break;
-        }
-
         // If the Realtime session hit max duration, end the call cleanly.
         if (msg && msg.error && msg.error.code === "session_expired") {
           plannedEnd = true;
@@ -1863,7 +1711,6 @@ wss.on("connection", async (twilioWs, req) => {
         hasActiveResponse = false;
         botSpeaking = false;
         botTurnActive = false;
-        activeResponseId = null;
         noListenUntilTs = 0;
         break;
 
