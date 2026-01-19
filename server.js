@@ -350,6 +350,71 @@ function interpolateVars(str, vars) {
   return out;
 }
 
+
+// -----------------------------
+// Dynamic SETTINGS-derived lists (importers / delivery phones)
+// Convention:
+// - Delivery phones: SETTINGS keys starting with DELIVERY_PHONE_*, value should already be a human-readable string (e.g., "אלכס 050...")
+// - Importers: SETTINGS key pairs IMPORTER_<TOKEN>_NAME and IMPORTER_<TOKEN>_PHONE.
+//   NAME can contain multiple brand keywords (comma-separated), and PHONE is the direct number.
+// These lists are exposed to prompts via {DELIVERY_PHONES_LIST} and {IMPORTERS_LIST}.
+function buildDeliveryPhonesList(settings) {
+  const entries = [];
+  for (const [k, v] of Object.entries(settings || {})) {
+    if (!String(k).startsWith("DELIVERY_PHONE_")) continue;
+    const val = String(v || "").trim();
+    if (!val) continue;
+    const suffix = String(k).slice("DELIVERY_PHONE_".length);
+    entries.push({ k, suffix, val });
+  }
+  entries.sort((a, b) => {
+    const na = parseInt(a.suffix, 10);
+    const nb = parseInt(b.suffix, 10);
+    const aNum = Number.isFinite(na);
+    const bNum = Number.isFinite(nb);
+    if (aNum && bNum) return na - nb;
+    if (aNum && !bNum) return -1;
+    if (!aNum && bNum) return 1;
+    return String(a.suffix).localeCompare(String(b.suffix));
+  });
+  return entries.map((e) => e.val).join("; ");
+}
+
+function buildImportersList(settings) {
+  const names = {};
+  const phones = {};
+
+  for (const [k, v] of Object.entries(settings || {})) {
+    const key = String(k);
+    if (!key.startsWith("IMPORTER_")) continue;
+    const val = String(v || "").trim();
+    if (!val) continue;
+
+    if (key.endsWith("_NAME")) {
+      const token = key.slice("IMPORTER_".length, -"_NAME".length);
+      names[token] = val;
+    } else if (key.endsWith("_PHONE")) {
+      const token = key.slice("IMPORTER_".length, -"_PHONE".length);
+      phones[token] = val;
+    }
+  }
+
+  const tokens = Array.from(new Set([...Object.keys(names), ...Object.keys(phones)])).sort();
+  const items = [];
+
+  for (const t of tokens) {
+    const phone = String(phones[t] || "").trim();
+    if (!phone) continue;
+
+    const name = String(names[t] || "").trim();
+    const label = name || t.replace(/_/g, " ");
+
+    items.push(`${label} ${phone}`.trim());
+  }
+
+  return items.join("; ");
+}
+
 function buildSystemInstructionsFromSheets() {
   const businessName = getSetting("BUSINESS_NAME", "GilSport");
   const botName = getSetting("BOT_NAME", "נטע");
@@ -371,6 +436,10 @@ function buildSystemInstructionsFromSheets() {
     MAIN_PHONE: getSetting("MAIN_PHONE", ""),
     WORKING_HOURS: getSetting("WORKING_HOURS", ""),
     AFTER_HOURS_DELIVERY_RULE: getSetting("AFTER_HOURS_DELIVERY_RULE", ""),
+
+    // Dynamic lists derived from SETTINGS (no code changes needed when adding more entries)
+    DELIVERY_PHONES_LIST: buildDeliveryPhonesList(sheetsCache.settings),
+    IMPORTERS_LIST: buildImportersList(sheetsCache.settings),
 
     DELIVERY_PHONE_1: getSetting("DELIVERY_PHONE_1", ""),
     DELIVERY_PHONE_2: getSetting("DELIVERY_PHONE_2", ""),
