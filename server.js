@@ -1697,13 +1697,31 @@ wss.on("connection", async (twilioWs, req) => {
         botSpeaking = false;
         botTurnActive = false;
 
+        // Manual turns: in practice, some sessions do not emit a reliable
+        // `response.completed` event for every spoken response. If we keep
+        // `hasActiveResponse=true` until `response.completed`, we can end up
+        // permanently queuing user transcripts ("Neta is dead").
+        //
+        // For manual mode we therefore treat audio completion as the end of
+        // the response lifecycle and immediately allow the next manual turn.
+        if (manualTurnsEnabled) {
+          hasActiveResponse = false;
+
+          // If we queued a transcript while the bot was speaking/active, respond now.
+          if (manualArmed && pendingManualTranscript && !callEnded) {
+            const txt = pendingManualTranscript;
+            pendingManualTranscript = null;
+            tryCreateManualResponse(txt, "drain_after_audio_done");
+          }
+        }
+
         // Arm manual turns after the first audio playback (opening) completes.
         if (manualTurnsEnabled && !openingAudioDoneOnce) {
           openingAudioDoneOnce = true;
           manualArmed = true;
           logInfo(connId, "Manual turns armed after opening.");
-          // If we queued a transcript while opening/response was active, respond immediately now.
-          if (pendingManualTranscript && !hasActiveResponse && !callEnded && openAiReady) {
+          // If we queued a transcript during opening, respond immediately now.
+          if (pendingManualTranscript && !callEnded && openAiReady) {
             const txt = pendingManualTranscript;
             pendingManualTranscript = null;
             tryCreateManualResponse(txt, "drain_after_opening");
