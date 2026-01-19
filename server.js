@@ -227,6 +227,12 @@ function isLowValueUtterance(raw) {
   const norm = normalizeTextLoose(t); // lowercase, no niqqud, punctuation stripped
   if (!norm) return true;
 
+  // Greetings should be treated as meaningful input (especially in Manual Turns),
+  // otherwise the caller says "שלום" / "שלום נטע" and the bot appears non-responsive.
+  // Keep this list conservative to avoid letting noise through.
+  const isGreeting = /^(שלום|היי|הי|הלו|אלו|alo|hello|hi)\b/.test(norm);
+  if (isGreeting) return false;
+
   // Count words on the loose-normalized text
   const words = norm.split(" ").filter(Boolean);
   const hasDigits = /\d/.test(norm);
