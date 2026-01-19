@@ -363,13 +363,17 @@ const MB_MAX_WARN_BEFORE_MS = envNumber("MB_MAX_WARN_BEFORE_MS", 45000);
 const MB_HANGUP_GRACE_MS = envNumber("MB_HANGUP_GRACE_MS", 5000);
 
 // Webhooks
+// Backward/compat aliases (project standard):
+// - MAKE_WEBHOOK_URL: FINAL lead only
+// - MAKE_ABANDONED_URL: abandoned calls only
+// Keep MB_* names as primary, but accept MAKE_* if MB_* is not set.
 const MB_CALL_LOG_WEBHOOK_URL = sanitizeWebhookUrl(process.env.MB_CALL_LOG_WEBHOOK_URL || "");
 const MB_CALL_LOG_ENABLED = envBool("MB_CALL_LOG_ENABLED", !!MB_CALL_LOG_WEBHOOK_URL);
 
-const MB_WEBHOOK_URL = sanitizeWebhookUrl(process.env.MB_WEBHOOK_URL || "");
+const MB_WEBHOOK_URL = sanitizeWebhookUrl(process.env.MB_WEBHOOK_URL || process.env.MAKE_WEBHOOK_URL || "");
 const MB_ENABLE_LEAD_CAPTURE = envBool("MB_ENABLE_LEAD_CAPTURE", !!MB_WEBHOOK_URL);
 
-const MB_ABANDONED_WEBHOOK_URL = sanitizeWebhookUrl(process.env.MB_ABANDONED_WEBHOOK_URL || "");
+const MB_ABANDONED_WEBHOOK_URL = sanitizeWebhookUrl(process.env.MB_ABANDONED_WEBHOOK_URL || process.env.MAKE_ABANDONED_URL || "");
 const MB_ENABLE_ABANDONED_WEBHOOK = envBool("MB_ENABLE_ABANDONED_WEBHOOK", !!MB_ABANDONED_WEBHOOK_URL);
 
 const MB_FINAL_WEBHOOK_ONLY = envBool("MB_FINAL_WEBHOOK_ONLY", true);
@@ -1160,6 +1164,9 @@ wss.on("connection", async (twilioWs, req) => {
   let goodbyePendingText = null;
 
   let capturedPhoneIL = null;
+  // A phone that was explicitly confirmed by the user ("זה נכון?" -> "כן").
+  // FINAL lead + hangup-after-closing MUST rely on this value.
+  let confirmedPhoneIL = null;
   let phoneCorrectionSent = false;
   let phoneHallucinationCorrectionSent = false;
 
@@ -1200,6 +1207,11 @@ wss.on("connection", async (twilioWs, req) => {
   let activeResponseAllowed = true; // true/false; can be set on first audio delta
   let activeResponseDecisionPending = false;
   let activeResponseCreatedAt = 0;
+
+  // Track whether a bot response was explicitly initiated by server-side logic (sendModelPrompt),
+  // so we can hard-gate specific phases like phone confirmation.
+  let pendingForcedPurpose = null;
+  let activeResponsePurpose = null;
 
   // Allowed business phone numbers (delivery/importers/main + caller-id). Used to prevent / correct hallucinated digits.
   let allowedPhonesDigits = new Set();
@@ -1388,11 +1400,7 @@ wss.on("connection", async (twilioWs, req) => {
     confirmedPhoneSource = source || confirmedPhoneSource || 'spoken';
 
     // cancel any in-flight model response to avoid overlaps
-    try {
-      if (openAiWs && openAiWs.readyState === WebSocket.OPEN) {
-        openAiWs.send(JSON.stringify({ type: "response.cancel" }));
-      }
-    } catch (_) {}
+    maybeCancelResponse("force_phone_confirm");
     hasActiveResponse = false;
     botSpeaking = false;
     botTurnActive = false;
@@ -1414,6 +1422,9 @@ wss.on("connection", async (twilioWs, req) => {
   function sendModelPrompt(openAiWs, text, purpose) {
     if (!openAiReady || openAiWs.readyState !== WebSocket.OPEN) return;
     if (hasActiveResponse) return;
+
+    // Mark the next response as explicitly initiated by us.
+    pendingForcedPurpose = purpose || "forced";
 
     openAiWs.send(
       JSON.stringify({
@@ -1511,7 +1522,7 @@ wss.on("connection", async (twilioWs, req) => {
       }
     }
 
-    const isFullLead = !!(parsedLead && parsedLead.is_lead === true && coercedPhone && confirmedPhoneIL);
+    const isFullLead = !!(parsedLead && parsedLead.is_lead === true && confirmedPhoneIL);
     const call_status = mapCallStatus(reason, plannedEnd);
 
     if (recordingSid && !recordingUrl) {
@@ -1538,8 +1549,8 @@ wss.on("connection", async (twilioWs, req) => {
       caller_id_e164:
         toE164FromIsraeliLocal(callerILLocal) || (callerRaw && String(callerRaw).startsWith("+") ? callerRaw : null),
 
-      collected_phone_il: coercedPhone || null,
-      collected_phone_e164: coercedPhone ? toE164FromIsraeliLocal(coercedPhone) : null,
+      collected_phone_il: confirmedPhoneIL || null,
+      collected_phone_e164: confirmedPhoneIL ? toE164FromIsraeliLocal(confirmedPhoneIL) : null,
 
       business_name: businessName,
       bot_name: botName,
@@ -1622,6 +1633,21 @@ wss.on("connection", async (twilioWs, req) => {
     const now = Date.now();
     const userSeen = hasRealUserTurn();
 
+    // Hard gate during code-enforced phone confirmation:
+    // while we are waiting for the user to confirm ("זה נכון?"), we only allow
+    // responses that were explicitly initiated by our server logic.
+    if (phoneConfirmPending || closingAfterPhoneConfirm) {
+      const p = String(activeResponsePurpose || "");
+      const allow =
+        p === "phone_confirm" ||
+        p === "phone_confirm_retry" ||
+        p === "closing_after_phone_confirm" ||
+        p === "validated_phone_correction" ||
+        p === "business_phone_correction" ||
+        p === "phone_correction";
+      if (!allow) return false;
+    }
+
     // Before any real user turn: allow exactly one opening response, block follow-ups.
     if (!userSeen) {
       return openingResponseCount === 0;
@@ -1652,10 +1678,12 @@ wss.on("connection", async (twilioWs, req) => {
 
   function maybeCancelResponse(reason) {
     if (!openAiWs || openAiWs.readyState !== WebSocket.OPEN) return;
+    // Avoid noisy OpenAI errors: only attempt cancel when we believe a response is active.
+    if (!hasActiveResponse && !botTurnActive && !activeResponseId) return;
     try {
       openAiWs.send(JSON.stringify({ type: "response.cancel" }));
+      logDebug(connId, `Output-guard: cancelled response (${reason})`);
     } catch (_) {}
-    logDebug(connId, `Output-guard: cancelled response (${reason})`);
   }
 
   openAiWs.on("open", () => {
@@ -1715,6 +1743,8 @@ wss.on("connection", async (twilioWs, req) => {
         noListenUntilTs = Date.now() + (MB_ALLOW_BARGE_IN ? MB_BARGE_IN_COOLDOWN_MS : MB_NO_BARGE_TAIL_MS);
         currentBotText = "";
         activeResponseId = msg.response?.id || msg.response_id || null;
+        activeResponsePurpose = pendingForcedPurpose;
+        pendingForcedPurpose = null;
         activeResponseCreatedAt = Date.now();
         activeResponseDecisionPending = MB_OUTPUT_GUARD ? true : false;
         activeResponseAllowed = MB_OUTPUT_GUARD ? true : true;
@@ -1928,7 +1958,16 @@ wss.on("connection", async (twilioWs, req) => {
 
             confirmedPhoneIL = null;
             confirmedPhoneSource = null;
-            sendModelPrompt(openAiWs, `אין בעיה. מה מספר הטלפון הנכון לחזרה?`, "phone_confirm_retry");
+            // If the caller already said the correct number in the same utterance
+            // (e.g., "לא... המספר הוא 050-..."), treat it as a new provided phone
+            // and immediately re-confirm digit-by-digit.
+            const maybeNew = parsePhoneFromText(t);
+            const normalizedNew = normalizePhoneNumber(maybeNew, null);
+            if (normalizedNew) {
+              forcePhoneConfirmation(normalizedNew, "spoken");
+            } else {
+              sendModelPrompt(openAiWs, `אין בעיה. מה מספר הטלפון הנכון לחזרה?`, "phone_confirm_retry");
+            }
           }
           // Either way, don't try to capture a new number from the same short confirm/reject utterance.
           break;
@@ -1969,6 +2008,12 @@ wss.on("connection", async (twilioWs, req) => {
       }
 
       case "error":
+        // Suppress noise for benign cancels where there is no active response.
+        if (msg?.error?.code === "response_cancel_not_active") {
+          logDebug(connId, "OpenAI cancel: no active response (ignored).");
+          break;
+        }
+
         logError(connId, "OpenAI error event", msg);
 
         // If the Realtime session hit max duration, end the call cleanly.
