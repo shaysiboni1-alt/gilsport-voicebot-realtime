@@ -1,8 +1,7 @@
 // server.js
 // GilSport VoiceBot – MisterBot-style (Sheet prompts only) + Recording + Lead/CallLog + Abandoned
-// Version v5 – P1+P2 code fixes:
-// P1: Abandoned logic hardened (stop treated abandoned only if unplanned), phone repeat safety-net
-// P2: Explicit gender-preference detection (no guessing) via session.update
+// Version v6 – ENV compatibility hotfix:
+// Fix: Support GOOGLE_SERVICE_ACCOUNT_JSON_B64 (Render) in addition to GOOGLE_CLIENT_EMAIL/GOOGLE_PRIVATE_KEY
 
 require("dotenv").config();
 
@@ -41,10 +40,6 @@ function sanitizeWebhookUrl(url) {
 
 function nowIso() {
   return new Date().toISOString();
-}
-
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
 }
 
 async function fetchWithTimeout(url, options = {}, timeoutMs = 4500) {
@@ -110,7 +105,6 @@ function normalizePhoneNumber(rawPhone, callerNumber) {
 function extractBestPhoneFromText(text) {
   const d = digitsOnly(text);
   if (!d) return null;
-  // just validate through normalizePhoneNumber
   return normalizePhoneNumber(d, null);
 }
 
@@ -118,25 +112,20 @@ function isTranscriptGarbage(t, hasRealUserYet) {
   const s = String(t || "").trim();
   if (!s) return true;
 
-  // very short acknowledgements BEFORE we have real content are often junk
   const low = s.toLowerCase();
   if (!hasRealUserYet && (low === "ok" || low === "okay" || low === "yes" || low === "no")) return true;
 
-  // extremely short tokens with no digits/hebrew are likely noise
   const hasHeb = /[\u0590-\u05FF]/.test(s);
   const hasDigits = /\d/.test(s);
   const hasLetters = /[a-zA-Z]/.test(s);
 
   if (s.length <= 2 && !hasDigits) return true;
 
-  // If it is mostly punctuation
   const letters = s.replace(/[^a-zA-Z\u0590-\u05FF]/g, "");
   if (letters.length === 0 && !hasDigits) return true;
 
-  // If we already have real user content, allow short confirmations
   if (hasRealUserYet) return false;
 
-  // Before real content: allow Hebrew/digits; allow letters only if length > 5
   if (hasHeb || hasDigits) return false;
   if (hasLetters && s.length > 5) return false;
 
@@ -211,7 +200,12 @@ function logAlways(msg, extra) {
 // -----------------------------
 // Google Sheets (SETTINGS + PROMPTS)
 // -----------------------------
+// IMPORTANT: Keep existing Render ENV names.
+// Primary: GOOGLE_SERVICE_ACCOUNT_JSON_B64 + GSHEET_ID
+// Fallback: GOOGLE_CLIENT_EMAIL + GOOGLE_PRIVATE_KEY + GSHEET_ID
 const GSHEET_ID = process.env.GSHEET_ID || "";
+const GOOGLE_SERVICE_ACCOUNT_JSON_B64 = process.env.GOOGLE_SERVICE_ACCOUNT_JSON_B64 || "";
+
 const GOOGLE_CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL || "";
 const GOOGLE_PRIVATE_KEY = (process.env.GOOGLE_PRIVATE_KEY || "").replace(/\\n/g, "\n");
 
@@ -224,17 +218,57 @@ let sheetsCache = {
   prompts: {},
 };
 
+function decodeServiceAccountFromB64(b64) {
+  const raw = String(b64 || "").trim();
+  if (!raw) return null;
+  try {
+    const jsonStr = Buffer.from(raw, "base64").toString("utf8");
+    const obj = JSON.parse(jsonStr);
+    if (!obj || typeof obj !== "object") return null;
+
+    const email = String(obj.client_email || "").trim();
+    let key = String(obj.private_key || "").trim();
+
+    // normalize newlines if stored escaped
+    key = key.replace(/\\n/g, "\n");
+
+    if (!email || !key) return null;
+    return { email, key };
+  } catch (_) {
+    return null;
+  }
+}
+
+function getSheetsCreds() {
+  // Prefer JSON_B64 (your current Render)
+  const fromB64 = decodeServiceAccountFromB64(GOOGLE_SERVICE_ACCOUNT_JSON_B64);
+  if (fromB64) return fromB64;
+
+  // Fallback (legacy)
+  const email = String(GOOGLE_CLIENT_EMAIL || "").trim();
+  const key = String(GOOGLE_PRIVATE_KEY || "").trim();
+  if (email && key) return { email, key };
+
+  return null;
+}
+
 function requireSheetsConfig() {
   if (!GSHEET_ID) throw new Error("Missing GSHEET_ID");
-  if (!GOOGLE_CLIENT_EMAIL) throw new Error("Missing GOOGLE_CLIENT_EMAIL");
-  if (!GOOGLE_PRIVATE_KEY) throw new Error("Missing GOOGLE_PRIVATE_KEY");
+
+  const creds = getSheetsCreds();
+  if (!creds) {
+    // match the old error wording you saw (so it’s obvious what’s missing)
+    throw new Error("Missing GOOGLE_CLIENT_EMAIL");
+  }
 }
 
 function getAuth() {
   requireSheetsConfig();
+  const creds = getSheetsCreds();
+
   const jwt = new google.auth.JWT({
-    email: GOOGLE_CLIENT_EMAIL,
-    key: GOOGLE_PRIVATE_KEY,
+    email: creds.email,
+    key: creds.key,
     scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
   });
   return jwt;
@@ -299,18 +333,18 @@ async function loadSheetsCache(tag = "Startup") {
 function getSetting(key, def = "") {
   const k = normalizeKey(key);
   const v = sheetsCache.settings[k];
-  return (v !== undefined && v !== null && String(v).trim() !== "") ? String(v) : def;
+  return v !== undefined && v !== null && String(v).trim() !== "" ? String(v) : def;
 }
 function getPrompt(id, def = "") {
   const k = normalizeKey(id);
   const v = sheetsCache.prompts[k];
-  return (v !== undefined && v !== null && String(v).trim() !== "") ? String(v) : def;
+  return v !== undefined && v !== null && String(v).trim() !== "" ? String(v) : def;
 }
 
 function interpolateVars(str, vars) {
   let out = String(str || "");
   for (const [k, v] of Object.entries(vars || {})) {
-    const safeV = (v === undefined || v === null) ? "" : String(v);
+    const safeV = v === undefined || v === null ? "" : String(v);
     out = out.replaceAll(`{${k}}`, safeV);
   }
   return out;
@@ -320,12 +354,12 @@ function buildSystemInstructionsFromSheets() {
   const businessName = getSetting("BUSINESS_NAME", "GilSport");
   const botName = getSetting("BOT_NAME", "נטע");
 
-  const opening = getSetting("OPENING_SCRIPT", 'שלום! מדברת נטע מגיל ספורט במה אפשר לעזור?');
+  const opening = getSetting("OPENING_SCRIPT", "שלום! מדברת נטע מגיל ספורט במה אפשר לעזור?");
   const closing = getSetting("CLOSING_SCRIPT", "תודה שפנית אלינו. יום נעים!");
 
   const master = getPrompt("MASTER_PROMPT", "");
   const guard = getPrompt("GUARDRAILS_PROMPT", "");
-  const kb = getPrompt("KB_PROMPT", ""); // optional; if you keep only MASTER it is ok
+  const kb = getPrompt("KB_PROMPT", "");
 
   const vars = {
     BUSINESS_NAME: businessName,
@@ -344,6 +378,7 @@ function buildSystemInstructionsFromSheets() {
 
     IMPORTER_VO2_NAME: getSetting("IMPORTER_VO2_NAME", ""),
     IMPORTER_VO2_PHONE: getSetting("IMPORTER_VO2_PHONE", ""),
+
     IMPORTER_A_NAME: getSetting("IMPORTER_A_NAME", ""),
     IMPORTER_A_PHONE: getSetting("IMPORTER_A_PHONE", ""),
     IMPORTER_B_NAME: getSetting("IMPORTER_B_NAME", ""),
@@ -360,7 +395,9 @@ function buildSystemInstructionsFromSheets() {
     botName,
     opening,
     closing,
-    instructions: final || `את/ה נציג/ת שירות ומכירה קולית בשם "${botName}" עבור "${businessName}". דבר/י בעברית כברירת מחדל, בלשון רבים, בטון שירותי וקצר.`,
+    instructions:
+      final ||
+      `את/ה נציג/ת שירות ומכירה קולית בשם "${botName}" עבור "${businessName}". דבר/י בעברית כברירת מחדל, בלשון רבים, בטון שירותי וקצר.`,
   };
 }
 
@@ -404,15 +441,6 @@ async function buildRecordingUrl(recordingSid) {
 // -----------------------------
 // Lead parsing via Chat Completions
 // -----------------------------
-function pickFirst(obj, keys) {
-  for (const k of keys) {
-    if (obj && Object.prototype.hasOwnProperty.call(obj, k) && obj[k] !== undefined && obj[k] !== null && String(obj[k]).trim() !== "") {
-      return obj[k];
-    }
-  }
-  return null;
-}
-
 function normalizeKeyLoose(k) {
   return String(k || "")
     .trim()
@@ -422,20 +450,19 @@ function normalizeKeyLoose(k) {
 
 function coerceLeadFields(obj) {
   const out = {};
-
-  // Handle messy keys from model (Hebrew no underscores, etc.)
   const entries = Object.entries(obj || {}).map(([k, v]) => [normalizeKeyLoose(k), v]);
   const loose = Object.fromEntries(entries);
 
   const getLoose = (names) => {
     for (const n of names) {
       const key = normalizeKeyLoose(n);
-      if (loose[key] !== undefined && loose[key] !== null && String(loose[key]).trim() !== "") return loose[key];
+      if (loose[key] !== undefined && loose[key] !== null && String(loose[key]).trim() !== "")
+        return loose[key];
     }
     return null;
   };
 
-  out.is_lead = (obj && typeof obj.is_lead === "boolean") ? obj.is_lead : !!getLoose(["is_lead", "islead"]);
+  out.is_lead = obj && typeof obj.is_lead === "boolean" ? obj.is_lead : !!getLoose(["is_lead", "islead"]);
   out.intent = getLoose(["intent", "סיבתפנייה", "סיבת_פנייה"]) || "unknown";
   out.full_name = getLoose(["full_name", "fullname", "שםמלא", "שם_מלא"]) || null;
 
@@ -466,7 +493,6 @@ async function extractLeadFromConversation(conversationLog, connId, botName, bus
       .map((m) => `${m.from === "user" ? "לקוח" : botName}: ${m.text}`)
       .join("\n");
 
-    // IMPORTANT: messages must include word "json" to use response_format json_object (OpenAI requirement)
     const systemPrompt = `
 You are a call transcript analyzer. Return ONLY valid JSON (no extra text).
 The output MUST be a single JSON object with this exact schema keys:
@@ -476,19 +502,14 @@ If missing, set null. Output JSON only.
 
     const userPrompt = `
 Transcript between a caller and a voice bot named "${botName}" for "${businessName}".
-
 Return a JSON object ONLY.
-
 Transcript:
 ${conversationText}
 `.trim();
 
     const response = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        "Content-Type": "application/json",
-      },
+      headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
       body: JSON.stringify({
         model: MB_LEAD_PARSING_MODEL,
         response_format: { type: "json_object" },
@@ -627,13 +648,11 @@ wss.on("connection", async (twilioWs, req) => {
     return;
   }
 
-  // refresh sheets at connect (best-effort)
   loadSheetsCache("OnConnect").catch(() => {});
 
   let streamSid = null;
   let callSid = null;
   let callerRaw = null;
-  let calledRaw = null;
 
   let recordingSid = null;
   let recordingUrl = null;
@@ -644,8 +663,7 @@ wss.on("connection", async (twilioWs, req) => {
   let botTurnActive = false;
   let noListenUntilTs = 0;
 
-  let plannedEnd = false; // set true when WE decide to end
-
+  let plannedEnd = false;
   let callStartTs = Date.now();
   let lastMediaTs = Date.now();
   let idleCheckInterval = null;
@@ -656,15 +674,13 @@ wss.on("connection", async (twilioWs, req) => {
 
   let callEnded = false;
 
-  // deterministic phone capture (best effort) + safety net
-  let capturedPhoneIL = null; // from caller speech (best effort)
+  let capturedPhoneIL = null;
   let phoneCorrectionSent = false;
 
-  let preferredGender = null; // "male"|"female"|null (user preference)
+  let preferredGender = null;
   let genderInstructionSent = false;
-  let baseInstructions = null; // instructions snapshot at session start
+  let baseInstructions = null;
 
-  // transcript log
   let conversationLog = [];
 
   function getGraceMs() {
@@ -690,7 +706,6 @@ wss.on("connection", async (twilioWs, req) => {
 
   function detectGenderPreference(text) {
     const t = String(text || "").toLowerCase();
-    // Respect explicit user preference only (avoid guessing by voice)
     if (/(אני\s*(?:גבר|בן)|פנה\s*אלי\s*בלשון\s*זכר|בלשון\s*זכר|תדבר\s*אלי\s*בלשון\s*זכר)/.test(t)) return "male";
     if (/(אני\s*(?:אישה|בת)|פני\s*אלי\s*בלשון\s*נקבה|בלשון\s*נקבה|תדברי\s*אלי\s*בלשון\s*נקבה)/.test(t)) return "female";
     return null;
@@ -727,13 +742,11 @@ wss.on("connection", async (twilioWs, req) => {
     const startedAt = new Date(callStartTs).toISOString();
     const durationSec = Math.max(0, Math.round((Date.now() - callStartTs) / 1000));
 
-    // Parse lead once at end
     let parsedLead = null;
     try {
       parsedLead = await extractLeadFromConversation(conversationLog, connId, botName, businessName);
     } catch (_) {}
 
-    // Normalize phone from parsedLead or capturedPhone or caller
     const callerIL = toIsraeliLocalFromAny(callerRaw) || null;
 
     const coercedPhone =
@@ -749,7 +762,6 @@ wss.on("connection", async (twilioWs, req) => {
     const isFullLead = !!(parsedLead && parsedLead.is_lead === true && coercedPhone);
     const call_status = mapCallStatus(reason, plannedEnd);
 
-    // recording url
     if (recordingSid && !recordingUrl) {
       recordingUrl = await buildRecordingUrl(recordingSid);
     }
@@ -790,17 +802,14 @@ wss.on("connection", async (twilioWs, req) => {
       isFullLead,
     };
 
-    // Call log always if enabled
     if (MB_CALL_LOG_ENABLED && MB_CALL_LOG_WEBHOOK_URL) {
       await sendWebhook(MB_CALL_LOG_WEBHOOK_URL, payloadBase, connId, "CallLog");
     }
 
-    // Final lead webhook (only if full lead)
     if (MB_ENABLE_LEAD_CAPTURE && MB_WEBHOOK_URL && isFullLead) {
       await sendWebhook(MB_WEBHOOK_URL, payloadBase, connId, "FINAL Lead");
     }
 
-    // Abandoned webhook (P1 fix): only if NOT full lead, AND stop/error was unplanned
     if (
       MB_ENABLE_ABANDONED_WEBHOOK &&
       MB_ABANDONED_WEBHOOK_URL &&
@@ -811,10 +820,8 @@ wss.on("connection", async (twilioWs, req) => {
       await sendWebhook(MB_ABANDONED_WEBHOOK_URL, payloadBase, connId, "ABANDONED");
     }
 
-    // Hangup Twilio (best-effort)
     if (callSid) hangupTwilioCall(callSid, connId).catch(() => {});
 
-    // Close sockets
     try {
       if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close();
     } catch (_) {}
@@ -823,12 +830,15 @@ wss.on("connection", async (twilioWs, req) => {
   // -----------------------------
   // OpenAI Realtime WS
   // -----------------------------
-  const openAiWs = new WebSocket(`wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_REALTIME_MODEL)}`, {
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      "OpenAI-Beta": "realtime=v1",
-    },
-  });
+  const openAiWs = new WebSocket(
+    `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_REALTIME_MODEL)}`,
+    {
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "OpenAI-Beta": "realtime=v1",
+      },
+    }
+  );
 
   openAiWs.on("open", () => {
     openAiReady = true;
@@ -837,29 +847,28 @@ wss.on("connection", async (twilioWs, req) => {
 
     const effectiveSilenceMs = MB_VAD_SILENCE_MS + MB_VAD_SUFFIX_MS;
 
-    const sessionUpdate = {
-      type: "session.update",
-      session: {
-        model: OPENAI_REALTIME_MODEL,
-        modalities: ["audio", "text"],
-        voice: OPENAI_VOICE,
-        input_audio_format: "g711_ulaw",
-        output_audio_format: "g711_ulaw",
-        input_audio_transcription: { model: "whisper-1" },
-        turn_detection: {
-          type: "server_vad",
-          threshold: MB_VAD_THRESHOLD,
-          silence_duration_ms: effectiveSilenceMs,
-          prefix_padding_ms: MB_VAD_PREFIX_MS,
+    openAiWs.send(
+      JSON.stringify({
+        type: "session.update",
+        session: {
+          model: OPENAI_REALTIME_MODEL,
+          modalities: ["audio", "text"],
+          voice: OPENAI_VOICE,
+          input_audio_format: "g711_ulaw",
+          output_audio_format: "g711_ulaw",
+          input_audio_transcription: { model: "whisper-1" },
+          turn_detection: {
+            type: "server_vad",
+            threshold: MB_VAD_THRESHOLD,
+            silence_duration_ms: effectiveSilenceMs,
+            prefix_padding_ms: MB_VAD_PREFIX_MS,
+          },
+          max_response_output_tokens: "inf",
+          instructions,
         },
-        max_response_output_tokens: "inf",
-        instructions,
-      },
-    };
+      })
+    );
 
-    openAiWs.send(JSON.stringify(sessionUpdate));
-
-    // proactive opening
     sendModelPrompt(
       openAiWs,
       `פתחי את השיחה עם הלקוח במשפט הבא (אפשר לשנות מעט את הניסוח אבל לא להאריך): "${opening}" ואז עצרי והמתיני לתשובה שלו.`,
@@ -901,7 +910,6 @@ wss.on("connection", async (twilioWs, req) => {
           conversationLog.push({ from: "bot", text });
           logAlways(`[BOT][${connId}] ${text}`);
 
-          // P1: phone repeat safety net – if bot said a phone, verify digits
           if (!phoneCorrectionSent && capturedPhoneIL) {
             const said = digitsOnly(text);
             const cap = digitsOnly(capturedPhoneIL);
@@ -912,8 +920,9 @@ wss.on("connection", async (twilioWs, req) => {
                 captured: cap,
                 model_said: said,
               });
-              // cancel and force exact correction
-              try { openAiWs.send(JSON.stringify({ type: "response.cancel" })); } catch (_) {}
+              try {
+                openAiWs.send(JSON.stringify({ type: "response.cancel" }));
+              } catch (_) {}
               hasActiveResponse = false;
               botSpeaking = false;
               botTurnActive = false;
@@ -972,7 +981,6 @@ wss.on("connection", async (twilioWs, req) => {
         conversationLog.push({ from: "user", text: t });
         logAlways(`[CALLER][${connId}] ${t}`);
 
-        // P2: gender preference (explicit only). Update session instructions so model uses requested address form.
         const gPref = detectGenderPreference(t);
         if (gPref && gPref !== preferredGender) {
           preferredGender = gPref;
@@ -986,7 +994,6 @@ wss.on("connection", async (twilioWs, req) => {
           }
         }
 
-        // Best-effort deterministic phone capture from caller speech
         const phoneFromSpeech = extractBestPhoneFromText(t);
         if (phoneFromSpeech) {
           capturedPhoneIL = phoneFromSpeech;
@@ -1037,15 +1044,12 @@ wss.on("connection", async (twilioWs, req) => {
 
       const cp = msg.start?.customParameters || {};
       callerRaw = cp.caller || cp.From || cp.from || msg.start?.caller || msg.start?.from || null;
-      calledRaw = cp.called || cp.To || cp.to || msg.start?.to || null;
 
       callStartTs = Date.now();
       lastMediaTs = Date.now();
 
       logAlways(`[TWILIO_START][${connId}] ${JSON.stringify(msg.start || {})}`);
 
-      // Start “recording” marker (you already have Twilio recording SID from your logic; keep your existing start if applicable)
-      // If you set recordingSid elsewhere, it will propagate into webhooks.
       if (msg.start?.recordingSid) {
         recordingSid = msg.start.recordingSid;
         recordingUrl = await buildRecordingUrl(recordingSid);
@@ -1089,17 +1093,13 @@ wss.on("connection", async (twilioWs, req) => {
       if (!openAiReady || openAiWs.readyState !== WebSocket.OPEN) return;
 
       const now = Date.now();
-
       if (!MB_ALLOW_BARGE_IN) {
-        if (botTurnActive || botSpeaking || now < noListenUntilTs) {
-          return;
-        }
+        if (botTurnActive || botSpeaking || now < noListenUntilTs) return;
       }
 
       openAiWs.send(JSON.stringify({ type: "input_audio_buffer.append", audio: payload }));
     } else if (event === "stop") {
       logAlways(`[TWILIO_STOP][${connId}] stream stopped`);
-      // If Twilio stop arrives without plannedEnd, we treat it as unplanned disconnect.
       if (!plannedEnd && !callEnded) {
         endCall("twilio_stop", null).catch(() => {});
       } else if (!callEnded) {
