@@ -403,6 +403,20 @@ function logAlways(msg, extra) {
   else console.log(`[ALWAYS] ${msg}`);
 }
 
+function maskUrl(u) {
+  const s = String(u || "").trim();
+  if (!s) return "";
+  // keep origin + first path segment for debugging without leaking secrets
+  try {
+    const url = new URL(s);
+    const p = String(url.pathname || "/");
+    const first = p.split("/").filter(Boolean)[0] || "";
+    return `${url.origin}/${first ? first + "/" : ""}…`;
+  } catch (_) {
+    return s.slice(0, 24) + "…";
+  }
+}
+
 // -----------------------------
 // Google Sheets (SETTINGS + PROMPTS)
 // -----------------------------
@@ -1532,7 +1546,9 @@ wss.on("connection", async (twilioWs, req) => {
       .map((m) => `${m.from === "user" ? "לקוח" : botName}: ${m.text}`)
       .join("\n");
 
-    const EVENT = mapEventHe(parsedLead?.intent);
+    // Human-friendly EVENT label for Make dashboards.
+    // For abandoned calls we always mark it explicitly as "ננטשה" regardless of intent quality.
+    const EVENT = call_status === "abandoned" ? "ננטשה" : mapEventHe(parsedLead?.intent);
 
     const payloadBase = {
       call_id: callSid || streamSid || `call_${Date.now()}`,
@@ -1567,6 +1583,16 @@ wss.on("connection", async (twilioWs, req) => {
       parsedLead: parsedLead || null,
       isFullLead,
     };
+
+    logInfo(connId, "Webhook routing decision", {
+      call_status,
+      plannedEnd,
+      isFullLead,
+      confirmedPhoneIL: confirmedPhoneIL ? true : false,
+      final_url: maskUrl(MB_WEBHOOK_URL),
+      abandoned_url: maskUrl(MB_ABANDONED_WEBHOOK_URL),
+      calllog_url: maskUrl(MB_CALL_LOG_WEBHOOK_URL),
+    });
 
     if (MB_CALL_LOG_ENABLED && MB_CALL_LOG_WEBHOOK_URL) {
       await sendWebhook(MB_CALL_LOG_WEBHOOK_URL, payloadBase, connId, "CallLog");
@@ -1739,7 +1765,8 @@ wss.on("connection", async (twilioWs, req) => {
         hasActiveResponse = true;
         botTurnActive = true;
         botSpeaking = false;
-        noListenUntilTs = Date.now() + (MB_ALLOW_BARGE_IN ? MB_BARGE_IN_COOLDOWN_MS : MB_NO_BARGE_TAIL_MS);
+        // With barge-in enabled, don't block early caller speech right after the greeting.
+        noListenUntilTs = Date.now() + (MB_ALLOW_BARGE_IN ? 0 : MB_NO_BARGE_TAIL_MS);
         currentBotText = "";
         activeResponseId = msg.response?.id || msg.response_id || null;
         activeResponsePurpose = pendingForcedPurpose;
@@ -1850,7 +1877,8 @@ wss.on("connection", async (twilioWs, req) => {
         botSpeaking = true;
 
         const now = Date.now();
-        noListenUntilTs = now + (MB_ALLOW_BARGE_IN ? MB_BARGE_IN_COOLDOWN_MS : MB_NO_BARGE_TAIL_MS);
+        // During bot speech, allow barge-in. We'll only cool down briefly after audio.done.
+        noListenUntilTs = now + (MB_ALLOW_BARGE_IN ? 0 : MB_NO_BARGE_TAIL_MS);
 
         if (twilioWs.readyState === WebSocket.OPEN) {
           twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload: b64 } }));
