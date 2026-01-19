@@ -105,6 +105,70 @@ function formatDigitsForHebrewSpeech(d) {
     .join(", ");
 }
 
+// Extract a digit string from Hebrew digit-words in model output.
+// Supports common variants and strips niqqud/punctuation.
+function extractHebrewSpokenDigits(text) {
+  const s = String(text || "");
+  if (!s) return "";
+
+  // Remove niqqud and normalize separators to spaces
+  const cleaned = s
+    .replace(/[\u0591-\u05C7]/g, "")
+    .replace(/["'`]/g, "")
+    .replace(/[\(\)\[\]{}<>]/g, " ")
+    .replace(/[.,;:!?/\\|\-_=+]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const map = {
+    "אפס": "0",
+    "אפסים": "0",
+    "0": "0",
+    "אחד": "1",
+    "אחת": "1",
+    "1": "1",
+    "שתיים": "2",
+    "שניים": "2",
+    "שתים": "2",
+    "2": "2",
+    "שלוש": "3",
+    "שלושה": "3",
+    "3": "3",
+    "ארבע": "4",
+    "ארבעה": "4",
+    "4": "4",
+    "חמש": "5",
+    "חמישה": "5",
+    "5": "5",
+    "שש": "6",
+    "שישה": "6",
+    "6": "6",
+    "שבע": "7",
+    "שבעה": "7",
+    "7": "7",
+    "שמונה": "8",
+    "8": "8",
+    "תשע": "9",
+    "תשעה": "9",
+    "9": "9",
+  };
+
+  const toks = cleaned.split(" ");
+  let out = "";
+  for (const tok of toks) {
+    const t = tok.trim();
+    if (!t) continue;
+    if (map[t] != null) {
+      out += map[t];
+      continue;
+    }
+    // Also accept short numeric chunks like "03" "050" etc.
+    const dd = digitsOnly(t);
+    if (dd && dd.length <= 4) out += dd;
+  }
+  return out;
+}
+
 function normalizePhoneNumber(rawPhone, callerNumber) {
   function clean(num) {
     const d = digitsOnly(num);
@@ -895,8 +959,14 @@ app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
 app.get("/health", (req, res) => {
-  res.status(200).json({ ok: true, ts: Date.now(), sheets_loaded_at: sheetsCache.loadedAt });
-
+  res.status(200).json({
+    ok: true,
+    ts: Date.now(),
+    sheets_loaded_at: sheetsCache.loadedAt,
+    settings_keys: Object.keys(sheetsCache.settings || {}).length,
+    prompt_ids: Object.keys(sheetsCache.prompts || {}).length,
+  });
+});
 
 // Manual reload of Google Sheets cache (admin)
 app.post("/admin/reload-sheets", async (req, res) => {
@@ -914,8 +984,6 @@ app.post("/admin/reload-sheets", async (req, res) => {
       error: String(err?.message || err),
     });
   }
-});
-
 });
 
 // Twilio Voice webhook -> returns TwiML with Stream
@@ -1081,9 +1149,11 @@ wss.on("connection", async (twilioWs, req) => {
     if (!allowedPhonesDigits || allowedPhonesDigits.size === 0) return false;
 
     const seqs = extractDigitSequences(botText);
-    // Also handle common speech formatting like "0 5 0 ..." where digits aren't contiguous.
+    // Also handle common speech formatting like "0 5 0 ..." or Hebrew digit-words.
     const joined = digitsOnly(botText);
     if (joined && joined.length >= 7 && joined.length <= 12) seqs.push(joined);
+    const hebSpoken = extractHebrewSpokenDigits(botText);
+    if (hebSpoken && hebSpoken.length >= 7 && hebSpoken.length <= 12) seqs.push(hebSpoken);
     for (const seq of seqs) {
       const m = bestAllowedPhoneMatch(seq);
       if (!m) continue;
@@ -1093,9 +1163,12 @@ wss.on("connection", async (twilioWs, req) => {
 
       logError(connId, "Model spoke a business phone number incorrectly; forcing correction.", m);
 
-      try {
-        openAiWs.send(JSON.stringify({ type: "response.cancel" }));
-      } catch (_) {}
+      // Attempt to cancel only if a response is currently active; otherwise ignore.
+      if (hasActiveResponse) {
+        try {
+          openAiWs.send(JSON.stringify({ type: "response.cancel" }));
+        } catch (_) {}
+      }
 
       hasActiveResponse = false;
       botSpeaking = false;
