@@ -264,6 +264,26 @@ function isLowValueUtterance(raw) {
   return false;
 }
 
+// Strong utterances should be allowed to cut through short post-TTS cooldown windows.
+// This prevents a "choked" experience where a caller speaks immediately after the bot finishes and gets ignored.
+function isStrongUserUtterance(raw) {
+  const t = String(raw || "").trim();
+  if (!t) return false;
+
+  const norm = normalizeTextLoose(t);
+  if (!norm) return false;
+
+  const words = norm.split(" ").filter(Boolean);
+  const hasDigits = /\d/.test(norm);
+  const heb = /[\u0590-\u05FF]/.test(t);
+  const lettersOnly = norm.replace(/[^a-z\u0590-\u05FF]/g, "");
+
+  if (hasDigits && norm.length >= 4) return true;
+  if (words.length >= 2 && lettersOnly.length >= 6) return true;
+  if (heb && t.length >= 6) return true;
+  return false;
+}
+
 // For robust matching (goodbye detection / phone correction)
 function normalizeTextLoose(str) {
   return String(str || "")
@@ -1548,9 +1568,12 @@ wss.on("connection", async (twilioWs, req) => {
     const raw = String(t || "").trim();
     if (!raw) return false;
 
-    // Post-TTS cooldown (echo/noise protection)
+    // Post-TTS cooldown (echo/noise protection).
+    // Allow strong, clearly-intended utterances (e.g., "שלום נטע") to pass even if they arrive
+    // immediately after TTS; otherwise the bot can appear "choked" and never respond.
     const now = Date.now();
-    if (now < noListenUntilTs) return false;
+    const strong = isStrongUserUtterance(raw);
+    if (!strong && now < noListenUntilTs) return false;
 
     // If barge-in is disabled, do not create a user turn while the bot is speaking/has a response.
     if (!MB_ALLOW_BARGE_IN && (botSpeaking || botTurnActive || hasActiveResponse)) return false;
