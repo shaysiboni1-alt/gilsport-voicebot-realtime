@@ -818,11 +818,7 @@ wss.on("connection", async (twilioWs, req) => {
 
       business_name: businessName,
       bot_name: botName,
-
-      EVENT,
-      EVENT,
-
-      call_status,
+      EVENT,      call_status,
       reason: reason || null,
       closingMessage: effectiveClosing || null,
 
@@ -834,20 +830,6 @@ wss.on("connection", async (twilioWs, req) => {
       parsedLead: parsedLead || null,
       isFullLead,
     };
-
-    // Human-readable event label for downstream automations (requested field name)
-    const EVENT =
-      parsedLead?.intent === "support"
-        ? "שירות לקוחות"
-        : parsedLead?.intent === "sales"
-          ? "מכירות"
-          : parsedLead?.intent === "delivery"
-            ? "אספקה"
-            : parsedLead?.intent === "message"
-              ? "הודעה"
-              : null;
-    payloadBase.EVENT = EVENT;
-
     if (MB_CALL_LOG_ENABLED && MB_CALL_LOG_WEBHOOK_URL) {
       await sendWebhook(MB_CALL_LOG_WEBHOOK_URL, payloadBase, connId, "CallLog");
     }
