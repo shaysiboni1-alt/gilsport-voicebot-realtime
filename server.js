@@ -1,7 +1,6 @@
 // server.js
 // GilSport VoiceBot – MisterBot-style (Sheet prompts only) + Recording + Lead/CallLog + Abandoned
-// Version v6 – ENV compatibility hotfix:
-// Fix: Support GOOGLE_SERVICE_ACCOUNT_JSON_B64 (Render) in addition to GOOGLE_CLIENT_EMAIL/GOOGLE_PRIVATE_KEY
+// Version v6+ – Dynamic KB lists + CallerID injection + Phone hallucination correction + Hangup after goodbye + Hebrew lead parsing
 
 require("dotenv").config();
 
@@ -58,16 +57,6 @@ function digitsOnly(v) {
   return String(v).replace(/\D/g, "");
 }
 
-// Extract a single phone-like digit sequence from arbitrary text.
-// Handles spaced/dashed formats like "0 5 0-3 2" by stripping non-digits.
-// Returns null if the digit count is outside a sane phone range.
-function extractPhoneDigitsLoose(text, minDigits = 7, maxDigits = 12) {
-  const d = digitsOnly(text);
-  if (!d) return null;
-  if (d.length < minDigits || d.length > maxDigits) return null;
-  return d;
-}
-
 function toIsraeliLocalFromAny(raw) {
   const d = digitsOnly(raw);
   if (!d) return null;
@@ -86,15 +75,15 @@ function toE164FromIsraeliLocal(local) {
   return null;
 }
 
-// format digits as "0 5 0 3 ..." to reduce TTS swallowing digits
+// Legacy: "0 5 0 3 ..." (kept for backward compat if needed)
 function formatDigitsForTts(d) {
   const s = digitsOnly(d);
   if (!s) return "";
   return s.split("").join(" ");
 }
 
-// Prefer Hebrew words for digits (with commas) so the TTS does not swallow repetitions.
-// Example: 0503222237 -> "אפס, חמש, אפס, שלוש, שתיים, שתיים, שתיים, שתיים, שלוש, שבע".
+// Stronger speech-friendly formatting: Hebrew digit-words with commas for clear pauses
+// Example: 0503222237 -> "אפס, חמש, אפס, שלוש, שתיים, שתיים, שתיים, שתיים, שלוש, שבע"
 function formatDigitsForHebrewSpeech(d) {
   const s = digitsOnly(d);
   if (!s) return "";
@@ -165,6 +154,44 @@ function isTranscriptGarbage(t, hasRealUserYet) {
   return true;
 }
 
+// For robust matching (goodbye detection / phone correction)
+function normalizeTextLoose(str) {
+  return String(str || "")
+    .toLowerCase()
+    .replace(/[\u0591-\u05C7]/g, "") // remove niqqud
+    .replace(/[^a-z0-9\u0590-\u05FF\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function extractDigitSequences(text) {
+  const s = String(text || "");
+  const matches = s.match(/\d{7,12}/g);
+  return matches || [];
+}
+
+function levenshtein(a, b) {
+  a = String(a || "");
+  b = String(b || "");
+  if (a === b) return 0;
+  const al = a.length;
+  const bl = b.length;
+  if (al === 0) return bl;
+  if (bl === 0) return al;
+
+  const dp = Array.from({ length: al + 1 }, () => new Array(bl + 1).fill(0));
+  for (let i = 0; i <= al; i++) dp[i][0] = i;
+  for (let j = 0; j <= bl; j++) dp[0][j] = j;
+
+  for (let i = 1; i <= al; i++) {
+    for (let j = 1; j <= bl; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      dp[i][j] = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost);
+    }
+  }
+  return dp[al][bl];
+}
+
 // -----------------------------
 // Core ENV config
 // -----------------------------
@@ -178,6 +205,7 @@ const MB_DEBUG = envBool("MB_DEBUG", true);
 const MB_LOG_TRANSCRIPTS = envBool("MB_LOG_TRANSCRIPTS", true);
 const MB_NO_BARGE_TAIL_MS = envNumber("MB_NO_BARGE_TAIL_MS", 1600);
 const MB_ALLOW_BARGE_IN = envBool("MB_ALLOW_BARGE_IN", false);
+const MB_HANGUP_AFTER_GOODBYE = envBool("MB_HANGUP_AFTER_GOODBYE", true);
 
 const MB_VAD_THRESHOLD = envNumber("MB_VAD_THRESHOLD", 0.65);
 const MB_VAD_SILENCE_MS = envNumber("MB_VAD_SILENCE_MS", 900);
@@ -192,7 +220,6 @@ const MB_IDLE_HANGUP_MS = envNumber("MB_IDLE_HANGUP_MS", 90000);
 const MB_MAX_CALL_MS = envNumber("MB_MAX_CALL_MS", 5 * 60 * 1000);
 const MB_MAX_WARN_BEFORE_MS = envNumber("MB_MAX_WARN_BEFORE_MS", 45000);
 const MB_HANGUP_GRACE_MS = envNumber("MB_HANGUP_GRACE_MS", 5000);
-const MB_HANGUP_AFTER_GOODBYE = envBool("MB_HANGUP_AFTER_GOODBYE", true);
 
 // Webhooks
 const MB_CALL_LOG_WEBHOOK_URL = sanitizeWebhookUrl(process.env.MB_CALL_LOG_WEBHOOK_URL || "");
@@ -384,7 +411,6 @@ function interpolateVars(str, vars) {
   return out;
 }
 
-
 // -----------------------------
 // Dynamic SETTINGS-derived lists (importers / delivery phones)
 // Convention:
@@ -449,58 +475,6 @@ function buildImportersList(settings) {
   return items.join("; ");
 }
 
-// Collect all known phone numbers from SETTINGS so we can harden digit reading.
-function buildAllowedPhoneDigitsFromSettings(settings, extra = []) {
-  const set = new Set();
-
-  for (const [k, v] of Object.entries(settings || {})) {
-    const key = String(k || "").toUpperCase();
-    if (
-      key === "MAIN_PHONE" ||
-      /^DELIVERY_PHONE_\d+$/.test(key) ||
-      /^IMPORTER_[A-Z0-9_]+_PHONE$/.test(key)
-    ) {
-      const d = digitsOnly(v);
-      if (d) set.add(d);
-    }
-  }
-
-  for (const x of extra || []) {
-    const d = digitsOnly(x);
-    if (d) set.add(d);
-  }
-
-  return set;
-}
-
-function buildImporterIndex(settings) {
-  const idx = [];
-  const s = settings || {};
-
-  for (const [keyRaw, nameVal] of Object.entries(s)) {
-    const key = String(keyRaw || "").toUpperCase();
-    if (!key.endsWith("_NAME")) continue;
-    if (!key.startsWith("IMPORTER_")) continue;
-
-    const base = key.replace(/_NAME$/, "");
-    const phoneKey = `${base}_PHONE`;
-    const phoneVal = s[phoneKey];
-
-    const phone = digitsOnly(phoneVal);
-    const label = String(nameVal || "").trim();
-    if (!label || !phone) continue;
-
-    const keywords = label
-      .split(/[,，]/)
-      .map((x) => String(x || "").trim())
-      .filter(Boolean);
-
-    idx.push({ base, label, phone, keywords: keywords.length ? keywords : [label] });
-  }
-
-  return idx;
-}
-
 function buildSystemInstructionsFromSheets() {
   const businessName = getSetting("BUSINESS_NAME", "GilSport");
   const botName = getSetting("BOT_NAME", "נטע");
@@ -527,6 +501,7 @@ function buildSystemInstructionsFromSheets() {
     DELIVERY_PHONES_LIST: buildDeliveryPhonesList(sheetsCache.settings),
     IMPORTERS_LIST: buildImportersList(sheetsCache.settings),
 
+    // Backward-compatible placeholders (still supported)
     DELIVERY_PHONE_1: getSetting("DELIVERY_PHONE_1", ""),
     DELIVERY_PHONE_2: getSetting("DELIVERY_PHONE_2", ""),
     DELIVERY_PHONE_3: getSetting("DELIVERY_PHONE_3", ""),
@@ -603,6 +578,20 @@ function normalizeKeyLoose(k) {
     .replace(/[\s_'"״׳]/g, "");
 }
 
+// Loose normalizer for free-text comparisons (Hebrew+Latin):
+// - lowercases
+// - strips niqqud
+// - removes non-alphanumeric/non-Hebrew
+function normalizeLoose(s) {
+  return String(s || "")
+    .toLowerCase()
+    // niqqud + cantillation
+    .replace(/[\u0591-\u05C7]/g, "")
+    // keep hebrew/latin/digits
+    .replace(/[^a-z0-9\u0590-\u05FF]+/g, "")
+    .trim();
+}
+
 function coerceLeadFields(obj) {
   const out = {};
   const entries = Object.entries(obj || {}).map(([k, v]) => [normalizeKeyLoose(k), v]);
@@ -611,8 +600,7 @@ function coerceLeadFields(obj) {
   const getLoose = (names) => {
     for (const n of names) {
       const key = normalizeKeyLoose(n);
-      if (loose[key] !== undefined && loose[key] !== null && String(loose[key]).trim() !== "")
-        return loose[key];
+      if (loose[key] !== undefined && loose[key] !== null && String(loose[key]).trim() !== "") return loose[key];
     }
     return null;
   };
@@ -627,55 +615,15 @@ function coerceLeadFields(obj) {
 
   const prefersCaller = getLoose(["prefers_caller_id", "preferscallerid", "מזוהה", "מספרמזוהה"]);
   if (typeof prefersCaller === "boolean") out.prefers_caller_id = prefersCaller;
-  else if (typeof prefersCaller === "string") out.prefers_caller_id = /כן|נכון|true|1/.test(prefersCaller);
+  else if (typeof prefersCaller === "string") out.prefers_caller_id = /כן|נכון|true|1|yes|yep|yeah/.test(prefersCaller.toLowerCase());
   else out.prefers_caller_id = null;
 
   out.brand = getLoose(["brand", "מותג"]) || null;
   out.model = getLoose(["model", "דגם"]) || null;
-  out.reason = getLoose(["reason", "סיבת_פנייה", "סיבתפנייה"]) || null;
+  out.reason = getLoose(["reason", "סיבת_פנייה", "סיבתפנייה", "תקלה"]) || null;
   out.notes = getLoose(["notes", "הערות"]) || null;
 
   return out;
-}
-
-function hasHebrewLetters(s) {
-  return /[\u0590-\u05FF]/.test(String(s || ""));
-}
-
-async function translateToHebrewIfNeeded(connId, text, purpose = "") {
-  const src = String(text || "").trim();
-  if (!src) return src;
-  if (hasHebrewLetters(src)) return src;
-  if (!OPENAI_API_KEY) return src;
-  try {
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: MB_LEAD_PARSING_MODEL || "gpt-4.1-mini",
-        response_format: { type: "json_object" },
-        messages: [
-          {
-            role: "system",
-            content:
-              `Translate to Hebrew. Return ONLY valid JSON: {"he": "..."}. Preserve product/model names and phone numbers as-is. Purpose: ${purpose}`,
-          },
-          { role: "user", content: src },
-        ],
-        temperature: 0.2,
-      }),
-    });
-    if (!response.ok) return src;
-    const data = await response.json();
-    const raw = data.choices?.[0]?.message?.content;
-    if (!raw) return src;
-    const parsed = JSON.parse(raw);
-    const he = String(parsed?.he || "").trim();
-    return he || src;
-  } catch (e) {
-    logDebug(connId, `translateToHebrewIfNeeded failed: ${e && (e.message || e)}`);
-    return src;
-  }
 }
 
 async function extractLeadFromConversation(conversationLog, connId, botName, businessName) {
@@ -688,17 +636,16 @@ async function extractLeadFromConversation(conversationLog, connId, botName, bus
       .map((m) => `${m.from === "user" ? "לקוח" : botName}: ${m.text}`)
       .join("\n");
 
-    const basePrompt = getPrompt(
-      "LEAD_CAPTURE_PROMPT",
-      `החזירו json תקין בלבד (בלי טקסט נוסף) לפי הסכמה: {"is_lead":boolean,"intent":"sales"|"support"|"delivery"|"message"|"unknown","full_name":string|null,"phone_number":string|null,"prefers_caller_id":boolean|null,"brand":string|null,"model":string|null,"reason":string|null,"notes":string|null}; מלאו מהשיחה בלבד; אם חסר ערך—null.`
-    );
-    const systemPrompt = `${basePrompt}\n\nכל שדות הטקסט reason ו-notes חייבים להיות בעברית (גם אם הלקוח דיבר באנגלית). אם נמסר מספר יבואן/מוביל—ציינו זאת במפורש ב-notes. אין להמציא.`.trim();
+    const leadPromptFromSheets = String(getPrompt("LEAD_CAPTURE_PROMPT", "") || "").trim();
 
-    const userPrompt = `
-Transcript between a caller and a voice bot named "${botName}" for "${businessName}".
-Return a JSON object ONLY.
-Transcript:
-${conversationText}
+    const systemPrompt = (
+      leadPromptFromSheets ||
+      `החזירו JSON בלבד לפי סכימה קבועה.`
+    ).trim();
+
+    const systemAddon = `
+חובה: להחזיר JSON תקין בלבד (ללא טקסט נוסף).
+חובה: השדות reason ו-notes בעברית (אפשר לתרגם מתוכן השיחה), כולל ציון מפורש אם נמסר מספר יבואן/מוביל.
 `.trim();
 
     const response = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -708,8 +655,11 @@ ${conversationText}
         model: MB_LEAD_PARSING_MODEL,
         response_format: { type: "json_object" },
         messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: userPrompt },
+          { role: "system", content: `${systemPrompt}\n\n${systemAddon}` },
+          {
+            role: "user",
+            content: `תמלול שיחה בין מתקשר לבין בוט קולי בשם "${botName}" עבור "${businessName}". החזירו אובייקט JSON בלבד.\nתמלול:\n${conversationText}`,
+          },
         ],
       }),
     });
@@ -733,11 +683,6 @@ ${conversationText}
     if (!parsed || typeof parsed !== "object") return null;
 
     const coerced = coerceLeadFields(parsed);
-
-    // Ensure webhook-facing fields are in Hebrew, even if caller spoke English.
-    coerced.reason = await translateToHebrewIfNeeded(connId, coerced.reason, "reason");
-    coerced.notes = await translateToHebrewIfNeeded(connId, coerced.notes, "notes");
-
     logInfo(connId, "Lead parsed.", coerced);
     return coerced;
   } catch (err) {
@@ -769,48 +714,6 @@ function mapCallStatus(reason, plannedEnd) {
   if (plannedEnd) return "completed";
   if (isAbandonedReason(reason)) return "abandoned";
   return "completed";
-}
-
-function buildDetailedNotesHe({ parsedLead, importerPhoneProvided, matchedImporter, callerIL }) {
-  const p = parsedLead || {};
-  const parts = [];
-
-  switch (p.intent) {
-    case "support":
-      parts.push("נפתחה קריאת שירות בגיל ספורט.");
-      break;
-    case "sales":
-      parts.push("נרשמה פנייה למכירות.");
-      break;
-    case "delivery":
-      parts.push("נפתחה פנייה למחלקת אספקה ומשלוחים.");
-      break;
-    case "message":
-      parts.push("נרשמה הודעה כללית.");
-      break;
-    default:
-      break;
-  }
-
-  if (p.reason) parts.push(`סיבת פנייה: ${p.reason}.`);
-  if (p.brand) parts.push(`מותג: ${p.brand}.`);
-  if (p.model) parts.push(`דגם: ${p.model}.`);
-
-  if (importerPhoneProvided && matchedImporter?.phone) {
-    parts.push(`נמסר מספר טלפון ישיר ליבואן (${matchedImporter.label}): ${digitsOnly(matchedImporter.phone)}.`);
-  } else if (matchedImporter?.phone && matchedImporter?.label) {
-    parts.push(`זוהה יבואן תואם: ${matchedImporter.label} (${digitsOnly(matchedImporter.phone)}).`);
-  }
-
-  // Phone summary
-  const phone = digitsOnly(p.phone_number) || "";
-  if (phone) parts.push(`טלפון לחזרה: ${phone}.`);
-  else if (callerIL) parts.push(`טלפון מזוהה: ${digitsOnly(callerIL)}.`);
-
-  return parts
-    .map((s) => String(s || "").trim())
-    .filter(Boolean)
-    .join(" ");
 }
 
 // -----------------------------
@@ -889,13 +792,6 @@ wss.on("connection", async (twilioWs, req) => {
     return;
   }
 
-  loadSheetsCache("OnConnect")
-    .then(() => {
-      importerIndex = buildImporterIndex(sheetsCache.settings);
-      allowedPhoneDigits = buildAllowedPhoneDigitsFromSettings(sheetsCache.settings, callerIL ? [callerIL] : []);
-    })
-    .catch(() => {});
-
   let streamSid = null;
   let callSid = null;
   let callerRaw = null;
@@ -904,9 +800,6 @@ wss.on("connection", async (twilioWs, req) => {
   let recordingSid = null;
   let recordingUrl = null;
 
-  // OpenAI Realtime WS (kept as a variable so we can close it on endCall)
-  let openAiWs = null;
-
   let openAiReady = false;
   let hasActiveResponse = false;
   let botSpeaking = false;
@@ -914,7 +807,6 @@ wss.on("connection", async (twilioWs, req) => {
   let noListenUntilTs = 0;
 
   let plannedEnd = false;
-  let goodbyeEndScheduled = false;
   let callStartTs = Date.now();
   let lastMediaTs = Date.now();
   let idleCheckInterval = null;
@@ -925,31 +817,116 @@ wss.on("connection", async (twilioWs, req) => {
 
   let callEnded = false;
 
+  // When the bot says the closing line, we want to hang up automatically (so Twilio doesn't keep the line open)
+  let goodbyePendingHangup = false;
+  let goodbyePendingText = null;
+
   let capturedPhoneIL = null;
   let phoneCorrectionSent = false;
+  let phoneHallucinationCorrectionSent = false;
 
   let preferredGender = null;
   let genderInstructionSent = false;
   let baseInstructions = null;
 
-  // Session add-ons that depend on Twilio start data (caller id, captured phone, etc.)
-  // These may arrive before OpenAI WS is ready.
-  const pendingSessionAddons = [];
-
   let conversationLog = [];
 
-  // Harden phone number reading / confirmations across all flows
-  let lastAskedPhoneDigits = null;
-  let lastAskedPhonePurpose = null;
-  let phoneConfirmed = false;
+  // Allowed business phone numbers (delivery/importers/main + caller-id). Used to prevent / correct hallucinated digits.
+  let allowedPhonesDigits = new Set();
 
-  // Dynamic importer matching (from SETTINGS)
-  let importerIndex = [];
-  let matchedImporter = null; // { base,label,phone,keywords }
-  let importerPhoneProvided = false;
+  function refreshAllowedPhonesFromSheets() {
+    const s = sheetsCache.settings || {};
+    const out = new Set();
 
-  // Allowed digits we will accept the model to speak when a phone number is involved.
-  let allowedPhoneDigits = buildAllowedPhoneDigitsFromSettings(sheetsCache.settings);
+    const pushMaybe = (val) => {
+      const d = digitsOnly(val);
+      if (!d) return;
+      if (d.length >= 7 && d.length <= 12) out.add(d);
+    };
+
+    pushMaybe(getSetting("MAIN_PHONE", ""));
+
+    for (const [k, v] of Object.entries(s)) {
+      if (!k) continue;
+      const key = String(k).toUpperCase();
+      if (key.endsWith("_PHONE") || key.startsWith("DELIVERY_PHONE_")) pushMaybe(v);
+    }
+
+    allowedPhonesDigits = out;
+  }
+
+  function bestAllowedPhoneMatch(seqDigits) {
+    const seq = digitsOnly(seqDigits);
+    if (!seq || seq.length < 7 || seq.length > 12) return null;
+
+    let best = null;
+    let bestScore = Infinity;
+
+    for (const a of allowedPhonesDigits) {
+      if (!a) continue;
+      if (a === seq) return null;
+
+      // Off-by-one where one string contains the other
+      if (Math.abs(a.length - seq.length) <= 1 && (a.includes(seq) || seq.includes(a))) {
+        return { said: seq, expected: a, score: 0 };
+      }
+
+      if (Math.abs(a.length - seq.length) > 2) continue;
+      const dist = levenshtein(a, seq);
+      if (dist < bestScore) {
+        bestScore = dist;
+        best = a;
+      }
+    }
+
+    if (!best) return null;
+    if (bestScore <= 1) return { said: seq, expected: best, score: bestScore };
+    return null;
+  }
+
+  function maybeCorrectHallucinatedPhone(botText) {
+    if (phoneHallucinationCorrectionSent) return false;
+    if (!botText) return false;
+    if (!allowedPhonesDigits || allowedPhonesDigits.size === 0) return false;
+
+    const seqs = extractDigitSequences(botText);
+    for (const seq of seqs) {
+      const m = bestAllowedPhoneMatch(seq);
+      if (!m) continue;
+
+      phoneHallucinationCorrectionSent = true;
+      const expectedSpoken = formatDigitsForHebrewSpeech(m.expected);
+
+      logError(connId, "Model spoke a business phone number incorrectly; forcing correction.", m);
+
+      try {
+        openAiWs.send(JSON.stringify({ type: "response.cancel" }));
+      } catch (_) {}
+
+      hasActiveResponse = false;
+      botSpeaking = false;
+      botTurnActive = false;
+
+      sendModelPrompt(
+        openAiWs,
+        `תיקון חובה: המספר הנכון הוא "${expectedSpoken}". הקריאו אותו בדיוק ספרה-ספרה (מילות ספרות בעברית עם פסיקים) ושאלו: "זה נכון?" בלי תוספות.`,
+        "business_phone_correction"
+      );
+
+      return true;
+    }
+    return false;
+  }
+
+  function isGoodbyeUtterance(text) {
+    const { closing } = buildSystemInstructionsFromSheets();
+    const t = normalizeTextLoose(text);
+    const c = normalizeTextLoose(closing);
+    if (c && t.includes(c.slice(0, Math.min(20, c.length)))) return true;
+
+    const keywords = ["להתראות", "יום נעים", "תודה שפניתם", "תודה שפנית", "נסיים", "ביי"];
+    return keywords.some((k) => t.includes(normalizeTextLoose(k)));
+  }
 
   function getGraceMs() {
     const raw = MB_HANGUP_GRACE_MS && MB_HANGUP_GRACE_MS > 0 ? MB_HANGUP_GRACE_MS : 3000;
@@ -988,14 +965,20 @@ wss.on("connection", async (twilioWs, req) => {
     logInfo(connId, `session.update (${label || "addon"}) applied.`);
   }
 
-  function queueSessionAddon(addon, label) {
-    const text = String(addon || "").trim();
+  const sessionAddonQueue = [];
+  function queueSessionAddon(text, label) {
     if (!text) return;
-    if (openAiReady && openAiWs && openAiWs.readyState === WebSocket.OPEN && String(baseInstructions || "").trim()) {
-      updateSessionInstructions(openAiWs, text, label);
-      return;
-    }
-    pendingSessionAddons.push({ addon: text, label: label || "addon" });
+    sessionAddonQueue.push({ text, label: label || "addon" });
+    flushSessionAddons();
+  }
+  function flushSessionAddons() {
+    if (!openAiReady || openAiWs.readyState !== WebSocket.OPEN) return;
+    if (!baseInstructions) return;
+    if (sessionAddonQueue.length === 0) return;
+
+    const combinedAddons = sessionAddonQueue.map((x) => x.text).join("\n\n");
+    sessionAddonQueue.length = 0;
+    updateSessionInstructions(openAiWs, combinedAddons, "queued_addons");
   }
 
   function scheduleForceEndAfterGrace(reason, closingMessage) {
@@ -1025,7 +1008,7 @@ wss.on("connection", async (twilioWs, req) => {
       parsedLead = await extractLeadFromConversation(conversationLog, connId, botName, businessName);
     } catch (_) {}
 
-    const callerILLocal = callerIL || toIsraeliLocalFromAny(callerRaw) || null;
+    const callerILLocal = toIsraeliLocalFromAny(callerRaw) || null;
 
     const coercedPhone =
       normalizePhoneNumber(parsedLead?.phone_number, callerRaw) ||
@@ -1037,29 +1020,8 @@ wss.on("connection", async (twilioWs, req) => {
       parsedLead.phone_number = coercedPhone;
     }
 
-    if (parsedLead && typeof parsedLead === "object") {
-      // Ensure notes are descriptive and Hebrew.
-      parsedLead.notes = buildDetailedNotesHe({
-        parsedLead,
-        importerPhoneProvided,
-        matchedImporter,
-        callerIL: callerILLocal,
-      });
-    }
-
     const isFullLead = !!(parsedLead && parsedLead.is_lead === true && coercedPhone);
     const call_status = mapCallStatus(reason, plannedEnd);
-
-    const EVENT =
-      parsedLead?.intent === "support"
-        ? "שירות לקוחות"
-        : parsedLead?.intent === "sales"
-          ? "מכירות"
-          : parsedLead?.intent === "delivery"
-            ? "אספקה ומשלוחים"
-            : parsedLead?.intent === "message"
-              ? "הודעה כללית"
-              : "לא ידוע";
 
     if (recordingSid && !recordingUrl) {
       recordingUrl = await buildRecordingUrl(recordingSid);
@@ -1068,6 +1030,8 @@ wss.on("connection", async (twilioWs, req) => {
     const transcript = conversationLog
       .map((m) => `${m.from === "user" ? "לקוח" : botName}: ${m.text}`)
       .join("\n");
+
+    const EVENT = parsedLead?.intent === "support" ? "שירות לקוחות" : parsedLead?.intent || "unknown";
 
     const payloadBase = {
       call_id: callSid || streamSid || `call_${Date.now()}`,
@@ -1088,7 +1052,9 @@ wss.on("connection", async (twilioWs, req) => {
 
       business_name: businessName,
       bot_name: botName,
-      EVENT,      call_status,
+
+      EVENT,
+      call_status,
       reason: reason || null,
       closingMessage: effectiveClosing || null,
 
@@ -1100,6 +1066,7 @@ wss.on("connection", async (twilioWs, req) => {
       parsedLead: parsedLead || null,
       isFullLead,
     };
+
     if (MB_CALL_LOG_ENABLED && MB_CALL_LOG_WEBHOOK_URL) {
       await sendWebhook(MB_CALL_LOG_WEBHOOK_URL, payloadBase, connId, "CallLog");
     }
@@ -1120,14 +1087,12 @@ wss.on("connection", async (twilioWs, req) => {
 
     if (callSid) hangupTwilioCall(callSid, connId).catch(() => {});
 
-    // IMPORTANT: Close OpenAI WS when the call ends.
-    // This prevents orphaned OpenAI sessions that later emit "session_expired" after ~60 minutes.
+    // IMPORTANT: Close OpenAI WS when the call ends (prevents later session_expired noise)
     try {
       if (openAiWs) {
         if (openAiWs.readyState === WebSocket.OPEN) {
           openAiWs.close(1000, "call_end");
         } else if (openAiWs.readyState === WebSocket.CONNECTING) {
-          // If still connecting, force-terminate to avoid leaks
           if (typeof openAiWs.terminate === "function") openAiWs.terminate();
         }
       }
@@ -1138,10 +1103,15 @@ wss.on("connection", async (twilioWs, req) => {
     } catch (_) {}
   }
 
+  // Load sheets early and refresh allowed phone list once available
+  loadSheetsCache("OnConnect")
+    .then(() => refreshAllowedPhonesFromSheets())
+    .catch(() => {});
+
   // -----------------------------
   // OpenAI Realtime WS
   // -----------------------------
-  openAiWs = new WebSocket(
+  const openAiWs = new WebSocket(
     `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_REALTIME_MODEL)}`,
     {
       headers: {
@@ -1180,14 +1150,7 @@ wss.on("connection", async (twilioWs, req) => {
       })
     );
 
-    // Apply any queued instruction add-ons (caller id, captured phone, etc.)
-    // that arrived before the OpenAI session was ready.
-    while (pendingSessionAddons.length) {
-      const item = pendingSessionAddons.shift();
-      try {
-        updateSessionInstructions(openAiWs, item.addon, item.label);
-      } catch (_) {}
-    }
+    flushSessionAddons();
 
     sendModelPrompt(
       openAiWs,
@@ -1230,39 +1193,23 @@ wss.on("connection", async (twilioWs, req) => {
           conversationLog.push({ from: "bot", text });
           logAlways(`[BOT][${connId}] ${text}`);
 
-          // Harden all digit read-backs (caller ID, provided phone, importer phones, delivery phones).
-          // If the bot's spoken digits don't exactly match the expected digits, force a correction turn.
-          if (!phoneCorrectionSent) {
-            const saidLoose = extractPhoneDigitsLoose(text);
-            if (saidLoose) {
-              // Determine which number the bot is supposed to be reading right now.
-              let expected = null;
-              if (matchedImporter && /יבואן|מספר\s+ישיר|תרצו\s+לרשום/i.test(text)) {
-                expected = digitsOnly(matchedImporter.phone);
-              } else {
-                expected = digitsOnly(lastAskedPhoneDigits || "") || digitsOnly(capturedPhoneIL || "");
-              }
+          // 1) Correct hallucinated business numbers (importer/delivery/main/caller-id) before anything else
+          if (maybeCorrectHallucinatedPhone(text)) {
+            currentBotText = "";
+            break;
+          }
 
-              // Track if we actually provided the importer number
-              if (matchedImporter) {
-                const impDig = digitsOnly(matchedImporter.phone);
-                if (impDig && saidLoose === impDig) importerPhoneProvided = true;
-              }
-
-              const looksLikePhoneReadback = /זה\s*נכון|נכון\?|לחזור\s*למספר|המספר\s*לחזרה|תרצו\s+לרשום|המספר\s+הוא/i.test(text);
-              if (
-                expected &&
-                looksLikePhoneReadback &&
-                expected.length >= 7 &&
-                saidLoose.length >= 7 &&
-                saidLoose !== expected
-              ) {
+          // 2) Correct repeated-captured phone if model said different digits
+          if (!phoneCorrectionSent && capturedPhoneIL) {
+            const seqs = extractDigitSequences(text);
+            const said = seqs.length ? digitsOnly(seqs[0]) : digitsOnly(text);
+            const cap = digitsOnly(capturedPhoneIL);
+            if (said && said.length >= 7 && cap && said !== cap) {
               phoneCorrectionSent = true;
-              const expectedSpoken = formatDigitsForHebrewSpeech(expected);
+              const capSpoken = formatDigitsForHebrewSpeech(cap);
               logError(connId, "Model repeated wrong phone digits; forcing correction.", {
-                expected,
-                model_said: saidLoose,
-                purpose: lastAskedPhonePurpose || "unknown",
+                captured: cap,
+                model_said: said,
               });
               try {
                 openAiWs.send(JSON.stringify({ type: "response.cancel" }));
@@ -1272,22 +1219,16 @@ wss.on("connection", async (twilioWs, req) => {
               botTurnActive = false;
               sendModelPrompt(
                 openAiWs,
-                `תיקון חובה: המספר הוא "${expectedSpoken}". חזרי עליו בדיוק ספרה-ספרה, עם פסיקים בין הספרות, ושאלי: "זה נכון?" בלי להוסיף או להשמיט ספרות ובלי לשנות סדר.`,
+                `תיקון חובה: המספר שנקלט הוא "${capSpoken}". הקריאו אותו בדיוק ספרה-ספרה (מילות ספרות בעברית עם פסיקים) ושאלו: "זה נכון?" בלי להוסיף או להשמיט ספרות.`,
                 "phone_correction"
               );
-              }
             }
           }
 
-          // If this looks like a closing utterance, mark planned end so Twilio stop won't be classified as abandoned.
-          if (/להתראות|יום\s+נעים|תודה\s+שפנית|נחזור\s+אליכם\s+בהקדם/.test(text)) {
-            plannedEnd = true;
-            if (!goodbyeEndScheduled && MB_HANGUP_AFTER_GOODBYE) {
-              goodbyeEndScheduled = true;
-              setTimeout(() => {
-                endCall("goodbye", text).catch(() => {});
-              }, MB_HANGUP_GRACE_MS);
-            }
+          // 3) If the bot said a goodbye, hang up after audio finishes
+          if (!goodbyePendingHangup && MB_HANGUP_AFTER_GOODBYE && isGoodbyeUtterance(text)) {
+            goodbyePendingHangup = true;
+            goodbyePendingText = text;
           }
         }
         currentBotText = "";
@@ -1311,6 +1252,11 @@ wss.on("connection", async (twilioWs, req) => {
       case "response.audio.done":
         botSpeaking = false;
         botTurnActive = false;
+
+        if (goodbyePendingHangup && MB_HANGUP_AFTER_GOODBYE && !callEnded) {
+          plannedEnd = true;
+          scheduleForceEndAfterGrace("goodbye", goodbyePendingText);
+        }
         break;
 
       case "response.completed":
@@ -1337,45 +1283,6 @@ wss.on("connection", async (twilioWs, req) => {
         conversationLog.push({ from: "user", text: t });
         logAlways(`[CALLER][${connId}] ${t}`);
 
-        // If the bot just asked to confirm a phone number and the caller confirms, prevent re-asking.
-        const lastBot = [...conversationLog].reverse().find((m) => m.from === "bot" && (m.text || "").trim());
-        const lastBotText = String(lastBot?.text || "").trim();
-        const userLow = t.toLowerCase();
-        const userConfirmed =
-          /^(כן|נכון|מאשר|מאשרת|בדיוק|יופי|סבבה|אוקיי|ok|okay|yes|yeah|yep|good|yay)\b/i.test(userLow);
-        if (lastAskedPhoneDigits && userConfirmed && /זה\s*נכון|נכון\s*\?|לחזור\s*למספר|המספר\s*לחזרה/i.test(lastBotText)) {
-          phoneConfirmed = true;
-          lastAskedPhoneDigits = null;
-          lastAskedPhonePurpose = null;
-          queueSessionAddon(
-            "המספר אושר על-ידי הלקוח. אל תשאלי שוב על אימות מספר הטלפון אלא אם הלקוח מבקש לשנות או לתקן.",
-            "phone_confirmed"
-          );
-        }
-
-        // Dynamic importer match: if the caller mentions a known brand keyword, lock the importer phone.
-        if (importerIndex && importerIndex.length) {
-          const norm = normalizeLoose(t);
-          let best = null;
-          for (const it of importerIndex) {
-            for (const kw of it.keywords) {
-              if (kw && norm.includes(kw)) {
-                if (!best || kw.length > best.kw.length) best = { it, kw };
-              }
-            }
-          }
-          if (best && (!matchedImporter || matchedImporter.base !== best.it.base)) {
-            matchedImporter = best.it;
-            importerPhoneProvided = false;
-            const phoneSpoken = formatDigitsForHebrewSpeech(matchedImporter.phone);
-            allowedPhoneDigits.add(digitsOnly(matchedImporter.phone));
-            queueSessionAddon(
-              `זוהה מותג/יבואן תואם: "${matchedImporter.label}". אם הלקוח מבקש מספר יבואן, המספר הישיר היחיד שמותר למסור הוא: "${phoneSpoken}" (בדיוק). אין למסור מספר אחר.`,
-              "importer_lock"
-            );
-          }
-        }
-
         const gPref = detectGenderPreference(t);
         if (gPref && gPref !== preferredGender) {
           preferredGender = gPref;
@@ -1393,50 +1300,31 @@ wss.on("connection", async (twilioWs, req) => {
         if (phoneFromSpeech) {
           capturedPhoneIL = phoneFromSpeech;
           logDebug(connId, `Captured phone from speech: ${capturedPhoneIL}`);
-
-          // Inject the captured phone number so the model will repeat it digit-by-digit reliably.
-          const spoken = formatDigitsForHebrewSpeech(capturedPhoneIL);
-          lastAskedPhoneDigits = digitsOnly(capturedPhoneIL);
-          lastAskedPhonePurpose = "captured_phone";
-          queueSessionAddon(
-            `המספר שנקלט מהלקוח לחזרה הוא: "${spoken}". כשאת מאשרת מספר טלפון—חובה לקרוא ספרה-ספרה, עם פסיקים/הפסקות, בדיוק כפי שמופיע כאן, ואז לשאול: "זה נכון?". אין להשמיט או לשנות ספרות.`,
-            "captured_phone"
-          );
         }
 
         break;
       }
 
-      case "error": {
-        const code = msg?.error?.code || null;
+      case "error":
+        logError(connId, "OpenAI error event", msg);
 
-        // If the call already ended, ignore late OpenAI error events (prevents log noise).
-        if (callEnded) {
-          logDebug(connId, `OpenAI error after call ended (ignored) code=${code || "unknown"}`, msg?.error || msg);
-          break;
-        }
-
-        // OpenAI Realtime hard-limits sessions (commonly 60 minutes).
-        // Handle it as a controlled call end instead of emitting an error log.
-        if (code === "session_expired") {
+        // If the Realtime session hit max duration, end the call cleanly.
+        if (msg && msg.error && msg.error.code === "session_expired") {
           plannedEnd = true;
-          logInfo(connId, "OpenAI session expired (max duration). Ending call.", msg?.error || msg);
+          // Avoid trying to keep streaming into an expired session
           hasActiveResponse = false;
           botSpeaking = false;
           botTurnActive = false;
           noListenUntilTs = 0;
-
           endCall("openai_session_expired", null).catch(() => {});
           break;
         }
 
-        logError(connId, "OpenAI error event", msg);
         hasActiveResponse = false;
         botSpeaking = false;
         botTurnActive = false;
         noListenUntilTs = 0;
         break;
-      }
 
       default:
         break;
@@ -1472,16 +1360,16 @@ wss.on("connection", async (twilioWs, req) => {
       const cp = msg.start?.customParameters || {};
       callerRaw = cp.caller || cp.From || cp.from || msg.start?.caller || msg.start?.from || null;
 
-      // Derive caller id (IL local) and inject into the model instructions.
-      // This prevents the bot from claiming it cannot see the caller ID and enables proper caller-id validation.
+      // Refresh phones from sheets (if cache already loaded) and add caller-id to the allowed set
+      refreshAllowedPhonesFromSheets();
+
       callerIL = toIsraeliLocalFromAny(callerRaw) || null;
       if (callerIL) {
+        allowedPhonesDigits.add(digitsOnly(callerIL));
+
         const callerSpoken = formatDigitsForHebrewSpeech(callerIL);
-        lastAskedPhoneDigits = digitsOnly(callerIL);
-        lastAskedPhonePurpose = "caller_id";
-        allowedPhoneDigits = buildAllowedPhoneDigitsFromSettings(sheetsCache.settings, [callerIL]);
         queueSessionAddon(
-          `מספר הטלפון המזוהה של המתקשר הוא: "${callerSpoken}". כשאת שואלת האם לחזור למספר המזוהה—חובה קודם להקריא אותו ספרה-ספרה עם פסיקים בדיוק כמו כאן, ואז לשאול "לחזור למספר הזה?". אסור להשמיט/להוסיף ספרות. לעולם אל תגידי שאינך רואה/יודעת את המספר.`,
+          `מספר הטלפון המזוהה של המתקשר הוא (להקראה מדויקת): "${callerSpoken}". כשאת שואלת האם לחזור למספר המזוהה—חובה להקריא את המספר במלואו ספרה-ספרה בדיוק בפורמט הזה (מילות ספרות בעברית עם פסיקים). לעולם אל תגידי שאינך רואה/יודעת את המספר, ולעולם אל תחסירי/תוסיפי ספרה.`,
           "caller_id"
         );
       }
@@ -1564,7 +1452,7 @@ wss.on("connection", async (twilioWs, req) => {
 // Start server
 // -----------------------------
 server.listen(PORT, () => {
-  console.log(`==> Your service is live 🎉`);
+  console.log(`==> Your service is live`);
   console.log(`==> Available at your primary URL ${process.env.RENDER_EXTERNAL_URL || ""}`);
   loadSheetsCache("Startup").catch((err) => console.error("[ERROR] Startup sheets load failed", err));
 });
