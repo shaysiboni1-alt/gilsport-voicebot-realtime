@@ -1148,6 +1148,54 @@ wss.on("connection", async (twilioWs, req) => {
     if (!botText) return false;
     if (!allowedPhonesDigits || allowedPhonesDigits.size === 0) return false;
 
+    // Strict enforcement for validated numbers (caller-id / captured callback).
+    // If we are in a validation turn and the model speaks a different sequence, force a correction.
+    const normText = normalizeTextLoose(botText);
+    const expectedCaller = callerIL ? digitsOnly(callerIL) : null;
+    const expectedCaptured = capturedPhoneIL ? digitsOnly(capturedPhoneIL) : null;
+
+    const mentionsCallerId = !!(expectedCaller && (normText.includes(normalizeTextLoose("מספר המזוהה")) || normText.includes(normalizeTextLoose("המספר המזוהה"))));
+    const mentionsCallback = !!(expectedCaptured && (
+      normText.includes(normalizeTextLoose("מספר הטלפון שלך")) ||
+      normText.includes(normalizeTextLoose("המספר שלך")) ||
+      normText.includes(normalizeTextLoose("מספר הטלפון לחזרה")) ||
+      normText.includes(normalizeTextLoose("המספר לחזרה")) ||
+      normText.includes(normalizeTextLoose("לחזור למספר"))
+    ));
+
+    const strictExpected = mentionsCallerId ? expectedCaller : (mentionsCallback ? expectedCaptured : null);
+    if (strictExpected) {
+      const strictSpoken = extractHebrewSpokenDigits(botText) || digitsOnly(botText);
+      if (!strictSpoken || strictSpoken.length < 7 || strictSpoken.length > 12 || strictSpoken !== strictExpected) {
+        phoneHallucinationCorrectionSent = true;
+        const expectedSpoken = formatDigitsForHebrewSpeech(strictExpected);
+
+        logError(connId, "Model spoke a validated phone number incorrectly; forcing correction.", {
+          said: strictSpoken || null,
+          expected: strictExpected,
+          mode: mentionsCallerId ? "caller_id" : "captured_phone",
+        });
+
+        if (hasActiveResponse) {
+          try {
+            openAiWs.send(JSON.stringify({ type: "response.cancel" }));
+          } catch (_) {}
+        }
+
+        hasActiveResponse = false;
+        botSpeaking = false;
+        botTurnActive = false;
+
+        sendModelPrompt(
+          openAiWs,
+          `תיקון חובה: המספר הנכון הוא "${expectedSpoken}". הקריאו אותו בדיוק ספרה-ספרה (מילות ספרות בעברית עם פסיקים) ושאלו שאלה אחת בלבד לאישור: "זה נכון?"`,
+          "validated_phone_correction"
+        );
+
+        return true;
+      }
+    }
+
     const seqs = extractDigitSequences(botText);
     // Also handle common speech formatting like "0 5 0 ..." or Hebrew digit-words.
     const joined = digitsOnly(botText);
@@ -1580,6 +1628,10 @@ wss.on("connection", async (twilioWs, req) => {
         if (phoneFromSpeech) {
           capturedPhoneIL = phoneFromSpeech;
           logDebug(connId, `Captured phone from speech: ${capturedPhoneIL}`);
+          try {
+            const d = digitsOnly(capturedPhoneIL);
+            if (d && d.length >= 7 && d.length <= 12) allowedPhonesDigits.add(d);
+          } catch (_) {}
         }
 
         break;
