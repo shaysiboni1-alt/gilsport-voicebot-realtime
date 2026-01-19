@@ -1180,7 +1180,6 @@ wss.on("connection", async (twilioWs, req) => {
 
   // Confirmed callback phone (set ONLY after explicit user confirmation).
   // We never treat caller-id or parsed lead as confirmed unless the user approved it.
-  let confirmedPhoneIL = null;
   let confirmedPhoneSource = null; // 'spoken' | 'caller_id'
 
   // If the bot says a goodbye/closing before we have a confirmed phone, we must
