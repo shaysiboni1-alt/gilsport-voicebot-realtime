@@ -316,12 +316,8 @@ const MB_LOG_TRANSCRIPTS = envBool("MB_LOG_TRANSCRIPTS", true);
 const MB_NO_BARGE_TAIL_MS = envNumber("MB_NO_BARGE_TAIL_MS", 1600);
 const MB_BARGE_IN_COOLDOWN_MS = envNumber("MB_BARGE_IN_COOLDOWN_MS", 500);
 const MB_ALLOW_BARGE_IN = envBool("MB_ALLOW_BARGE_IN", false);
-const MB_HANGUP_AFTER_GOODBYE = envBool("MB_HANGUP_AFTER_GOODBYE", true);
-
-// Stage 2 (Silence / Turn Control) – optional manual turn control.
-// When enabled, OpenAI will NOT auto-create responses on VAD; we will explicitly call response.create
-// only after a user transcript passes the existing transcript gates.
 const MB_MANUAL_TURNS = envBool("MB_MANUAL_TURNS", false);
+const MB_HANGUP_AFTER_GOODBYE = envBool("MB_HANGUP_AFTER_GOODBYE", true);
 
 const MB_VAD_THRESHOLD = envNumber("MB_VAD_THRESHOLD", 0.65);
 const MB_VAD_SILENCE_MS = envNumber("MB_VAD_SILENCE_MS", 900);
@@ -1117,6 +1113,15 @@ wss.on("connection", async (twilioWs, req) => {
   let botTurnActive = false;
   let noListenUntilTs = 0;
 
+  let activeResponseId = null;
+
+  // Manual Turn Control (Stage 2): keep server_vad but disable auto-response generation.
+  const manualTurnsEnabled = MB_MANUAL_TURNS;
+  let manualArmed = false;           // armed only after opening finishes
+  let openingInProgress = false;     // true while opening response is active
+  let openingResponseId = null;      // response id of opening
+  let pendingManualTranscript = null; // last meaningful user transcript while a response is active
+
   let plannedEnd = false;
   let callStartTs = Date.now();
   let lastMediaTs = Date.now();
@@ -1135,43 +1140,6 @@ wss.on("connection", async (twilioWs, req) => {
   let capturedPhoneIL = null;
   let phoneCorrectionSent = false;
   let phoneHallucinationCorrectionSent = false;
-
-  // Manual turn control (Stage 2 hardening)
-  const manualTurnsEnabled = MB_MANUAL_TURNS;
-  let manualTurnsArmed = false; // arm only after the opening finishes
-  let lastManualResponseCreateTs = 0;
-  let openingResponsePending = false;
-
-  function triggerManualResponse(reason) {
-    if (!manualTurnsEnabled || !manualTurnsArmed) return;
-    if (!openAiReady || openAiWs.readyState !== WebSocket.OPEN) return;
-
-    // Debounce: prevent multiple response.create calls for the same utterance.
-    const now = Date.now();
-    if (now - lastManualResponseCreateTs < 300) return;
-    lastManualResponseCreateTs = now;
-
-    // If something is still considered active, try to cancel. Ignore cancel errors (they are noisy but benign).
-    if (hasActiveResponse || botTurnActive || botSpeaking) {
-      try {
-        openAiWs.send(JSON.stringify({ type: "response.cancel" }));
-      } catch (_) {}
-      hasActiveResponse = false;
-      botTurnActive = false;
-      botSpeaking = false;
-    }
-
-    try {
-      openAiWs.send(JSON.stringify({ type: "response.create" }));
-      hasActiveResponse = true;
-      botTurnActive = true;
-      logDebug(connId, `response.create (manual) reason=${reason || "user_transcript"}`);
-    } catch (err) {
-      hasActiveResponse = false;
-      botTurnActive = false;
-      logError(connId, "response.create failed (manual)", err);
-    }
-  }
 
   let preferredGender = null;
   let genderInstructionSent = false;
@@ -1557,12 +1525,11 @@ wss.on("connection", async (twilioWs, req) => {
           input_audio_transcription: { model: "whisper-1" },
           turn_detection: {
             type: "server_vad",
+            create_response: !manualTurnsEnabled,
+            interrupt_response: MB_ALLOW_BARGE_IN,
             threshold: MB_VAD_THRESHOLD,
             silence_duration_ms: effectiveSilenceMs,
             prefix_padding_ms: MB_VAD_PREFIX_MS,
-            // When manual turns are enabled, do not let OpenAI auto-create assistant responses.
-            // We'll create responses explicitly after transcript gating.
-            create_response: MB_MANUAL_TURNS ? false : undefined,
           },
           max_response_output_tokens: "inf",
           instructions,
@@ -1572,9 +1539,12 @@ wss.on("connection", async (twilioWs, req) => {
 
     flushSessionAddons();
 
-    // In manual-turn mode, we arm only after the opening finishes playing,
-    // so an immediate caller "שלום" doesn't race the opening response lifecycle.
-    openingResponsePending = true;
+    if (manualTurnsEnabled) {
+      openingInProgress = true;
+      manualArmed = false;
+      openingResponseId = null;
+      pendingManualTranscript = null;
+    }
 
     sendModelPrompt(
       openAiWs,
@@ -1585,7 +1555,38 @@ wss.on("connection", async (twilioWs, req) => {
 
   let currentBotText = "";
 
-  openAiWs.on("message", (data) => {
+  
+  function manualShouldRespondToTranscript(t) {
+    if (!manualTurnsEnabled || !manualArmed) return false;
+    const cleaned = normalizeTextLoose(t || "");
+    if (!cleaned) return false;
+    // Use existing gates but allow common greetings.
+    const allowGreetings = /^(שלום|היי|הלו|אלו|אהלן|aloha|hello|hi)\b/i.test(cleaned);
+    if (!allowGreetings) {
+      if (isTranscriptGarbage(cleaned) || isLowValueUtterance(cleaned)) return false;
+    }
+    return true;
+  }
+
+  function triggerManualResponseCreate(reason) {
+    if (!manualTurnsEnabled || !manualArmed) return;
+    if (!openAiReady || !openAiWs || openAiWs.readyState !== WebSocket.OPEN) return;
+
+    // If a response is active (opening or ongoing), wait for response.completed.
+    if (hasActiveResponse) return;
+
+    try {
+      openAiWs.send(JSON.stringify({ type: "response.create" }));
+      hasActiveResponse = true;
+      botTurnActive = true;
+      botSpeaking = false;
+      noListenUntilTs = Date.now() + (MB_ALLOW_BARGE_IN ? MB_BARGE_IN_COOLDOWN_MS : MB_NO_BARGE_TAIL_MS);
+      logInfo(connId, `Manual response.create sent (${reason}).`);
+    } catch (e) {
+      logError(connId, "Failed to send manual response.create", e);
+    }
+  }
+openAiWs.on("message", (data) => {
     let msg;
     try {
       msg = JSON.parse(data.toString());
@@ -1595,13 +1596,28 @@ wss.on("connection", async (twilioWs, req) => {
     }
 
     switch (msg.type) {
-      case "response.created":
+      case "response.created": {
+        const rid = (msg && msg.response && msg.response.id) || msg.response_id || msg.id || null;
+        activeResponseId = rid;
         hasActiveResponse = true;
         botTurnActive = true;
         botSpeaking = false;
         noListenUntilTs = Date.now() + (MB_ALLOW_BARGE_IN ? MB_BARGE_IN_COOLDOWN_MS : MB_NO_BARGE_TAIL_MS);
         currentBotText = "";
+        if (manualTurnsEnabled && openingInProgress && !openingResponseId) {
+          openingResponseId = rid;
+        }
+        // Manual Turn Control: explicitly create a model response only after a meaningful transcript.
+        if (manualTurnsEnabled && manualArmed && manualShouldRespondToTranscript(t)) {
+          if (hasActiveResponse) {
+            pendingManualTranscript = t;
+          } else {
+            triggerManualResponseCreate("user_transcript");
+          }
+        }
+
         break;
+      }
 
       case "response.output_text.delta":
       case "response.audio_transcript.delta": {
@@ -1677,12 +1693,6 @@ wss.on("connection", async (twilioWs, req) => {
         botSpeaking = false;
         botTurnActive = false;
 
-        if (manualTurnsEnabled && openingResponsePending && !manualTurnsArmed) {
-          manualTurnsArmed = true;
-          openingResponsePending = false;
-          logInfo(connId, "Manual turns armed after opening.");
-        }
-
         // Always apply a small post-TTS cooldown to avoid echo / background noise false turns.
         noListenUntilTs = Date.now() + (MB_ALLOW_BARGE_IN ? MB_BARGE_IN_COOLDOWN_MS : MB_NO_BARGE_TAIL_MS);
 
@@ -1692,13 +1702,34 @@ wss.on("connection", async (twilioWs, req) => {
         }
         break;
 
-      case "response.completed":
+      case "response.completed": {
+        const rid = (msg && msg.response && msg.response.id) || msg.response_id || msg.id || null;
+
+        activeResponseId = null;
         hasActiveResponse = false;
         botSpeaking = false;
         botTurnActive = false;
+
+        if (manualTurnsEnabled && openingInProgress && openingResponseId && rid && rid === openingResponseId) {
+          openingInProgress = false;
+          manualArmed = true;
+          logInfo(connId, "Manual turns armed after opening.");
+          if (pendingManualTranscript) {
+            // Consume pending transcript captured during opening.
+            pendingManualTranscript = null;
+            triggerManualResponseCreate("pending_after_opening");
+          }
+        } else if (manualTurnsEnabled && manualArmed && pendingManualTranscript) {
+          pendingManualTranscript = null;
+          triggerManualResponseCreate("pending_after_completed");
+        }
+
         break;
+      }
 
       case "conversation.item.input_audio_transcription.completed": {
+        const shouldLogTranscript = MB_LOG_TRANSCRIPTS;
+
         const raw = String(msg.transcript || "").trim();
         const hasRealUserYet = conversationLog.some((m) => m.from === "user" && (m.text || "").trim().length >= 4);
 
@@ -1718,7 +1749,7 @@ wss.on("connection", async (twilioWs, req) => {
         if (!t) break;
 
         conversationLog.push({ from: "user", text: t });
-        if (MB_LOG_TRANSCRIPTS) logAlways(`[CALLER][${connId}] ${t}`);
+        logAlways(`[CALLER][${connId}] ${t}`);
 
         const gPref = detectGenderPreference(t);
         if (gPref && gPref !== preferredGender) {
@@ -1742,10 +1773,6 @@ wss.on("connection", async (twilioWs, req) => {
             if (d && d.length >= 7 && d.length <= 12) allowedPhonesDigits.add(d);
           } catch (_) {}
         }
-
-        // Manual turn control: after a meaningful transcript passes gates, explicitly trigger the next response.
-        // This is intentionally late in the handler so capturedPhone/gender hooks still run.
-        triggerManualResponse("user_transcript");
 
         break;
       }
