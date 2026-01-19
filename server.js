@@ -274,18 +274,6 @@ function normalizeTextLoose(str) {
     .trim();
 }
 
-// Greeting whitelist used for Manual Turns gating.
-// "שלום נטע" must be treated as a valid user turn.
-function isGreetingUtteranceLoose(raw) {
-  const norm = normalizeTextLoose(raw);
-  if (!norm) return false;
-  if (norm === "שלום" || norm === "היי" || norm === "הלו" || norm === "אלו") return true;
-  if (norm === "שלום נטע" || norm === "היי נטע" || norm === "הלו נטע" || norm === "אלו נטע") return true;
-  if (norm === "hi" || norm === "hello" || norm === "hey") return true;
-  if (norm === "aloha" || norm === "aloha neta") return true;
-  return false;
-}
-
 function extractDigitSequences(text) {
   const s = String(text || "");
   const matches = s.match(/\d{7,12}/g);
@@ -325,10 +313,10 @@ const OPENAI_VOICE = process.env.OPENAI_VOICE || "alloy";
 
 const MB_DEBUG = envBool("MB_DEBUG", true);
 const MB_LOG_TRANSCRIPTS = envBool("MB_LOG_TRANSCRIPTS", true);
-const MB_MANUAL_TURNS = envBool("MB_MANUAL_TURNS", false);
 const MB_NO_BARGE_TAIL_MS = envNumber("MB_NO_BARGE_TAIL_MS", 1600);
 const MB_BARGE_IN_COOLDOWN_MS = envNumber("MB_BARGE_IN_COOLDOWN_MS", 500);
 const MB_ALLOW_BARGE_IN = envBool("MB_ALLOW_BARGE_IN", false);
+const MB_MANUAL_TURNS = envBool("MB_MANUAL_TURNS", false);
 const MB_HANGUP_AFTER_GOODBYE = envBool("MB_HANGUP_AFTER_GOODBYE", true);
 
 const MB_VAD_THRESHOLD = envNumber("MB_VAD_THRESHOLD", 0.65);
@@ -1125,13 +1113,19 @@ wss.on("connection", async (twilioWs, req) => {
   let botTurnActive = false;
   let noListenUntilTs = 0;
 
-  // Manual turn-taking (Stage 2: Silence / Turn Control)
+  // Manual-turn watchdog: we sometimes do not receive reliable response.completed.
+  // Track last bot audio delta, and force-clear active response if audio has gone quiet.
+  let lastBotAudioDeltaTs = 0;
+  let manualForceDrainTimer = null;
+
+  let activeResponseId = null;
+
+  // Manual Turn Control (Stage 2): keep server_vad but disable auto-response generation.
   const manualTurnsEnabled = MB_MANUAL_TURNS;
-  let manualArmed = false; // armed after the opening playback completes
-  let openingAudioDoneOnce = false;
-  let pendingManualTranscript = null; // queued user text when a response is still active
-  let lastManualKey = null;
-  let lastManualCreateAt = 0;
+  let manualArmed = false;           // armed only after opening finishes
+  let openingInProgress = false;     // true while opening response is active
+  let openingResponseId = null;      // response id of opening
+  let pendingManualTranscript = null; // last meaningful user transcript while a response is active
 
   let plannedEnd = false;
   let callStartTs = Date.now();
@@ -1244,9 +1238,11 @@ wss.on("connection", async (twilioWs, req) => {
           mode: mentionsCallerId ? "caller_id" : "captured_phone",
         });
 
-        try {
-          if (hasActiveResponse) openAiWs.send(JSON.stringify({ type: "response.cancel" }));
-        } catch (_) {}
+        if (hasActiveResponse) {
+          try {
+            openAiWs.send(JSON.stringify({ type: "response.cancel" }));
+          } catch (_) {}
+        }
 
         hasActiveResponse = false;
         botSpeaking = false;
@@ -1278,9 +1274,11 @@ wss.on("connection", async (twilioWs, req) => {
       logError(connId, "Model spoke a business phone number incorrectly; forcing correction.", m);
 
       // Attempt to cancel only if a response is currently active; otherwise ignore.
-      try {
-        if (hasActiveResponse) openAiWs.send(JSON.stringify({ type: "response.cancel" }));
-      } catch (_) {}
+      if (hasActiveResponse) {
+        try {
+          openAiWs.send(JSON.stringify({ type: "response.cancel" }));
+        } catch (_) {}
+      }
 
       hasActiveResponse = false;
       botSpeaking = false;
@@ -1326,57 +1324,6 @@ wss.on("connection", async (twilioWs, req) => {
     hasActiveResponse = true;
     botTurnActive = true;
     logDebug(connId, `response.create SPEAK purpose=${purpose || "no-tag"} text=${text}`);
-  }
-
-  function tryCreateManualResponse(userText, reasonTag) {
-    if (!manualTurnsEnabled) return false;
-    if (!manualArmed) return false;
-    if (!openAiReady || openAiWs.readyState !== WebSocket.OPEN) return false;
-    if (callEnded) return false;
-
-    const t = String(userText || "").trim();
-    if (!t) return false;
-
-    // Dedupe within a short window (prevents double responses from repeated transcript events).
-    const norm = normalizeTextLoose(t);
-    const key = `${norm}::${Math.floor(Date.now() / 700)}`;
-    if (lastManualKey === key) {
-      logDebug(connId, `MANUAL dedupe skip reason=${reasonTag || "n/a"} norm="${norm}"`);
-      return false;
-    }
-    lastManualKey = key;
-
-    if (hasActiveResponse) {
-      pendingManualTranscript = t;
-      logInfo(connId, "MANUAL queued (active response)", { reason: reasonTag || "queued", norm });
-      return false;
-    }
-
-    // Rate-limit: at most one manual create every 250ms.
-    const now = Date.now();
-    if (now - lastManualCreateAt < 250) {
-      pendingManualTranscript = t;
-      logInfo(connId, "MANUAL queued (rate limit)", { reason: reasonTag || "rate", norm });
-      return false;
-    }
-    lastManualCreateAt = now;
-
-    try {
-      openAiWs.send(
-        JSON.stringify({
-          type: "conversation.item.create",
-          item: { type: "message", role: "user", content: [{ type: "input_text", text: t }] },
-        })
-      );
-      openAiWs.send(JSON.stringify({ type: "response.create" }));
-      hasActiveResponse = true;
-      botTurnActive = true;
-      logInfo(connId, "MANUAL response.create", { reason: reasonTag || "user_turn", text: t });
-      return true;
-    } catch (err) {
-      logError(connId, "MANUAL response.create failed", err);
-      return false;
-    }
   }
 
   function detectGenderPreference(text) {
@@ -1425,6 +1372,7 @@ wss.on("connection", async (twilioWs, req) => {
     if (idleCheckInterval) clearInterval(idleCheckInterval);
     if (maxCallTimeout) clearTimeout(maxCallTimeout);
     if (maxCallWarningTimeout) clearTimeout(maxCallWarningTimeout);
+    if (manualForceDrainTimer) clearTimeout(manualForceDrainTimer);
 
     const { businessName, botName, closing } = buildSystemInstructionsFromSheets();
     const effectiveClosing = String(closingMessage || closing || "").trim();
@@ -1583,10 +1531,11 @@ wss.on("connection", async (twilioWs, req) => {
           input_audio_transcription: { model: "whisper-1" },
           turn_detection: {
             type: "server_vad",
+            create_response: !manualTurnsEnabled,
+            interrupt_response: MB_ALLOW_BARGE_IN,
             threshold: MB_VAD_THRESHOLD,
             silence_duration_ms: effectiveSilenceMs,
             prefix_padding_ms: MB_VAD_PREFIX_MS,
-            ...(manualTurnsEnabled ? { create_response: false } : {}),
           },
           max_response_output_tokens: "inf",
           instructions,
@@ -1595,6 +1544,13 @@ wss.on("connection", async (twilioWs, req) => {
     );
 
     flushSessionAddons();
+
+    if (manualTurnsEnabled) {
+      openingInProgress = true;
+      manualArmed = false;
+      openingResponseId = null;
+      pendingManualTranscript = null;
+    }
 
     sendModelPrompt(
       openAiWs,
@@ -1605,7 +1561,38 @@ wss.on("connection", async (twilioWs, req) => {
 
   let currentBotText = "";
 
-  openAiWs.on("message", (data) => {
+  
+  function manualShouldRespondToTranscript(t) {
+    if (!manualTurnsEnabled || !manualArmed) return false;
+    const cleaned = normalizeTextLoose(t || "");
+    if (!cleaned) return false;
+    // Use existing gates but allow common greetings.
+    const allowGreetings = /^(שלום|היי|הלו|אלו|אהלן|aloha|hello|hi)\b/i.test(cleaned);
+    if (!allowGreetings) {
+      if (isTranscriptGarbage(cleaned) || isLowValueUtterance(cleaned)) return false;
+    }
+    return true;
+  }
+
+  function triggerManualResponseCreate(reason) {
+    if (!manualTurnsEnabled || !manualArmed) return;
+    if (!openAiReady || !openAiWs || openAiWs.readyState !== WebSocket.OPEN) return;
+
+    // If a response is active (opening or ongoing), wait for response.completed.
+    if (hasActiveResponse) return;
+
+    try {
+      openAiWs.send(JSON.stringify({ type: "response.create" }));
+      hasActiveResponse = true;
+      botTurnActive = true;
+      botSpeaking = false;
+      noListenUntilTs = Date.now() + (MB_ALLOW_BARGE_IN ? MB_BARGE_IN_COOLDOWN_MS : MB_NO_BARGE_TAIL_MS);
+      logInfo(connId, `Manual response.create sent (${reason}).`);
+    } catch (e) {
+      logError(connId, "Failed to send manual response.create", e);
+    }
+  }
+openAiWs.on("message", (data) => {
     let msg;
     try {
       msg = JSON.parse(data.toString());
@@ -1615,13 +1602,28 @@ wss.on("connection", async (twilioWs, req) => {
     }
 
     switch (msg.type) {
-      case "response.created":
+      case "response.created": {
+        const rid = (msg && msg.response && msg.response.id) || msg.response_id || msg.id || null;
+        activeResponseId = rid;
         hasActiveResponse = true;
         botTurnActive = true;
         botSpeaking = false;
         noListenUntilTs = Date.now() + (MB_ALLOW_BARGE_IN ? MB_BARGE_IN_COOLDOWN_MS : MB_NO_BARGE_TAIL_MS);
         currentBotText = "";
+        if (manualTurnsEnabled && openingInProgress && !openingResponseId) {
+          openingResponseId = rid;
+        }
+        // Manual Turn Control: explicitly create a model response only after a meaningful transcript.
+        if (manualTurnsEnabled && manualArmed && manualShouldRespondToTranscript(t)) {
+          if (hasActiveResponse) {
+            pendingManualTranscript = t;
+          } else {
+            triggerManualResponseCreate("user_transcript");
+          }
+        }
+
         break;
+      }
 
       case "response.output_text.delta":
       case "response.audio_transcript.delta": {
@@ -1656,7 +1658,7 @@ wss.on("connection", async (twilioWs, req) => {
                 model_said: said,
               });
               try {
-                if (hasActiveResponse) openAiWs.send(JSON.stringify({ type: "response.cancel" }));
+                openAiWs.send(JSON.stringify({ type: "response.cancel" }));
               } catch (_) {}
               hasActiveResponse = false;
               botSpeaking = false;
@@ -1697,37 +1699,6 @@ wss.on("connection", async (twilioWs, req) => {
         botSpeaking = false;
         botTurnActive = false;
 
-        // Manual turns: in practice, some sessions do not emit a reliable
-        // `response.completed` event for every spoken response. If we keep
-        // `hasActiveResponse=true` until `response.completed`, we can end up
-        // permanently queuing user transcripts ("Neta is dead").
-        //
-        // For manual mode we therefore treat audio completion as the end of
-        // the response lifecycle and immediately allow the next manual turn.
-        if (manualTurnsEnabled) {
-          hasActiveResponse = false;
-
-          // If we queued a transcript while the bot was speaking/active, respond now.
-          if (manualArmed && pendingManualTranscript && !callEnded) {
-            const txt = pendingManualTranscript;
-            pendingManualTranscript = null;
-            tryCreateManualResponse(txt, "drain_after_audio_done");
-          }
-        }
-
-        // Arm manual turns after the first audio playback (opening) completes.
-        if (manualTurnsEnabled && !openingAudioDoneOnce) {
-          openingAudioDoneOnce = true;
-          manualArmed = true;
-          logInfo(connId, "Manual turns armed after opening.");
-          // If we queued a transcript during opening, respond immediately now.
-          if (pendingManualTranscript && !callEnded && openAiReady) {
-            const txt = pendingManualTranscript;
-            pendingManualTranscript = null;
-            tryCreateManualResponse(txt, "drain_after_opening");
-          }
-        }
-
         // Always apply a small post-TTS cooldown to avoid echo / background noise false turns.
         noListenUntilTs = Date.now() + (MB_ALLOW_BARGE_IN ? MB_BARGE_IN_COOLDOWN_MS : MB_NO_BARGE_TAIL_MS);
 
@@ -1735,35 +1706,88 @@ wss.on("connection", async (twilioWs, req) => {
           plannedEnd = true;
           scheduleForceEndAfterGrace("goodbye", goodbyePendingText);
         }
+
+        // Manual turns: treat audio completion as response lifecycle completion.
+        // This prevents "stuck active response" which causes all user transcripts to be queued forever.
+        if (manualTurnsEnabled) {
+          activeResponseId = null;
+          hasActiveResponse = false;
+
+          // If opening was in progress, arm manual now (audio finished playing).
+          if (openingInProgress) {
+            openingInProgress = false;
+            manualArmed = true;
+            logInfo(connId, "Manual turns armed after opening (audio.done).");
+          }
+
+          // If we have a pending transcript captured while bot was speaking/active, respond now.
+          if (manualArmed && pendingManualTranscript && !callEnded) {
+            const pt = pendingManualTranscript;
+            pendingManualTranscript = null;
+            triggerManualResponseCreate("pending_after_audio_done");
+          }
+        }
+
+        // Manual watchdog: if we queued something but never see a completion event,
+        // force a drain shortly after audio quiets down.
+        if (manualTurnsEnabled && manualArmed && pendingManualTranscript && !manualForceDrainTimer && !callEnded) {
+          manualForceDrainTimer = setTimeout(() => {
+            manualForceDrainTimer = null;
+            if (callEnded) return;
+            const quietFor = lastBotAudioDeltaTs ? (Date.now() - lastBotAudioDeltaTs) : 9999;
+            if (hasActiveResponse && quietFor < 400) return; // still speaking
+            activeResponseId = null;
+            hasActiveResponse = false;
+            if (pendingManualTranscript) {
+              const pt2 = pendingManualTranscript;
+              pendingManualTranscript = null;
+              triggerManualResponseCreate("force_drain_watchdog");
+            }
+          }, 650);
+        }
+
         break;
 
-      case "response.completed":
+      case "response.completed": {
+        const rid = (msg && msg.response && msg.response.id) || msg.response_id || msg.id || null;
+
+        activeResponseId = null;
         hasActiveResponse = false;
         botSpeaking = false;
         botTurnActive = false;
 
-        // Drain queued user transcript in manual mode.
-        if (manualTurnsEnabled && manualArmed && pendingManualTranscript && !callEnded) {
-          const txt = pendingManualTranscript;
+        if (manualTurnsEnabled && openingInProgress && openingResponseId && rid && rid === openingResponseId) {
+          openingInProgress = false;
+          manualArmed = true;
+          logInfo(connId, "Manual turns armed after opening.");
+          if (pendingManualTranscript) {
+            // Consume pending transcript captured during opening.
+            pendingManualTranscript = null;
+            triggerManualResponseCreate("pending_after_opening");
+          }
+        } else if (manualTurnsEnabled && manualArmed && pendingManualTranscript) {
           pendingManualTranscript = null;
-          tryCreateManualResponse(txt, "drain_after_completed");
+          triggerManualResponseCreate("pending_after_completed");
         }
+
         break;
+      }
 
       case "conversation.item.input_audio_transcription.completed": {
+        const shouldLogTranscript = MB_LOG_TRANSCRIPTS;
+
         const raw = String(msg.transcript || "").trim();
-        if (!raw) break;
-
         const hasRealUserYet = conversationLog.some((m) => m.from === "user" && (m.text || "").trim().length >= 4);
-        const isGreeting = isGreetingUtteranceLoose(raw);
-        const isGarbage = isTranscriptGarbage(raw, hasRealUserYet);
-        const isLowValue = isLowValueUtterance(raw);
 
-        // Gate: ignore garbage/low-value unless it's an allowed greeting ("שלום נטע" etc.).
-        if ((isGarbage || isLowValue) && !isGreeting) {
-          if (MB_LOG_TRANSCRIPTS) {
-            logDebug(connId, `Filtered transcript (garbage/low): "${raw}"`);
-          }
+        if (!raw) break;
+        if (isTranscriptGarbage(raw, hasRealUserYet)) {
+          logDebug(connId, `Filtered garbage transcript: "${raw}"`);
+          break;
+        }
+
+        // Additional gate: ignore low-signal utterances (breath/noise/fillers) so the bot does not respond "on its own".
+        if (isLowValueUtterance(raw)) {
+          logDebug(connId, `Filtered low-value utterance: "${raw}"`);
           break;
         }
 
@@ -1771,7 +1795,7 @@ wss.on("connection", async (twilioWs, req) => {
         if (!t) break;
 
         conversationLog.push({ from: "user", text: t });
-        if (MB_LOG_TRANSCRIPTS) logAlways(`[CALLER][${connId}] ${t}`);
+        logAlways(`[CALLER][${connId}] ${t}`);
 
         const gPref = detectGenderPreference(t);
         if (gPref && gPref !== preferredGender) {
@@ -1794,16 +1818,6 @@ wss.on("connection", async (twilioWs, req) => {
             const d = digitsOnly(capturedPhoneIL);
             if (d && d.length >= 7 && d.length <= 12) allowedPhonesDigits.add(d);
           } catch (_) {}
-        }
-
-        // Manual turns: explicitly create a response for each valid transcript (or queue if busy).
-        if (manualTurnsEnabled) {
-          if (!manualArmed) {
-            pendingManualTranscript = t;
-            logInfo(connId, "MANUAL queued (not armed yet)", { norm: normalizeTextLoose(t) });
-          } else {
-            tryCreateManualResponse(t, isGreeting ? "greeting" : "transcript");
-          }
         }
 
         break;
@@ -1963,17 +1977,5 @@ wss.on("connection", async (twilioWs, req) => {
 server.listen(PORT, () => {
   console.log(`==> Your service is live`);
   console.log(`==> Available at your primary URL ${process.env.RENDER_EXTERNAL_URL || ""}`);
-  console.log(`[INFO] [Startup] Runtime flags`, {
-    MB_MANUAL_TURNS,
-    MB_ALLOW_BARGE_IN,
-    MB_NO_BARGE_TAIL_MS,
-    MB_BARGE_IN_COOLDOWN_MS,
-    MB_VAD_THRESHOLD,
-    MB_VAD_PREFIX_MS,
-    MB_VAD_SILENCE_MS,
-    MB_VAD_SUFFIX_MS,
-    MB_IDLE_WARNING_MS,
-    MB_IDLE_HANGUP_MS,
-  });
   loadSheetsCache("Startup").catch((err) => console.error("[ERROR] Startup sheets load failed", err));
 });
