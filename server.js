@@ -1136,6 +1136,8 @@ wss.on("connection", async (twilioWs, req) => {
   let openingResponsePending = false;
   let manualTurnsArmed = false;
 
+  let pendingManualResponse = false;
+
   let preferredGender = null;
   let genderInstructionSent = false;
   let baseInstructions = null;
@@ -1655,12 +1657,28 @@ wss.on("connection", async (twilioWs, req) => {
         hasActiveResponse = false;
         botSpeaking = false;
         botTurnActive = false;
+
+        // Manual turn backstop: if user spoke while a response was still completing (hasActiveResponse=true),
+        // we queue a response.create and dispatch it as soon as the previous response fully completes.
+        if (manualTurnsEnabled && manualTurnsArmed && pendingManualResponse && openAiReady && openAiWs.readyState === WebSocket.OPEN) {
+          try {
+            openAiWs.send(JSON.stringify({ type: "response.create" }));
+            hasActiveResponse = true;
+            botTurnActive = true;
+            pendingManualResponse = false;
+            logDebug(connId, "response.create (manual backstop after response.completed)");
+          } catch (err) {
+            hasActiveResponse = false;
+            botTurnActive = false;
+            logError(connId, "response.create failed (manual backstop)", err);
+          }
+        }
+
         break;
 
       case "conversation.item.input_audio_transcription.completed": {
-        if (!MB_LOG_TRANSCRIPTS) break;
-
         const raw = String(msg.transcript || "").trim();
+        const shouldLogTranscripts = !!MB_LOG_TRANSCRIPTS;
         const hasRealUserYet = conversationLog.some((m) => m.from === "user" && (m.text || "").trim().length >= 4);
 
         if (!raw) break;
@@ -1679,23 +1697,24 @@ wss.on("connection", async (twilioWs, req) => {
         if (!t) break;
 
         conversationLog.push({ from: "user", text: t });
-        logAlways(`[CALLER][${connId}] ${t}`);
+        if (shouldLogTranscripts) logAlways(`[CALLER][${connId}] ${t}`);
 
         if (manualTurnsEnabled && manualTurnsArmed) {
-          // In manual mode, the Realtime server_vad will still commit and transcribe user audio,
-          // but it will NOT auto-generate an assistant response. We explicitly create one here.
-          if (openAiReady && openAiWs.readyState === WebSocket.OPEN) {
-            if (!hasActiveResponse && !botSpeaking && !botTurnActive) {
-              try {
-                openAiWs.send(JSON.stringify({ type: "response.create" }));
-                hasActiveResponse = true;
-                botTurnActive = true;
-                logDebug(connId, "response.create (manual turn accepted)");
-              } catch (err) {
-                hasActiveResponse = false;
-                botTurnActive = false;
-                logError(connId, "response.create failed", err);
-              }
+          // Queue a manual response when we receive a meaningful transcript.
+          pendingManualResponse = true;
+
+          // Create immediately only when the model is fully idle (no active response lifecycle).
+          if (openAiReady && openAiWs.readyState === WebSocket.OPEN && !botSpeaking && !botTurnActive && !hasActiveResponse) {
+            try {
+              openAiWs.send(JSON.stringify({ type: "response.create" }));
+              hasActiveResponse = true;
+              botTurnActive = true;
+              pendingManualResponse = false;
+              logDebug(connId, "response.create (manual immediate)");
+            } catch (err) {
+              hasActiveResponse = false;
+              botTurnActive = false;
+              logError(connId, "response.create failed (manual immediate)", err);
             }
           }
         }
