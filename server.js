@@ -1171,6 +1171,15 @@ wss.on("connection", async (twilioWs, req) => {
   let phoneConfirmAskedAt = 0;
   let closingAfterPhoneConfirm = false;
 
+  // Confirmed callback phone (set ONLY after explicit user confirmation).
+  // We never treat caller-id or parsed lead as confirmed unless the user approved it.
+  let confirmedPhoneIL = null;
+  let confirmedPhoneSource = null; // 'spoken' | 'caller_id'
+
+  // If the bot says a goodbye/closing before we have a confirmed phone, we must
+  // keep the call open and force a phone capture turn after the response completes.
+  let pendingPhoneCaptureAfterGoodbye = null; // { kind: 'confirm_caller_id' | 'ask_phone' }
+
   let preferredGender = null;
   let genderInstructionSent = false;
   let baseInstructions = null;
@@ -1366,7 +1375,7 @@ wss.on("connection", async (twilioWs, req) => {
     return t === "לא" || t.includes("לא נכון") || t.includes("לא זה") || t.includes("טעית") || t.includes("שגוי");
   }
 
-  function forcePhoneConfirmation(phoneIL) {
+  function forcePhoneConfirmation(phoneIL, source) {
     const d = digitsOnly(phoneIL);
     if (!d || d.length < 9 || d.length > 10) return;
     const spoken = formatDigitsForHebrewSpeech(d);
@@ -1374,6 +1383,9 @@ wss.on("connection", async (twilioWs, req) => {
     phoneConfirmPending = true;
     phoneConfirmNumberIL = d;
     phoneConfirmAskedAt = Date.now();
+
+    // Remember what we are confirming so we can treat it as confirmed only on explicit approval.
+    confirmedPhoneSource = source || confirmedPhoneSource || 'spoken';
 
     // cancel any in-flight model response to avoid overlaps
     try {
@@ -1476,10 +1488,10 @@ wss.on("connection", async (twilioWs, req) => {
 
     const callerILLocal = toIsraeliLocalFromAny(callerRaw) || null;
 
+    // IMPORTANT: callback phone is considered valid ONLY if explicitly confirmed by the caller.
+    // We never auto-fallback to caller-id for FINAL lead delivery without confirmation.
     const coercedPhone =
-      normalizePhoneNumber(parsedLead?.phone_number, callerRaw) ||
-      normalizePhoneNumber(capturedPhoneIL, callerRaw) ||
-      normalizePhoneNumber(callerILLocal, callerRaw) ||
+      normalizePhoneNumber(confirmedPhoneIL, null) ||
       null;
 
     if (parsedLead && typeof parsedLead === "object") {
@@ -1499,7 +1511,7 @@ wss.on("connection", async (twilioWs, req) => {
       }
     }
 
-    const isFullLead = !!(parsedLead && parsedLead.is_lead === true && coercedPhone);
+    const isFullLead = !!(parsedLead && parsedLead.is_lead === true && coercedPhone && confirmedPhoneIL);
     const call_status = mapCallStatus(reason, plannedEnd);
 
     if (recordingSid && !recordingUrl) {
@@ -1758,9 +1770,18 @@ wss.on("connection", async (twilioWs, req) => {
           }
 
           // 3) If the bot said a goodbye, hang up after audio finishes
+          // BUT: Never hang up (and never treat the call as complete) unless we have a CONFIRMED callback phone.
           if (!goodbyePendingHangup && MB_HANGUP_AFTER_GOODBYE && isGoodbyeUtterance(text)) {
-            goodbyePendingHangup = true;
-            goodbyePendingText = text;
+            if (confirmedPhoneIL) {
+              goodbyePendingHangup = true;
+              goodbyePendingText = text;
+            } else if (!phoneConfirmPending) {
+              // We already let the goodbye be spoken; keep the line open and immediately collect a confirmed phone.
+              pendingPhoneCaptureAfterGoodbye = callerIL ? { kind: 'confirm_caller_id' } : { kind: 'ask_phone' };
+              logInfo(connId, "[GUARD] Goodbye/closing detected but no confirmed phone; forcing phone capture.", {
+                hasCallerId: !!callerIL,
+              });
+            }
           }
         }
         currentBotText = "";
@@ -1835,6 +1856,21 @@ wss.on("connection", async (twilioWs, req) => {
         botTurnActive = false;
         activeResponseId = null;
         activeResponseDecisionPending = false;
+
+        if (pendingPhoneCaptureAfterGoodbye && !callEnded && !phoneConfirmPending && !confirmedPhoneIL) {
+          const kind = pendingPhoneCaptureAfterGoodbye.kind;
+          pendingPhoneCaptureAfterGoodbye = null;
+
+          if (kind === 'confirm_caller_id' && callerIL) {
+            const spoken = formatDigitsForHebrewSpeech(callerIL);
+            // Confirming caller-id must be explicit, digit-by-digit.
+            forcePhoneConfirmation(callerIL, 'caller_id');
+            logInfo(connId, "[GUARD] Forced caller-id confirmation after premature closing.");
+          } else {
+            sendModelPrompt(openAiWs, `לפני שנסיים, מה מספר הטלפון לחזרה?`, "phone_required_before_close");
+            logInfo(connId, "[GUARD] Asked for callback phone after premature closing.");
+          }
+        }
         break;
 
       case "conversation.item.input_audio_transcription.completed": {
@@ -1878,6 +1914,10 @@ wss.on("connection", async (twilioWs, req) => {
             phoneConfirmPending = false;
             capturedPhoneIL = phoneConfirmNumberIL;
 
+            confirmedPhoneIL = phoneConfirmNumberIL;
+            // If we confirmed the caller-id, mark source accordingly
+            if (!confirmedPhoneSource) confirmedPhoneSource = 'spoken';
+
             const { closing } = buildSystemInstructionsFromSheets();
             closingAfterPhoneConfirm = true;
             sendModelPrompt(openAiWs, String(closing || "תודה שפניתם. יום טוב."), "closing_after_phone_confirm");
@@ -1885,6 +1925,9 @@ wss.on("connection", async (twilioWs, req) => {
             phoneConfirmPending = false;
             phoneConfirmNumberIL = null;
             capturedPhoneIL = null;
+
+            confirmedPhoneIL = null;
+            confirmedPhoneSource = null;
             sendModelPrompt(openAiWs, `אין בעיה. מה מספר הטלפון הנכון לחזרה?`, "phone_confirm_retry");
           }
           // Either way, don't try to capture a new number from the same short confirm/reject utterance.
@@ -1909,7 +1952,7 @@ wss.on("connection", async (twilioWs, req) => {
           capturedPhoneIL = phoneFromSpeech;
           logDebug(connId, `Captured phone from speech: ${capturedPhoneIL}`);
           // Force confirmation immediately (code-enforced) so we always read back digit-by-digit.
-          forcePhoneConfirmation(capturedPhoneIL);
+          forcePhoneConfirmation(capturedPhoneIL, 'spoken');
           try {
             const d = digitsOnly(capturedPhoneIL);
             if (d && d.length >= 7 && d.length <= 12) allowedPhonesDigits.add(d);
@@ -1918,7 +1961,7 @@ wss.on("connection", async (twilioWs, req) => {
           // Force a confirmation turn immediately after a phone was spoken.
           // This prevents "silent hangup" moments and ensures we never send a lead with an unconfirmed phone.
           if (!phoneConfirmPending) {
-            forcePhoneConfirmation(capturedPhoneIL);
+            forcePhoneConfirmation(capturedPhoneIL, 'spoken');
           }
         }
 
