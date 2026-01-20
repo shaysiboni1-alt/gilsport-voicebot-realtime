@@ -1299,9 +1299,105 @@ wss.on("connection", async (twilioWs, req) => {
 
   let conversationLog = [];
 
+  // -----------------------------
+  // Deterministic lead gating (NAME + PHONE are mandatory)
+  // -----------------------------
+  let leadFullName = null;
+  let leadPhoneIL = null;
+  let leadPhoneConfirmed = false;
+  let leadWaiting = null; // 'name' | 'phone' | 'phone_confirm' | null
+  let leadPhoneConfirmKind = null; // 'caller_id' | 'captured'
+  let leadPhoneConfirmUntilTs = 0;
+  let pendingUserTurns = []; // stored when we must interrupt for lead gating
+  let pendingCouponAsked = false;
+  let pendingPriceClaimAsked = false;
+
+  function askedCouponByText(userText) {
+    const n = normalizeTextLoose(userText);
+    return (
+      n.includes(normalizeTextLoose('קופון')) ||
+      n.includes(normalizeTextLoose('קוד קופון')) ||
+      (n.includes(normalizeTextLoose('קוד')) && n.includes(normalizeTextLoose('הנחה')))
+    );
+  }
+
+  function askedPriceClaimByText(userText) {
+    const n = normalizeTextLoose(userText);
+    if (!n) return false;
+    // caller mentions price/cheaper/comparison
+    return (
+      n.includes(normalizeTextLoose('מחיר')) ||
+      n.includes(normalizeTextLoose('יותר זול')) ||
+      n.includes(normalizeTextLoose('השווא')) ||
+      n.includes(normalizeTextLoose('יקר')) ||
+      n.includes(normalizeTextLoose('זול'))
+    );
+  }
+
+  function isPlausibleHebrewFullName(t) {
+    const s = safeStr(t);
+    if (!s) return false;
+    const hasHeb = /[\u0590-\u05FF]/.test(s);
+    if (!hasHeb) return false;
+    // avoid accepting sentence-like requests as a name
+    if (s.length > 60) return false;
+    const n = normalizeTextLoose(s);
+    if (!n) return false;
+    // if it clearly contains 'קופון/מחיר/משלוח/תקלה' it's not a name
+    const bad = ['קופון','מחיר','משלוח','אספק','תקלה','שירות','מכירה','נציג','הודעה','רציתי','אפשר','שלום'];
+    if (bad.some((w)=> n.includes(normalizeTextLoose(w)))) return false;
+    const parts = s.split(/\s+/).filter(Boolean);
+    return parts.length >= 2 || s.length >= 4;
+  }
+
+  function cancelActiveResponseQuietly() {
+    if (!hasActiveResponse) return;
+    try { openAiWs.send(JSON.stringify({ type: 'response.cancel' })); } catch (_) {}
+    hasActiveResponse = false;
+    botSpeaking = false;
+    botTurnActive = false;
+  }
+
+  function promptForName() {
+    leadWaiting = 'name';
+    cancelActiveResponseQuietly();
+    sendModelPrompt(openAiWs, 'כדי שאוכל לעזור ולתעד פנייה מסודרת, מה השם המלא שלכם?', 'lead_require_name');
+  }
+
+  function promptForPhone() {
+    // Prefer caller-id confirmation if available, otherwise ask for a callback number.
+    if (callerIL) {
+      const last4 = formatLast4ForHebrewSpeech(callerIL);
+      leadWaiting = 'phone_confirm';
+      leadPhoneConfirmKind = 'caller_id';
+      leadPhoneConfirmUntilTs = Date.now() + 25000;
+      cancelActiveResponseQuietly();
+      sendModelPrompt(openAiWs, `כדי שנוכל לחזור אליכם, האם נוח לחזור למספר המזוהה שמסתיים ב-${last4}? זה נכון?`, 'lead_require_phone_confirm_caller');
+      return;
+    }
+
+    leadWaiting = 'phone';
+    leadPhoneConfirmKind = 'captured';
+    cancelActiveResponseQuietly();
+    sendModelPrompt(openAiWs, 'כדי שנוכל לחזור אליכם, מה מספר הטלפון לחזרה? נא לומר את המספר בצורה ברורה, ואם צריך—ספרה-ספרה.', 'lead_require_phone');
+  }
+
+  function leadIsComplete() {
+    return safeStr(leadFullName).length >= 2 && leadPhoneConfirmed === true && !!normalizePhoneNumber(leadPhoneIL, callerRaw);
+  }
+
   // One-shot deterministic coupon response per call
   // (prevents repeated coupon handling and avoids hallucinated coupon codes)
   let couponAnsweredThisCall = false;
+
+  function userAskedCouponRecently() {
+    // Check last few user turns for an explicit coupon/discount request
+    const lastUsers = conversationLog.filter((m) => m && m.from === 'user').slice(-4);
+    const joined = lastUsers.map((m) => String(m.text || '')).join(' ');
+    const n = normalizeTextLoose(joined);
+    if (!n) return false;
+    return n.includes(normalizeTextLoose('קופון')) || n.includes(normalizeTextLoose('קוד קופון')) || (n.includes(normalizeTextLoose('קוד')) && n.includes(normalizeTextLoose('הנחה'))) || n.includes(normalizeTextLoose('הנחה'));
+  }
 
 
   // Allowed business phone numbers (delivery/importers/main + caller-id). Used to prevent / correct hallucinated digits.
@@ -1764,6 +1860,29 @@ wss.on("connection", async (twilioWs, req) => {
           conversationLog.push({ from: "bot", text });
           logAlways(`[BOT][${connId}] ${text}`);
 
+          // Coupon mention guardrail: if the bot starts talking about coupons without an explicit request,
+          // cancel and force it back on track (prevents inventions like "גיל 20" or random codes).
+          try {
+            const nt = normalizeTextLoose(text);
+            const botMentionsCoupon = nt.includes(normalizeTextLoose('קופון')) || nt.includes(normalizeTextLoose('קוד')) && nt.includes(normalizeTextLoose('הנחה'));
+            if (botMentionsCoupon && !userAskedCouponRecently()) {
+              logError(connId, 'Model mentioned coupon without explicit user request; blocking.', { text: text.slice(0, 160) });
+              if (hasActiveResponse) {
+                try { openAiWs.send(JSON.stringify({ type: 'response.cancel' })); } catch (_) {}
+              }
+              hasActiveResponse = false;
+              botSpeaking = false;
+              botTurnActive = false;
+              sendModelPrompt(
+                openAiWs,
+                'תיקון חובה: אל תזכירו קופונים/הנחות אם הלקוח לא ביקש זאת במפורש. המשיכו לשאלה/טיפול האחרון של הלקוח בעברית בלבד, בקצרה.',
+                'coupon_hallucination_block'
+              );
+              currentBotText = '';
+              break;
+            }
+          } catch (_) {}
+
           // 1) Correct hallucinated business numbers (importer/delivery/main/caller-id) before anything else
           if (maybeCorrectHallucinatedPhone(text)) {
             currentBotText = "";
@@ -1935,6 +2054,110 @@ wss.on("connection", async (twilioWs, req) => {
 
         conversationLog.push({ from: "user", text: t });
         logAlways(`[CALLER][${connId}] ${t}`);
+
+        // -----------------------------
+        // LEAD GATE: NAME + PHONE mandatory (all flows)
+        // -----------------------------
+        // If we still miss mandatory lead fields, we intercept the turn deterministically,
+        // store the user's intent, and only then continue to business handling.
+        try {
+          const userNorm = normalizeTextLoose(t);
+          const asksCouponNow = userNorm.includes(normalizeTextLoose('קופון')) || userNorm.includes(normalizeTextLoose('קוד קופון')) || (userNorm.includes(normalizeTextLoose('קוד')) && userNorm.includes(normalizeTextLoose('הנחה')));
+          const priceNow = userNorm.includes(normalizeTextLoose('מחיר')) || userNorm.includes(normalizeTextLoose('יותר זול')) || userNorm.includes(normalizeTextLoose('השווא'));
+
+          // 1) If we are mid-collection, handle it first.
+          if (leadWaiting === 'name') {
+            // Accept Hebrew 2+ words as a name; otherwise reprompt.
+            const hasHeb = /[֐-׿]/.test(t);
+            const words = t.split(/\s+/).filter(Boolean);
+            if (hasHeb && (words.length >= 2 || t.length >= 4)) {
+              leadFullName = t;
+              leadWaiting = 'none';
+              // Immediately continue to phone step.
+              promptForPhone();
+            } else {
+              promptForName();
+            }
+            break;
+          }
+
+          if (leadWaiting === 'phone') {
+            const candidate = extractBestPhoneFromText(t);
+            if (candidate) {
+              leadPhoneIL = candidate;
+              leadWaiting = 'phone_confirm';
+              leadPhoneConfirmKind = 'captured';
+              leadPhoneConfirmUntilTs = Date.now() + 25000;
+              const last4 = formatLast4ForHebrewSpeech(candidate);
+              cancelActiveResponseQuietly();
+              sendModelPrompt(openAiWs, `רק לוודא—מספר הטלפון לחזרה מסתיים ב-${last4}. זה נכון?`, 'lead_phone_confirm_captured');
+            } else {
+              promptForPhone();
+            }
+            break;
+          }
+
+          if (leadWaiting === 'phone_confirm') {
+            const isYes = (userNorm === 'כן' || userNorm === 'נכון' || userNorm === 'כן כן' || userNorm === 'בטח' || userNorm === 'ברור');
+            const isNo = (userNorm === 'לא' || userNorm === 'לא נכון' || userNorm === 'ממש לא');
+
+            if (isYes) {
+              leadPhoneConfirmed = true;
+              leadWaiting = 'none';
+
+              // If caller-id was confirmed, store it as the callback phone.
+              if (leadPhoneConfirmKind === 'caller_id' && callerIL) {
+                leadPhoneIL = callerIL;
+              }
+
+              // If we had a pending request, resume it deterministically.
+              if (pendingUserTurns.length > 0) {
+                const pending = pendingUserTurns.shift();
+                // deterministic coupon if it was asked
+                if (pending?.asksCoupon && !couponAnsweredThisCall) {
+                  const coupon = String(getSetting('SALES_COUPON_CODE', '') || '').trim();
+                  const fallback = String(getSetting('NO_DATA_MESSAGE', '') || '').trim();
+                  const msgCoupon = coupon || fallback || 'אין לי מידע על זה כרגע, אוכל לפתוח פנייה ונציג יחזור אליכם.';
+                  const spoken = formatCouponForSpeech(msgCoupon);
+                  couponAnsweredThisCall = true;
+                  cancelActiveResponseQuietly();
+                  sendModelPrompt(openAiWs, `עני בדיוק במשפט אחד: "${spoken}". אחר כך שאלי שאלה אחת בלבד: "תרצו שאפתח פנייה למחלקת המכירות?"`, 'coupon_after_lead');
+                } else {
+                  // Let the model answer the original user request now.
+                  cancelActiveResponseQuietly();
+                  sendModelPrompt(openAiWs, `הלקוח אמר: "${pending.text}". ענו בהתאם להנחיות ולמידע מה-Sheets.`, 'resume_after_lead');
+                }
+              }
+
+              break;
+            }
+
+            if (isNo) {
+              leadPhoneConfirmed = false;
+              leadPhoneIL = null;
+              leadWaiting = 'phone';
+              cancelActiveResponseQuietly();
+              sendModelPrompt(openAiWs, 'בסדר. מה מספר הטלפון הנכון לחזרה? נא לומר את המספר בצורה ברורה, ואם צריך—ספרה-ספרה.', 'lead_phone_retry');
+              break;
+            }
+
+            // If unclear, re-ask.
+            cancelActiveResponseQuietly();
+            sendModelPrompt(openAiWs, 'רק לוודא—זה נכון? אפשר לענות כן או לא.', 'lead_phone_confirm_repeat');
+            break;
+          }
+
+          // 2) Not in a collection step; if lead is incomplete, start gating and store intent.
+          if (!leadIsComplete()) {
+            pendingUserTurns.push({ text: t, asksCoupon: asksCouponNow, priceClaim: priceNow, at: Date.now() });
+            if (!safeStr(leadFullName)) {
+              promptForName();
+            } else {
+              promptForPhone();
+            }
+            break;
+          }
+        } catch (_) {}
 
 
         // deterministic_coupon_logic
