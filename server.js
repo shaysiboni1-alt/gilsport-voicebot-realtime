@@ -94,6 +94,21 @@ function formatDigitsForHebrewSpeech(d) {
   return s ? s.split("").join(" ") : "";
 }
 
+// Return last 4 digits (keeps full number for storage, but speaks only last4 for privacy).
+function last4Digits(d) {
+  const s = digitsOnly(d);
+  if (!s) return "";
+  return s.length <= 4 ? s : s.slice(-4);
+}
+
+// Speech-friendly formatting for last4 validation: digit-by-digit with spaces.
+// Example: 0503222237 -> "2 2 3 7"
+function formatLast4ForHebrewSpeech(d) {
+  const s = last4Digits(d);
+  return s ? s.split("").join(" ") : "";
+}
+
+
 // Extract a digit string from Hebrew digit-words in model output.
 // Supports common variants and strips niqqud/punctuation.
 function extractHebrewSpokenDigits(text) {
@@ -1332,14 +1347,17 @@ wss.on("connection", async (twilioWs, req) => {
 
     const strictExpected = mentionsCallerId ? expectedCaller : (mentionsCallback ? expectedCaptured : null);
     if (strictExpected) {
-      const strictSpoken = extractHebrewSpokenDigits(botText) || digitsOnly(botText);
-      if (!strictSpoken || strictSpoken.length < 7 || strictSpoken.length > 12 || strictSpoken !== strictExpected) {
+      const spokenDigits = extractHebrewSpokenDigits(botText) || digitsOnly(botText);
+      const expectedLast4 = last4Digits(strictExpected);
+      const spokenLast4 = last4Digits(spokenDigits);
+      // In validation turns we only speak last4; force correction if last4 mismatches or missing.
+      if (!spokenLast4 || spokenLast4.length !== 4 || spokenLast4 !== expectedLast4) {
         phoneHallucinationCorrectionSent = true;
-        const expectedSpoken = formatDigitsForHebrewSpeech(strictExpected);
+        const expectedSpoken = formatLast4ForHebrewSpeech(strictExpected);
 
         logError(connId, "Model spoke a validated phone number incorrectly; forcing correction.", {
-          said: strictSpoken || null,
-          expected: strictExpected,
+          said: spokenLast4 || null,
+          expected: expectedLast4,
           mode: mentionsCallerId ? "caller_id" : "captured_phone",
         });
 
@@ -1355,7 +1373,7 @@ wss.on("connection", async (twilioWs, req) => {
 
         sendModelPrompt(
           openAiWs,
-          `תיקון חובה: המספר הנכון הוא "${expectedSpoken}". הקריאו אותו בדיוק ספרה-ספרה (מילות ספרות בעברית עם פסיקים) ושאלו שאלה אחת בלבד לאישור: "זה נכון?"`,
+          `תיקון חובה: 4 הספרות האחרונות הנכונות הן "${expectedSpoken}". הקריאו אותן בדיוק ספרה-ספרה ושאלו שאלה אחת בלבד לאישור: "זה נכון?"`,
           "validated_phone_correction"
         );
 
@@ -1374,7 +1392,7 @@ wss.on("connection", async (twilioWs, req) => {
       if (!m) continue;
 
       phoneHallucinationCorrectionSent = true;
-      const expectedSpoken = formatDigitsForHebrewSpeech(m.expected);
+      const expectedSpoken = formatLast4ForHebrewSpeech(m.expected);
 
       logError(connId, "Model spoke a business phone number incorrectly; forcing correction.", m);
 
@@ -1391,7 +1409,7 @@ wss.on("connection", async (twilioWs, req) => {
 
       sendModelPrompt(
         openAiWs,
-        `תיקון חובה: המספר הנכון הוא "${expectedSpoken}". הקריאו אותו בדיוק ספרה-ספרה (מילות ספרות בעברית עם פסיקים) ושאלו: "זה נכון?" בלי תוספות.`,
+        `תיקון חובה: 4 הספרות האחרונות הנכונות הן "${expectedSpoken}". הקריאו אותן בדיוק ספרה-ספרה ושאלו: "זה נכון?" בלי תוספות.`,
         "business_phone_correction"
       );
 
@@ -1707,12 +1725,14 @@ wss.on("connection", async (twilioWs, req) => {
 
           // 2) Correct repeated-captured phone if model said different digits
           if (!phoneCorrectionSent && capturedPhoneIL) {
-            const seqs = extractDigitSequences(text);
-            const said = seqs.length ? digitsOnly(seqs[0]) : digitsOnly(text);
+            const saidDigits = extractHebrewSpokenDigits(text) || digitsOnly(text);
             const cap = digitsOnly(capturedPhoneIL);
-            if (said && said.length >= 7 && cap && said !== cap) {
+            const saidLast4 = last4Digits(saidDigits);
+            const capLast4 = last4Digits(cap);
+            // We only speak last4 for privacy; correct if last4 mismatches.
+            if (saidLast4 && saidLast4.length === 4 && capLast4 && saidLast4 !== capLast4) {
               phoneCorrectionSent = true;
-              const capSpoken = formatDigitsForHebrewSpeech(cap);
+              const capSpoken = formatLast4ForHebrewSpeech(cap);
               logError(connId, "Model repeated wrong phone digits; forcing correction.", {
                 captured: cap,
                 model_said: said,
@@ -1725,7 +1745,7 @@ wss.on("connection", async (twilioWs, req) => {
               botTurnActive = false;
               sendModelPrompt(
                 openAiWs,
-                `תיקון חובה: המספר שנקלט הוא "${capSpoken}". הקריאו אותו בדיוק ספרה-ספרה (מילות ספרות בעברית עם פסיקים) ושאלו: "זה נכון?" בלי להוסיף או להשמיט ספרות.`,
+                `תיקון חובה: 4 הספרות האחרונות שנקלטו הן "${capSpoken}". הקריאו אותן בדיוק ספרה-ספרה ושאלו: "זה נכון?" בלי להוסיף או להשמיט ספרות.`,
                 "phone_correction"
               );
             }
@@ -1886,9 +1906,9 @@ wss.on("connection", async (twilioWs, req) => {
       if (callerIL) {
         allowedPhonesDigits.add(digitsOnly(callerIL));
 
-        const callerSpoken = formatDigitsForHebrewSpeech(callerIL);
+        const callerSpoken = formatLast4ForHebrewSpeech(callerIL);
         queueSessionAddon(
-          `מספר הטלפון המזוהה של המתקשר הוא (להקראה מדויקת): "${callerSpoken}". כשאת שואלת האם לחזור למספר המזוהה—חובה להקריא את המספר במלואו ספרה-ספרה בדיוק בפורמט הזה (מילות ספרות בעברית עם פסיקים). לעולם אל תגידי שאינך רואה/יודעת את המספר, ולעולם אל תחסירי/תוסיפי ספרה.`,
+          `מספר הטלפון המזוהה של המתקשר (לשמירה פנימית) מסתיים ב-4 ספרות אחרונות: "${callerSpoken}". כשאת שואלת האם לחזור למספר המזוהה—חובה להקריא ללקוח אך ורק את 4 הספרות האחרונות (בפורמט הזה, ספרה-ספרה), ולבקש אישור ("זה נכון?"). לעולם אל תקריאי את המספר המלא, ולעולם אל תגידי שאינך רואה/יודעת את המספר.`,
           "caller_id"
         );
       }
