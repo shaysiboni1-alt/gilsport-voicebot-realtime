@@ -41,6 +41,10 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+function safeStr(v) {
+  return (v === undefined || v === null) ? "" : String(v).trim();
+}
+
 async function fetchWithTimeout(url, options = {}, timeoutMs = 4500) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
