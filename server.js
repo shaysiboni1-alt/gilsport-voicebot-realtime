@@ -614,10 +614,6 @@ function buildSystemInstructionsFromSheets() {
     OPENING_SCRIPT: opening,
     CLOSING_SCRIPT: closing,
 
-    // Pricing / coupon policy
-    SALES_COUPON_CODE: getSetting("SALES_COUPON_CODE", ""),
-    PRICE_CLAIM_SENTENCE: getSetting("PRICE_CLAIM_SENTENCE", ""),
-
     WEBSITE_URL: getSetting("WEBSITE_URL", ""),
     MAIN_PHONE: getSetting("MAIN_PHONE", ""),
     WORKING_HOURS: getSetting("WORKING_HOURS", ""),
@@ -643,27 +639,8 @@ function buildSystemInstructionsFromSheets() {
     IMPORTER_C_PHONE: getSetting("IMPORTER_C_PHONE", ""),
   };
 
-  const combined = [master, guard, kb].filter(Boolean).join("
-
-");
+  const combined = [master, guard, kb].filter(Boolean).join("\n\n");
   const final = interpolateVars(combined, vars);
-
-  // Hard guardrails for coupon / price-claim flows.
-  // These prevent the model from adding filler text beyond the required code/sentence.
-  const couponCode = safeStr(getSetting("SALES_COUPON_CODE", ""));
-  const priceClaimSentence = safeStr(getSetting("PRICE_CLAIM_SENTENCE", ""));
-  const enforcementAddon = `
-חיזוק קשיח (קופון/מחיר):
-- אם הלקוח מבקש קופון בלבד: מותר למסור אך ורק את קוד הקופון מתוך SETTINGS. אם קיים קוד—אמרו בדיוק את הקוד בלבד, ללא שום תוספות. אם אין קוד זמין—אמרו שאין קוד קופון זמין כרגע והציעו להשאיר פרטים.
-- אם הלקוח טוען למחיר/השוואת מחיר: מותר להגיב אך ורק במשפט PRICE_CLAIM_SENTENCE מתוך SETTINGS. אם קיים משפט—אמרו בדיוק את המשפט בלבד, ללא שום תוספות. אם אין משפט זמין—אמרו שאין מידע זמין לגבי התאמת מחיר והציעו להשאיר פרטים.
-איסור מוחלט להוסיף איחולים/ברכות/משפטי חיזוק, ואיסור מוחלט להמציא קוד או משפט חלופי.
-קוד קופון (אם קיים): ${couponCode || ""}
-משפט מחיר (אם קיים): ${priceClaimSentence || ""}
-`.trim();
-
-  const finalWithEnforcement = [final, enforcementAddon].filter(Boolean).join("
-
-");
 
   return {
     businessName,
@@ -671,7 +648,7 @@ function buildSystemInstructionsFromSheets() {
     opening,
     closing,
     instructions:
-      finalWithEnforcement ||
+      final ||
       `את/ה נציג/ת שירות ומכירה קולית בשם "${botName}" עבור "${businessName}". דבר/י בעברית כברירת מחדל, בלשון רבים, בטון שירותי וקצר.`,
   };
 }
@@ -1295,6 +1272,34 @@ wss.on("connection", async (twilioWs, req) => {
 
   let conversationLog = [];
 
+  // Deterministic overrides: coupon-only / price-claim
+  // If the caller explicitly asks only for a coupon code, we respond with the exact code from SETTINGS (no extra words).
+  // If the caller makes a price-claim / price comparison, we respond with the exact PRICE_CLAIM_SENTENCE from SETTINGS (no extra words).
+  let forceDeterministicReply = null; // { type: 'coupon'|'price', text: string }
+
+  function isCouponOnlyRequest(userText) {
+    const t = normalizeTextLoose(userText);
+    if (!t) return false;
+    // Strong coupon keywords
+    const hasCoupon = t.includes(normalizeTextLoose("קופון")) || t.includes(normalizeTextLoose("קוד קופון")) || t.includes(normalizeTextLoose("קופון הנחה"));
+    if (!hasCoupon) return false;
+    // If they mention products/service/support/delivery, it's not coupon-only.
+    const blockers = ["תקלה","שירות","תמיכה","יבואן","אספקה","מוביל","משלוח","הזמנה","קנייה","רכישה","הליכון","אופניים","מחיר","הנחה על","הצעת מחיר","דגם","מותג","בעיה","חלק","תיקון","זיכוי","החלפה"]; 
+    for (const b of blockers) {
+      if (t.includes(normalizeTextLoose(b))) return false;
+    }
+    return true;
+  }
+
+  function isPriceClaimRequest(userText) {
+    const t = normalizeTextLoose(userText);
+    if (!t) return false;
+    // Price-claim indicators (comparison / match / cheaper elsewhere)
+    const patterns = ["יותר זול","זול יותר","אצל","במקום אחר","השוואת מחיר","להשוות מחיר","תחרות","תתאימו מחיר","התאמת מחיר","להוריד מחיר","מחיר אחר","מחיר זול","מצאתי בזול","באמזון","בזאפ","זאפ"]; 
+    return patterns.some((p) => t.includes(normalizeTextLoose(p)));
+  }
+
+
   // Allowed business phone numbers (delivery/importers/main + caller-id). Used to prevent / correct hallucinated digits.
   let allowedPhonesDigits = new Set();
 
@@ -1556,14 +1561,30 @@ wss.on("connection", async (twilioWs, req) => {
       }
     }
 
-    // Lead routing logic (strict):
+    // Lead routing logic:
+    // - "Full lead" (unchanged definition): full_name + valid phone -> FINAL webhook.
     // - FINAL Lead webhook is sent ONLY for a "full lead": full_name + valid phone.
-    // - ABANDONED webhook is sent when the call ends WITHOUT a full lead, but there IS a caller-id (non-private).
-    //   This matches the rule: "שיחה ננטשת חייבת להגיע עם מספר מזוהה".
+// - ABANDONED webhook is sent when the call ends without a full lead, but there is a caller-id (non-private).
+
     const hasName = safeStr(parsedLead?.full_name).length >= 2;
     const hasPhone = !!coercedPhone && digitsOnly(coercedPhone).length >= 9;
 
-    // Maintain the model flag when it is clearly a full lead (name+phone).
+    const hasReason = safeStr(parsedLead?.reason).length >= 6;
+    const hasNotes = safeStr(parsedLead?.notes).length >= 10;
+    const hasMeaningfulDetails = hasReason || hasNotes;
+
+    // If the customer explicitly provided/confirmed an alternate phone, count that as details.
+    // (Even if they did not provide a name yet.)
+    const callerILDigits = callerILLocal ? digitsOnly(callerILLocal) : "";
+    const coercedDigits = coercedPhone ? digitsOnly(coercedPhone) : "";
+    const altPhoneConfirmed =
+      !!hasPhone &&
+      (
+        parsedLead?.prefers_caller_id === false ||
+        (callerILDigits && coercedDigits && coercedDigits !== callerILDigits)
+      );
+
+    // Maintain the model flag when it is clearly a lead (name+phone).
     if (parsedLead && parsedLead.is_lead !== true && hasName && hasPhone) {
       parsedLead.is_lead = true;
     }
@@ -1571,6 +1592,7 @@ wss.on("connection", async (twilioWs, req) => {
     const isFullLead = !!(hasName && hasPhone);
     const isQualifiedLead = isFullLead;
     const call_status = mapCallStatus(reason, plannedEnd);
+
     // Wait (briefly) for Twilio recording callback to arrive, so webhooks can include a recording link.
     if (MB_ENABLE_RECORDING && callSid) {
       await waitForRecording(callSid, 12000);
@@ -1849,6 +1871,42 @@ wss.on("connection", async (twilioWs, req) => {
 
         conversationLog.push({ from: "user", text: t });
         logAlways(`[CALLER][${connId}] ${t}`);
+
+        // Deterministic override for coupon-only / price-claim: cancel any auto response and force an exact reply.
+        // This is intentionally narrow to avoid affecting other flows.
+        const couponCode = safeStr(getSetting("SALES_COUPON_CODE", ""));
+        const priceClaimSentence = safeStr(getSetting("PRICE_CLAIM_SENTENCE", ""));
+
+        if (isCouponOnlyRequest(t)) {
+          if (couponCode) {
+            forceDeterministicReply = { type: "coupon", text: couponCode };
+          } else {
+            forceDeterministicReply = { type: "coupon", text: "אין קוד קופון זמין כרגע. תרצו להשאיר פרטים לחזרה?" };
+          }
+        } else if (isPriceClaimRequest(t)) {
+          if (priceClaimSentence) {
+            forceDeterministicReply = { type: "price", text: priceClaimSentence };
+          } else {
+            forceDeterministicReply = { type: "price", text: "אין מידע זמין לגבי התאמת מחיר כרגע. תרצו להשאיר פרטים לחזרה?" };
+          }
+        } else {
+          forceDeterministicReply = null;
+        }
+
+        if (forceDeterministicReply && openAiReady && openAiWs && openAiWs.readyState === WebSocket.OPEN) {
+          // Try to cancel any in-flight response quickly, then force a minimal deterministic response.
+          try { openAiWs.send(JSON.stringify({ type: "response.cancel" })); } catch (_) {}
+          hasActiveResponse = false;
+          botSpeaking = false;
+          botTurnActive = false;
+
+          sendModelPrompt(
+            openAiWs,
+            `תשובה חובה וללא תוספות: אמרי בדיוק את הטקסט הבא בלבד: "${forceDeterministicReply.text}"`,
+            "deterministic_override"
+          );
+        }
+
 
         const gPref = detectGenderPreference(t);
         if (gPref && gPref !== preferredGender) {
