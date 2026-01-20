@@ -607,6 +607,196 @@ function buildImportersList(settings) {
   return items.join("; ");
 }
 
+function buildSystemInstructionsFromSheets() {
+  const businessName = getSetting("BUSINESS_NAME", "GilSport");
+  const botName = getSetting("BOT_NAME", "נטע");
+
+  const opening = getSetting("OPENING_SCRIPT", "שלום! מדברת נטע מגיל ספורט במה אפשר לעזור?");
+  const closing = getSetting("CLOSING_SCRIPT", "תודה שפנית אלינו. יום נעים!");
+
+  const master = getPrompt("MASTER_PROMPT", "");
+  const guard = getPrompt("GUARDRAILS_PROMPT", "");
+  const kb = getPrompt("KB_PROMPT", "");
+
+  const vars = {
+    BUSINESS_NAME: businessName,
+    BOT_NAME: botName,
+    OPENING_SCRIPT: opening,
+    CLOSING_SCRIPT: closing,
+
+    WEBSITE_URL: getSetting("WEBSITE_URL", ""),
+    MAIN_PHONE: getSetting("MAIN_PHONE", ""),
+    WORKING_HOURS: getSetting("WORKING_HOURS", ""),
+    AFTER_HOURS_DELIVERY_RULE: getSetting("AFTER_HOURS_DELIVERY_RULE", ""),
+
+    // Commercial policy (must come from SETTINGS; never invented)
+    SALES_COUPON_CODE: getSetting("SALES_COUPON_CODE", ""),
+    PRICE_CLAIM_SENTENCE: getSetting("PRICE_CLAIM_SENTENCE", ""),
+    NO_DATA_MESSAGE: getSetting("NO_DATA_MESSAGE", ""),
+
+    // Dynamic lists derived from SETTINGS (no code changes needed when adding more entries)
+    DELIVERY_PHONES_LIST: buildDeliveryPhonesList(sheetsCache.settings),
+    IMPORTERS_LIST: buildImportersList(sheetsCache.settings),
+
+    // Backward-compatible placeholders (still supported)
+    DELIVERY_PHONE_1: getSetting("DELIVERY_PHONE_1", ""),
+    DELIVERY_PHONE_2: getSetting("DELIVERY_PHONE_2", ""),
+    DELIVERY_PHONE_3: getSetting("DELIVERY_PHONE_3", ""),
+
+    IMPORTER_VO2_NAME: getSetting("IMPORTER_VO2_NAME", ""),
+    IMPORTER_VO2_PHONE: getSetting("IMPORTER_VO2_PHONE", ""),
+
+    IMPORTER_A_NAME: getSetting("IMPORTER_A_NAME", ""),
+    IMPORTER_A_PHONE: getSetting("IMPORTER_A_PHONE", ""),
+    IMPORTER_B_NAME: getSetting("IMPORTER_B_NAME", ""),
+    IMPORTER_B_PHONE: getSetting("IMPORTER_B_PHONE", ""),
+    IMPORTER_C_NAME: getSetting("IMPORTER_C_NAME", ""),
+    IMPORTER_C_PHONE: getSetting("IMPORTER_C_PHONE", ""),
+  };
+
+  const combined = [master, guard, kb].filter(Boolean).join("\n\n");
+  const final = interpolateVars(combined, vars);
+
+  // Hard guardrails injected at runtime (even if PROMPTS are accidentally loosened).
+  // Keep this minimal and deterministic.
+  const hardPolicy = `
+כללי Runtime קשיחים:
+- קופון: מותר למסור קוד קופון אך ורק מתוך SETTINGS (SALES_COUPON_CODE). איסור מוחלט להמציא קוד. אם הערך חסר/ריק—להשתמש ב-NO_DATA_MESSAGE.
+- טענת מחיר/השוואה: מותר להגיב אך ורק במשפט מתוך SETTINGS (PRICE_CLAIM_SENTENCE). איסור מוחלט להמציא משפט חלופי. אם הערך חסר/ריק—להשתמש ב-NO_DATA_MESSAGE.
+`.trim();
+
+  const finalWithHardPolicy = [final, hardPolicy].filter(Boolean).join("\n\n");
+
+  return {
+    businessName,
+    botName,
+    opening,
+    closing,
+    instructions:
+      finalWithHardPolicy ||
+      `את/ה נציג/ת שירות ומכירה קולית בשם "${botName}" עבור "${businessName}". דבר/י בעברית כברירת מחדל, בלשון רבים, בטון שירותי וקצר.`,
+  };
+}
+
+// -----------------------------
+// Twilio helpers (hangup, recording URL)
+// -----------------------------
+async function hangupTwilioCall(callSid, connId) {
+  if (!callSid) return;
+  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) return;
+
+  try {
+    const url = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls/${callSid}.json`;
+    const body = new URLSearchParams({ Status: "completed" });
+
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization:
+          "Basic " + Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64"),
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body,
+    });
+
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      logError(connId, `Twilio hangup HTTP ${res.status}`, txt);
+    } else {
+      logInfo(connId, "Twilio hangup requested.");
+    }
+  } catch (err) {
+    logError(connId, "Twilio hangup error", err);
+  }
+}
+
+async function buildRecordingUrl(recordingSid) {
+  if (!recordingSid || !TWILIO_ACCOUNT_SID) return null;
+  return `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Recordings/${recordingSid}.mp3`;
+}
+
+// -------------------- Recording registry + public proxy --------------------
+// Twilio sends RecordingStatusCallback events asynchronously; we keep the latest per CallSid.
+const RECORDINGS = new Map();
+
+function getPublicOrigin() {
+  try {
+    if (!PUBLIC_BASE_URL) return "";
+    const u = new URL(PUBLIC_BASE_URL);
+    return `${u.protocol}//${u.host}`;
+  } catch {
+    return "";
+  }
+}
+
+function setRecordingForCall(callSid, { recordingSid, recordingUrl } = {}) {
+  const sid = safeStr(recordingSid);
+  const url = safeStr(recordingUrl);
+  if (!callSid) return;
+  const cur = RECORDINGS.get(callSid) || { callSid, recordingSid: "", recordingUrl: "", updatedAt: 0 };
+  if (sid) cur.recordingSid = sid;
+  if (url) cur.recordingUrl = url;
+  cur.updatedAt = Date.now();
+  RECORDINGS.set(callSid, cur);
+}
+
+function getRecordingForCall(callSid) {
+  return RECORDINGS.get(callSid) || { callSid, recordingSid: "", recordingUrl: "", updatedAt: 0 };
+}
+
+async function waitForRecording(callSid, timeoutMs) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const r = getRecordingForCall(callSid);
+    if (r.recordingSid || r.recordingUrl) return r;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  return getRecordingForCall(callSid);
+}
+
+function twilioBasicAuthHeader() {
+  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) return "";
+  const b64 = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64");
+  return `Basic ${b64}`;
+}
+
+async function startRecordingIfEnabled(callSid, connIdForLog) {
+  if (!MB_ENABLE_RECORDING) return { ok: false, reason: "recording_disabled" };
+  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) return { ok: false, reason: "twilio_auth_missing" };
+  if (!PUBLIC_BASE_URL) return { ok: false, reason: "public_base_url_missing" };
+
+  const cbUrl = `${getPublicOrigin()}/twilio-recording-callback`;
+  const url = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls/${callSid}/Recordings.json`;
+
+  const body = new URLSearchParams({
+    RecordingStatusCallback: cbUrl,
+    RecordingStatusCallbackMethod: "POST",
+    RecordingChannels: "dual",
+  });
+
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: twilioBasicAuthHeader(),
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body,
+    });
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      logError(connIdForLog || "startup", "Recording start failed", { status: res.status, body: json });
+      return { ok: false, reason: "recording_start_failed", status: res.status };
+    }
+    const sid = safeStr(json?.sid || "");
+    if (sid) setRecordingForCall(callSid, { recordingSid: sid });
+    return { ok: true, reason: "recording_started", sid };
+  } catch (err) {
+    logError(connIdForLog || "startup", "Recording start error", err);
+    return { ok: false, reason: "recording_start_error" };
+  }
+}
+
 
 // -----------------------------
 // Delivery phones structured parsing (for deterministic last4 + names)
