@@ -1533,16 +1533,39 @@ wss.on("connection", async (twilioWs, req) => {
       }
     }
 
-    // Full lead definition (client rule): lead is considered "not abandoned" only if we have
-    // at least a name and a valid Israeli phone number to call back.
-    // Do NOT rely solely on the model's is_lead flag.
+    // Lead routing logic:
+    // - "Full lead" (unchanged definition): full_name + valid phone -> FINAL webhook.
+    // - Additionally (Option B): if there is a reachable phone AND the caller left *any*
+    //   meaningful details (message/support/sales), treat it as a lead (FINAL webhook)
+    //   and NOT as abandoned. This prevents almost-all calls from being classified as
+    //   abandoned just because caller-id exists.
+    // - "Abandoned" is reserved for calls that ended without leaving details.
+
     const hasName = safeStr(parsedLead?.full_name).length >= 2;
     const hasPhone = !!coercedPhone && digitsOnly(coercedPhone).length >= 9;
+
+    const hasReason = safeStr(parsedLead?.reason).length >= 6;
+    const hasNotes = safeStr(parsedLead?.notes).length >= 10;
+    const hasMeaningfulDetails = hasReason || hasNotes;
+
+    // If the customer explicitly provided/confirmed an alternate phone, count that as details.
+    // (Even if they did not provide a name yet.)
+    const callerILDigits = callerILLocal ? digitsOnly(callerILLocal) : "";
+    const coercedDigits = coercedPhone ? digitsOnly(coercedPhone) : "";
+    const altPhoneConfirmed =
+      !!hasPhone &&
+      (
+        parsedLead?.prefers_caller_id === false ||
+        (callerILDigits && coercedDigits && coercedDigits !== callerILDigits)
+      );
+
+    // Maintain the model flag when it is clearly a lead (name+phone).
     if (parsedLead && parsedLead.is_lead !== true && hasName && hasPhone) {
       parsedLead.is_lead = true;
     }
 
     const isFullLead = !!(hasName && hasPhone);
+    const isQualifiedLead = !!(hasPhone && (hasName || hasMeaningfulDetails || altPhoneConfirmed));
     const call_status = mapCallStatus(reason, plannedEnd);
 
     // Wait (briefly) for Twilio recording callback to arrive, so webhooks can include a recording link.
@@ -1596,6 +1619,7 @@ wss.on("connection", async (twilioWs, req) => {
       parsedLeadCollection: {
         ...(parsedLead || {}),
         isFullLead: !!isFullLead,
+        isQualifiedLead: !!isQualifiedLead,
       },
     };
 
@@ -1603,9 +1627,14 @@ wss.on("connection", async (twilioWs, req) => {
       await sendWebhook(MB_CALL_LOG_WEBHOOK_URL, payloadBase, connId, "CallLog");
     }
 
-    if (MB_ENABLE_LEAD_CAPTURE && MB_WEBHOOK_URL && isFullLead) {
+    if (MB_ENABLE_LEAD_CAPTURE && MB_WEBHOOK_URL && isQualifiedLead) {
       await sendWebhook(MB_WEBHOOK_URL, payloadBase, connId, "FINAL Lead");
-    } else if (MB_ENABLE_ABANDONED_WEBHOOK && MB_ABANDONED_WEBHOOK_URL && !isFullLead) {
+    } else if (
+      MB_ENABLE_ABANDONED_WEBHOOK &&
+      MB_ABANDONED_WEBHOOK_URL &&
+      !isQualifiedLead &&
+      !!callerILLocal
+    ) {
       await sendWebhook(MB_ABANDONED_WEBHOOK_URL, payloadBase, connId, "ABANDONED");
     }
 
