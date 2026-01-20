@@ -29,16 +29,6 @@ function envBool(name, def = false) {
   return ["1", "true", "yes", "on"].includes(raw);
 }
 
-// -----------------------------
-// Output gating (preferred over manual turns)
-// -----------------------------
-// We keep OpenAI auto-turning enabled (server_vad creates responses), but we gate what
-// reaches Twilio (and optionally cancel disallowed responses) to prevent the bot from
-// "speaking on its own" due to noise/fillers or internal follow-ups.
-//
-// Enable/disable via MB_OUTPUT_GUARD (default: true).
-const MB_OUTPUT_GUARD = envBool("MB_OUTPUT_GUARD", true);
-
 function sanitizeWebhookUrl(url) {
   const u = (url || "").trim();
   if (!u) return "";
@@ -284,26 +274,6 @@ function normalizeTextLoose(str) {
     .trim();
 }
 
-function isGreetingUtterance(norm) {
-  const s = String(norm || "").trim();
-  if (!s) return false;
-
-  // Hebrew greetings
-  if (s === "שלום") return true;
-  if (s === "היי" || s === "הי" || s === "הלו" || s === "אלו") return true;
-  if (s.startsWith("שלום ") && (s.includes("נטע") || s.includes("נעטה") || s.includes("נעתה"))) return true;
-  if (s === "שלום נטע" || s === "שלום נעתה" || s === "שלום נעטה") return true;
-
-  // English / misc greetings
-  if (s === "hi" || s === "hello" || s === "hey" || s === "aloha") return true;
-  if (s.startsWith("shalom")) return true;
-  if (s.includes("aloha") && s.includes("neta")) return true;
-  if (s.includes("hello") && s.includes("neta")) return true;
-  if (s.includes("hi") && s.includes("neta")) return true;
-
-  return false;
-}
-
 function extractDigitSequences(text) {
   const s = String(text || "");
   const matches = s.match(/\d{7,12}/g);
@@ -363,17 +333,13 @@ const MB_MAX_WARN_BEFORE_MS = envNumber("MB_MAX_WARN_BEFORE_MS", 45000);
 const MB_HANGUP_GRACE_MS = envNumber("MB_HANGUP_GRACE_MS", 5000);
 
 // Webhooks
-// Backward/compat aliases (project standard):
-// - MAKE_WEBHOOK_URL: FINAL lead only
-// - MAKE_ABANDONED_URL: abandoned calls only
-// Keep MB_* names as primary, but accept MAKE_* if MB_* is not set.
 const MB_CALL_LOG_WEBHOOK_URL = sanitizeWebhookUrl(process.env.MB_CALL_LOG_WEBHOOK_URL || "");
 const MB_CALL_LOG_ENABLED = envBool("MB_CALL_LOG_ENABLED", !!MB_CALL_LOG_WEBHOOK_URL);
 
-const MB_WEBHOOK_URL = sanitizeWebhookUrl(process.env.MB_WEBHOOK_URL || process.env.MAKE_WEBHOOK_URL || "");
+const MB_WEBHOOK_URL = sanitizeWebhookUrl(process.env.MB_WEBHOOK_URL || "");
 const MB_ENABLE_LEAD_CAPTURE = envBool("MB_ENABLE_LEAD_CAPTURE", !!MB_WEBHOOK_URL);
 
-const MB_ABANDONED_WEBHOOK_URL = sanitizeWebhookUrl(process.env.MB_ABANDONED_WEBHOOK_URL || process.env.MAKE_ABANDONED_URL || "");
+const MB_ABANDONED_WEBHOOK_URL = sanitizeWebhookUrl(process.env.MB_ABANDONED_WEBHOOK_URL || "");
 const MB_ENABLE_ABANDONED_WEBHOOK = envBool("MB_ENABLE_ABANDONED_WEBHOOK", !!MB_ABANDONED_WEBHOOK_URL);
 
 const MB_FINAL_WEBHOOK_ONLY = envBool("MB_FINAL_WEBHOOK_ONLY", true);
@@ -401,20 +367,6 @@ function logError(connId, msg, extra) {
 function logAlways(msg, extra) {
   if (extra !== undefined) console.log(`[ALWAYS] ${msg}`, extra);
   else console.log(`[ALWAYS] ${msg}`);
-}
-
-function maskUrl(u) {
-  const s = String(u || "").trim();
-  if (!s) return "";
-  // keep origin + first path segment for debugging without leaking secrets
-  try {
-    const url = new URL(s);
-    const p = String(url.pathname || "/");
-    const first = p.split("/").filter(Boolean)[0] || "";
-    return `${url.origin}/${first ? first + "/" : ""}…`;
-  } catch (_) {
-    return s.slice(0, 24) + "…";
-  }
 }
 
 // -----------------------------
@@ -1163,8 +1115,6 @@ wss.on("connection", async (twilioWs, req) => {
   let plannedEnd = false;
   let callStartTs = Date.now();
   let lastMediaTs = Date.now();
-  let lastInboundAudioAt = 0;
-  let lastAllowedInboundAudioAt = 0;
   let idleCheckInterval = null;
   let idleWarningSent = false;
   let idleHangupScheduled = false;
@@ -1178,53 +1128,14 @@ wss.on("connection", async (twilioWs, req) => {
   let goodbyePendingText = null;
 
   let capturedPhoneIL = null;
-  // A phone that was explicitly confirmed by the user ("זה נכון?" -> "כן").
-  // FINAL lead + hangup-after-closing MUST rely on this value.
-  let confirmedPhoneIL = null;
   let phoneCorrectionSent = false;
   let phoneHallucinationCorrectionSent = false;
-
-  // Phone confirmation (code-enforced): after capturing a phone number from user speech,
-  // we force the bot to repeat it digit-by-digit and ask for confirmation.
-  // Only after confirmation do we proceed to closing + hangup.
-  let phoneConfirmPending = false;
-  let phoneConfirmNumberIL = null;
-  let phoneConfirmAskedAt = 0;
-  let closingAfterPhoneConfirm = false;
-
-  // Confirmed callback phone (set ONLY after explicit user confirmation).
-  // We never treat caller-id or parsed lead as confirmed unless the user approved it.
-  let confirmedPhoneSource = null; // 'spoken' | 'caller_id'
-
-  // If the bot says a goodbye/closing before we have a confirmed phone, we must
-  // keep the call open and force a phone capture turn after the response completes.
-  let pendingPhoneCaptureAfterGoodbye = null; // { kind: 'confirm_caller_id' | 'ask_phone' }
 
   let preferredGender = null;
   let genderInstructionSent = false;
   let baseInstructions = null;
 
   let conversationLog = [];
-
-  // -----------------------------
-  // Output gating state (auto-turn, gated output)
-  // -----------------------------
-  let userTurnSeq = 0;
-  let lastUserTurnAt = 0;
-  let lastUserTurnNorm = "";
-  let lastUserTurnKind = null; // 'greeting' | 'content'
-  let consumedUserTurnSeq = 0;
-  let openingResponseCount = 0;
-
-  let activeResponseId = null;
-  let activeResponseAllowed = true; // true/false; can be set on first audio delta
-  let activeResponseDecisionPending = false;
-  let activeResponseCreatedAt = 0;
-
-  // Track whether a bot response was explicitly initiated by server-side logic (sendModelPrompt),
-  // so we can hard-gate specific phases like phone confirmation.
-  let pendingForcedPurpose = null;
-  let activeResponsePurpose = null;
 
   // Allowed business phone numbers (delivery/importers/main + caller-id). Used to prevent / correct hallucinated digits.
   let allowedPhonesDigits = new Set();
@@ -1379,54 +1290,6 @@ wss.on("connection", async (twilioWs, req) => {
     return keywords.some((k) => t.includes(normalizeTextLoose(k)));
   }
 
-  function isAffirmativeUtterance(norm) {
-    const t = String(norm || "");
-    return (
-      t === "כן" ||
-      t.includes("כן נכון") ||
-      t.includes("נכון") ||
-      t.includes("בדיוק") ||
-      t.includes("מאשר") ||
-      t.includes("מאשרת") ||
-      t.includes("אמת")
-    );
-  }
-
-  function isNegativeUtterance(norm) {
-    const t = String(norm || "");
-    if (!t) return false;
-    // avoid treating "לא יודע" as a strict rejection for phone confirmation
-    if (t.includes("לא יודע") || t.includes("לא זוכר")) return false;
-    return t === "לא" || t.includes("לא נכון") || t.includes("לא זה") || t.includes("טעית") || t.includes("שגוי");
-  }
-
-  function forcePhoneConfirmation(phoneIL, source) {
-    const d = digitsOnly(phoneIL);
-    if (!d || d.length < 9 || d.length > 10) return;
-    const spoken = formatDigitsForHebrewSpeech(d);
-
-    phoneConfirmPending = true;
-    phoneConfirmNumberIL = d;
-    phoneConfirmAskedAt = Date.now();
-
-    // Remember what we are confirming so we can treat it as confirmed only on explicit approval.
-    confirmedPhoneSource = source || confirmedPhoneSource || 'spoken';
-
-    // cancel any in-flight model response to avoid overlaps
-    maybeCancelResponse("force_phone_confirm");
-    hasActiveResponse = false;
-    botSpeaking = false;
-    botTurnActive = false;
-    activeResponseId = null;
-    activeResponseDecisionPending = false;
-
-    sendModelPrompt(
-      openAiWs,
-      `כדי לוודא שחוזרים אליכם נכון, זה המספר לחזרה: ${spoken}. זה נכון?`,
-      "phone_confirm"
-    );
-  }
-
   function getGraceMs() {
     const raw = MB_HANGUP_GRACE_MS && MB_HANGUP_GRACE_MS > 0 ? MB_HANGUP_GRACE_MS : 3000;
     return Math.max(2000, Math.min(raw, 8000));
@@ -1435,9 +1298,6 @@ wss.on("connection", async (twilioWs, req) => {
   function sendModelPrompt(openAiWs, text, purpose) {
     if (!openAiReady || openAiWs.readyState !== WebSocket.OPEN) return;
     if (hasActiveResponse) return;
-
-    // Mark the next response as explicitly initiated by us.
-    pendingForcedPurpose = purpose || "forced";
 
     openAiWs.send(
       JSON.stringify({
@@ -1512,10 +1372,10 @@ wss.on("connection", async (twilioWs, req) => {
 
     const callerILLocal = toIsraeliLocalFromAny(callerRaw) || null;
 
-    // IMPORTANT: callback phone is considered valid ONLY if explicitly confirmed by the caller.
-    // We never auto-fallback to caller-id for FINAL lead delivery without confirmation.
     const coercedPhone =
-      normalizePhoneNumber(confirmedPhoneIL, null) ||
+      normalizePhoneNumber(parsedLead?.phone_number, callerRaw) ||
+      normalizePhoneNumber(capturedPhoneIL, callerRaw) ||
+      normalizePhoneNumber(callerILLocal, callerRaw) ||
       null;
 
     if (parsedLead && typeof parsedLead === "object") {
@@ -1535,7 +1395,7 @@ wss.on("connection", async (twilioWs, req) => {
       }
     }
 
-    const isFullLead = !!(parsedLead && parsedLead.is_lead === true && confirmedPhoneIL);
+    const isFullLead = !!(parsedLead && parsedLead.is_lead === true && coercedPhone);
     const call_status = mapCallStatus(reason, plannedEnd);
 
     if (recordingSid && !recordingUrl) {
@@ -1546,9 +1406,7 @@ wss.on("connection", async (twilioWs, req) => {
       .map((m) => `${m.from === "user" ? "לקוח" : botName}: ${m.text}`)
       .join("\n");
 
-    // Human-friendly EVENT label for Make dashboards.
-    // For abandoned calls we always mark it explicitly as "ננטשה" regardless of intent quality.
-    const EVENT = call_status === "abandoned" ? "ננטשה" : mapEventHe(parsedLead?.intent);
+    const EVENT = mapEventHe(parsedLead?.intent);
 
     const payloadBase = {
       call_id: callSid || streamSid || `call_${Date.now()}`,
@@ -1564,8 +1422,8 @@ wss.on("connection", async (twilioWs, req) => {
       caller_id_e164:
         toE164FromIsraeliLocal(callerILLocal) || (callerRaw && String(callerRaw).startsWith("+") ? callerRaw : null),
 
-      collected_phone_il: confirmedPhoneIL || null,
-      collected_phone_e164: confirmedPhoneIL ? toE164FromIsraeliLocal(confirmedPhoneIL) : null,
+      collected_phone_il: coercedPhone || null,
+      collected_phone_e164: coercedPhone ? toE164FromIsraeliLocal(coercedPhone) : null,
 
       business_name: businessName,
       bot_name: botName,
@@ -1583,16 +1441,6 @@ wss.on("connection", async (twilioWs, req) => {
       parsedLead: parsedLead || null,
       isFullLead,
     };
-
-    logInfo(connId, "Webhook routing decision", {
-      call_status,
-      plannedEnd,
-      isFullLead,
-      confirmedPhoneIL: confirmedPhoneIL ? true : false,
-      final_url: maskUrl(MB_WEBHOOK_URL),
-      abandoned_url: maskUrl(MB_ABANDONED_WEBHOOK_URL),
-      calllog_url: maskUrl(MB_CALL_LOG_WEBHOOK_URL),
-    });
 
     if (MB_CALL_LOG_ENABLED && MB_CALL_LOG_WEBHOOK_URL) {
       await sendWebhook(MB_CALL_LOG_WEBHOOK_URL, payloadBase, connId, "CallLog");
@@ -1648,69 +1496,6 @@ wss.on("connection", async (twilioWs, req) => {
     }
   );
 
-  function hasRealUserTurn() {
-    return conversationLog.some((m) => m.from === "user" && String(m.text || "").trim().length >= 2);
-  }
-
-  function decideAllowForThisResponse() {
-    if (!MB_OUTPUT_GUARD) return true;
-
-    const now = Date.now();
-    const userSeen = hasRealUserTurn();
-
-    // Hard gate during code-enforced phone confirmation:
-    // while we are waiting for the user to confirm ("זה נכון?"), we only allow
-    // responses that were explicitly initiated by our server logic.
-    if (phoneConfirmPending || closingAfterPhoneConfirm) {
-      const p = String(activeResponsePurpose || "");
-      const allow =
-        p === "phone_confirm" ||
-        p === "phone_confirm_retry" ||
-        p === "closing_after_phone_confirm" ||
-        p === "validated_phone_correction" ||
-        p === "business_phone_correction" ||
-        p === "phone_correction";
-      if (!allow) return false;
-    }
-
-    // Before any real user turn: allow exactly one opening response, block follow-ups.
-    if (!userSeen) {
-      return openingResponseCount === 0;
-    }
-
-    // After user spoke: allow at most one response per userTurnSeq (transcript-based),
-    // BUT do not block legitimate responses when server_vad triggers before the transcription-completed
-    // event arrives (a common ordering in realtime).
-
-    // Primary path: transcript-driven gating.
-    if (userTurnSeq > consumedUserTurnSeq) {
-      if (now - lastUserTurnAt > 15000) return false;
-      return true;
-    }
-
-    // Fallback path: audio-driven gating. If we recently appended inbound audio and we have not
-    // already allowed a response for that inbound-audio moment, allow this response.
-    if (lastInboundAudioAt && lastInboundAudioAt !== lastAllowedInboundAudioAt) {
-      const inboundAge = now - lastInboundAudioAt;
-      const createdDelta = Math.abs((activeResponseCreatedAt || now) - lastInboundAudioAt);
-      if (inboundAge <= 1500 && createdDelta <= 2000) {
-        return true;
-      }
-    }
-
-    return false;
-  }
-
-  function maybeCancelResponse(reason) {
-    if (!openAiWs || openAiWs.readyState !== WebSocket.OPEN) return;
-    // Avoid noisy OpenAI errors: only attempt cancel when we believe a response is active.
-    if (!hasActiveResponse && !botTurnActive && !activeResponseId) return;
-    try {
-      openAiWs.send(JSON.stringify({ type: "response.cancel" }));
-      logDebug(connId, `Output-guard: cancelled response (${reason})`);
-    } catch (_) {}
-  }
-
   openAiWs.on("open", () => {
     openAiReady = true;
     const { opening, instructions } = buildSystemInstructionsFromSheets();
@@ -1765,15 +1550,8 @@ wss.on("connection", async (twilioWs, req) => {
         hasActiveResponse = true;
         botTurnActive = true;
         botSpeaking = false;
-        // With barge-in enabled, don't block early caller speech right after the greeting.
-        noListenUntilTs = Date.now() + (MB_ALLOW_BARGE_IN ? 0 : MB_NO_BARGE_TAIL_MS);
+        noListenUntilTs = Date.now() + (MB_ALLOW_BARGE_IN ? MB_BARGE_IN_COOLDOWN_MS : MB_NO_BARGE_TAIL_MS);
         currentBotText = "";
-        activeResponseId = msg.response?.id || msg.response_id || null;
-        activeResponsePurpose = pendingForcedPurpose;
-        pendingForcedPurpose = null;
-        activeResponseCreatedAt = Date.now();
-        activeResponseDecisionPending = MB_OUTPUT_GUARD ? true : false;
-        activeResponseAllowed = MB_OUTPUT_GUARD ? true : true;
         break;
 
       case "response.output_text.delta":
@@ -1786,12 +1564,9 @@ wss.on("connection", async (twilioWs, req) => {
       case "response.output_text.done":
       case "response.audio_transcript.done": {
         const text = String(currentBotText || "").trim();
-        if (text && (!MB_OUTPUT_GUARD || activeResponseAllowed)) {
+        if (text) {
           conversationLog.push({ from: "bot", text });
           logAlways(`[BOT][${connId}] ${text}`);
-
-          // Count opening responses (responses before any real user turn)
-          if (!hasRealUserTurn()) openingResponseCount++;
 
           // 1) Correct hallucinated business numbers (importer/delivery/main/caller-id) before anything else
           if (maybeCorrectHallucinatedPhone(text)) {
@@ -1826,18 +1601,9 @@ wss.on("connection", async (twilioWs, req) => {
           }
 
           // 3) If the bot said a goodbye, hang up after audio finishes
-          // BUT: Never hang up (and never treat the call as complete) unless we have a CONFIRMED callback phone.
           if (!goodbyePendingHangup && MB_HANGUP_AFTER_GOODBYE && isGoodbyeUtterance(text)) {
-            if (confirmedPhoneIL) {
-              goodbyePendingHangup = true;
-              goodbyePendingText = text;
-            } else if (!phoneConfirmPending) {
-              // We already let the goodbye be spoken; keep the line open and immediately collect a confirmed phone.
-              pendingPhoneCaptureAfterGoodbye = callerIL ? { kind: 'confirm_caller_id' } : { kind: 'ask_phone' };
-              logInfo(connId, "[GUARD] Goodbye/closing detected but no confirmed phone; forcing phone capture.", {
-                hasCallerId: !!callerIL,
-              });
-            }
+            goodbyePendingHangup = true;
+            goodbyePendingText = text;
           }
         }
         currentBotText = "";
@@ -1847,38 +1613,10 @@ wss.on("connection", async (twilioWs, req) => {
       case "response.audio.delta": {
         const b64 = msg.delta;
         if (!b64 || !streamSid) break;
-
-        if (MB_OUTPUT_GUARD && activeResponseDecisionPending) {
-          const allow = decideAllowForThisResponse();
-          activeResponseAllowed = allow;
-          activeResponseDecisionPending = false;
-          if (allow && lastInboundAudioAt) {
-            lastAllowedInboundAudioAt = lastInboundAudioAt;
-          }
-          if (!allow) {
-            // Do not forward any audio; cancel to save tokens.
-            maybeCancelResponse("disallowed_output");
-            // Keep state consistent
-            hasActiveResponse = false;
-            botSpeaking = false;
-            botTurnActive = false;
-            currentBotText = "";
-            break;
-          }
-          // Mark this user turn as consumed so we don't allow multiple responses
-          if (userTurnSeq > consumedUserTurnSeq && hasRealUserTurn()) {
-            consumedUserTurnSeq = userTurnSeq;
-          }
-        }
-
-        if (MB_OUTPUT_GUARD && !activeResponseAllowed) {
-          break;
-        }
         botSpeaking = true;
 
         const now = Date.now();
-        // During bot speech, allow barge-in. We'll only cool down briefly after audio.done.
-        noListenUntilTs = now + (MB_ALLOW_BARGE_IN ? 0 : MB_NO_BARGE_TAIL_MS);
+        noListenUntilTs = now + (MB_ALLOW_BARGE_IN ? MB_BARGE_IN_COOLDOWN_MS : MB_NO_BARGE_TAIL_MS);
 
         if (twilioWs.readyState === WebSocket.OPEN) {
           twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload: b64 } }));
@@ -1897,108 +1635,37 @@ wss.on("connection", async (twilioWs, req) => {
           plannedEnd = true;
           scheduleForceEndAfterGrace("goodbye", goodbyePendingText);
         }
-
-        // If we just played the closing after an explicit phone confirmation, end the call cleanly.
-        if (closingAfterPhoneConfirm && !callEnded) {
-          closingAfterPhoneConfirm = false;
-          plannedEnd = true;
-          const { closing } = buildSystemInstructionsFromSheets();
-          scheduleForceEndAfterGrace("lead_completed", String(closing || ""));
-        }
         break;
 
       case "response.completed":
         hasActiveResponse = false;
         botSpeaking = false;
         botTurnActive = false;
-        activeResponseId = null;
-        activeResponseDecisionPending = false;
-
-        if (pendingPhoneCaptureAfterGoodbye && !callEnded && !phoneConfirmPending && !confirmedPhoneIL) {
-          const kind = pendingPhoneCaptureAfterGoodbye.kind;
-          pendingPhoneCaptureAfterGoodbye = null;
-
-          if (kind === 'confirm_caller_id' && callerIL) {
-            const spoken = formatDigitsForHebrewSpeech(callerIL);
-            // Confirming caller-id must be explicit, digit-by-digit.
-            forcePhoneConfirmation(callerIL, 'caller_id');
-            logInfo(connId, "[GUARD] Forced caller-id confirmation after premature closing.");
-          } else {
-            sendModelPrompt(openAiWs, `לפני שנסיים, מה מספר הטלפון לחזרה?`, "phone_required_before_close");
-            logInfo(connId, "[GUARD] Asked for callback phone after premature closing.");
-          }
-        }
         break;
 
       case "conversation.item.input_audio_transcription.completed": {
-        const shouldLog = !!MB_LOG_TRANSCRIPTS;
+        if (!MB_LOG_TRANSCRIPTS) break;
 
         const raw = String(msg.transcript || "").trim();
         const hasRealUserYet = conversationLog.some((m) => m.from === "user" && (m.text || "").trim().length >= 4);
 
         if (!raw) break;
         if (isTranscriptGarbage(raw, hasRealUserYet)) {
-          if (shouldLog) logDebug(connId, `Filtered garbage transcript: "${raw}"`);
+          logDebug(connId, `Filtered garbage transcript: "${raw}"`);
           break;
         }
 
-        const norm = normalizeTextLoose(raw);
-        const isGreeting = isGreetingUtterance(norm);
-
         // Additional gate: ignore low-signal utterances (breath/noise/fillers) so the bot does not respond "on its own".
-        // Greetings are explicitly allowed so "שלום נטע" never kills the turn.
-        if (!isGreeting && isLowValueUtterance(raw)) {
-          if (shouldLog) logDebug(connId, `Filtered low-value utterance: "${raw}"`);
+        if (isLowValueUtterance(raw)) {
+          logDebug(connId, `Filtered low-value utterance: "${raw}"`);
           break;
         }
 
         const t = raw.replace(/\s+/g, " ").replace(/\s+([,.:;!?])/g, "$1").trim();
         if (!t) break;
 
-        // Mark this as a real user turn for output gating.
-        userTurnSeq += 1;
-        lastUserTurnAt = Date.now();
-        lastUserTurnNorm = norm || normalizeTextLoose(t);
-        lastUserTurnKind = isGreeting ? "greeting" : "content";
-
         conversationLog.push({ from: "user", text: t });
-        if (shouldLog) logAlways(`[CALLER][${connId}] ${t}`);
-
-        // If we are waiting for phone confirmation, treat the next user utterance as confirm/reject.
-        // This is code-enforced so the call does not end immediately after the phone is spoken.
-        if (phoneConfirmPending) {
-          if (isAffirmativeUtterance(norm)) {
-            phoneConfirmPending = false;
-            capturedPhoneIL = phoneConfirmNumberIL;
-
-            confirmedPhoneIL = phoneConfirmNumberIL;
-            // If we confirmed the caller-id, mark source accordingly
-            if (!confirmedPhoneSource) confirmedPhoneSource = 'spoken';
-
-            const { closing } = buildSystemInstructionsFromSheets();
-            closingAfterPhoneConfirm = true;
-            sendModelPrompt(openAiWs, String(closing || "תודה שפניתם. יום טוב."), "closing_after_phone_confirm");
-          } else if (isNegativeUtterance(norm)) {
-            phoneConfirmPending = false;
-            phoneConfirmNumberIL = null;
-            capturedPhoneIL = null;
-
-            confirmedPhoneIL = null;
-            confirmedPhoneSource = null;
-            // If the caller already said the correct number in the same utterance
-            // (e.g., "לא... המספר הוא 050-..."), treat it as a new provided phone
-            // and immediately re-confirm digit-by-digit.
-            const maybeNew = parsePhoneFromText(t);
-            const normalizedNew = normalizePhoneNumber(maybeNew, null);
-            if (normalizedNew) {
-              forcePhoneConfirmation(normalizedNew, "spoken");
-            } else {
-              sendModelPrompt(openAiWs, `אין בעיה. מה מספר הטלפון הנכון לחזרה?`, "phone_confirm_retry");
-            }
-          }
-          // Either way, don't try to capture a new number from the same short confirm/reject utterance.
-          break;
-        }
+        logAlways(`[CALLER][${connId}] ${t}`);
 
         const gPref = detectGenderPreference(t);
         if (gPref && gPref !== preferredGender) {
@@ -2017,30 +1684,16 @@ wss.on("connection", async (twilioWs, req) => {
         if (phoneFromSpeech) {
           capturedPhoneIL = phoneFromSpeech;
           logDebug(connId, `Captured phone from speech: ${capturedPhoneIL}`);
-          // Force confirmation immediately (code-enforced) so we always read back digit-by-digit.
-          forcePhoneConfirmation(capturedPhoneIL, 'spoken');
           try {
             const d = digitsOnly(capturedPhoneIL);
             if (d && d.length >= 7 && d.length <= 12) allowedPhonesDigits.add(d);
           } catch (_) {}
-
-          // Force a confirmation turn immediately after a phone was spoken.
-          // This prevents "silent hangup" moments and ensures we never send a lead with an unconfirmed phone.
-          if (!phoneConfirmPending) {
-            forcePhoneConfirmation(capturedPhoneIL, 'spoken');
-          }
         }
 
         break;
       }
 
       case "error":
-        // Suppress noise for benign cancels where there is no active response.
-        if (msg?.error?.code === "response_cancel_not_active") {
-          logDebug(connId, "OpenAI cancel: no active response (ignored).");
-          break;
-        }
-
         logError(connId, "OpenAI error event", msg);
 
         // If the Realtime session hit max duration, end the call cleanly.
@@ -2165,8 +1818,6 @@ wss.on("connection", async (twilioWs, req) => {
       if (!MB_ALLOW_BARGE_IN) {
         if (botTurnActive || botSpeaking) return;
       }
-
-      lastInboundAudioAt = now;
 
       openAiWs.send(JSON.stringify({ type: "input_audio_buffer.append", audio: payload }));
     } else if (event === "stop") {
