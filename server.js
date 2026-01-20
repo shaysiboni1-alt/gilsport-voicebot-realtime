@@ -193,19 +193,9 @@ function normalizePhoneNumber(rawPhone, callerNumber) {
 }
 
 function extractBestPhoneFromText(text) {
-  const raw = String(text || "");
-
-  // Prefer explicit digit sequences; fallback to Hebrew digit-words.
-  const cand1 = digitsOnly(raw);
-  const cand2 = extractHebrewSpokenDigits(raw);
-
-  for (const cand of [cand1, cand2]) {
-    if (!cand) continue;
-    const norm = normalizePhoneNumber(cand, null);
-    if (norm) return norm;
-  }
-
-  return null;
+  const d = digitsOnly(text);
+  if (!d) return null;
+  return normalizePhoneNumber(d, null);
 }
 
 function isTranscriptGarbage(t, hasRealUserYet) {
@@ -797,94 +787,6 @@ async function startRecordingIfEnabled(callSid, connIdForLog) {
   }
 }
 
-
-// -----------------------------
-// Delivery phones structured parsing (for deterministic last4 + names)
-// -----------------------------
-function buildDeliveryPhonesStructured(settings) {
-  const entries = [];
-  for (const [k, v] of Object.entries(settings || {})) {
-    if (!String(k).startsWith("DELIVERY_PHONE_")) continue;
-    const raw = String(v || "").trim();
-    if (!raw) continue;
-
-    const digits = digitsOnly(raw);
-    const phoneIL = toIsraeliLocalFromAny(digits || raw);
-    if (!phoneIL) continue;
-
-    // Name is whatever remains after removing digits; deterministic.
-    let name = raw.replace(digits, " ").replace(/\s+/g, " ").trim();
-    name = name.replace(/[-–—:]+$/g, "").trim();
-    if (!name) name = "מוביל";
-
-    entries.push({
-      key: String(k),
-      name,
-      phone_il: phoneIL,
-      last4: last4Digits(phoneIL),
-      last4_spoken: formatLast4ForHebrewSpeech(phoneIL),
-    });
-  }
-
-  // Stable ordering by numeric suffix when present.
-  entries.sort((a, b) => {
-    const sa = a.key.slice("DELIVERY_PHONE_".length);
-    const sb = b.key.slice("DELIVERY_PHONE_".length);
-    const na = parseInt(sa, 10);
-    const nb = parseInt(sb, 10);
-    const aNum = Number.isFinite(na);
-    const bNum = Number.isFinite(nb);
-    if (aNum && bNum) return na - nb;
-    if (aNum && !bNum) return -1;
-    if (!aNum && bNum) return 1;
-    return String(sa).localeCompare(String(sb));
-  });
-
-  return entries;
-}
-
-function buildDeliveryLast4AllowList(settings) {
-  const items = buildDeliveryPhonesStructured(settings);
-  const set = new Set();
-  for (const it of items) {
-    if (it && it.last4 && String(it.last4).length === 4) set.add(String(it.last4));
-  }
-  return { items, set };
-}
-
-// -----------------------------
-// Lead notes cleanup before webhook (deterministic)
-// -----------------------------
-function cleanLeadNotes(notes, intent, deliveryNumbersProvided) {
-  const raw = String(notes || "").trim();
-  const i = String(intent || "").toLowerCase();
-  const addDelivery = i === "delivery" && !!deliveryNumbersProvided;
-
-  if (!raw) return addDelivery ? "נמסרו מספרי מובילים: כן." : null;
-
-  const parts = raw
-    .replace(/\r\n/g, "\n")
-    .split(/[\n.!?]+/)
-    .map((s) => s.trim())
-    .filter(Boolean);
-
-  const out = [];
-  for (const p of parts) {
-    const n = normalizeTextLoose(p);
-    if (!n) continue;
-    if (n.includes(normalizeTextLoose("יבואנ"))) continue;
-    if (n.includes(normalizeTextLoose("יבואנים"))) continue;
-    if (n.includes(normalizeTextLoose("מוביל"))) continue;
-    out.push(p);
-  }
-
-  if (addDelivery) out.push("נמסרו מספרי מובילים: כן.");
-
-  const joined = out.join(". ");
-  return joined ? joined + "." : null;
-}
-
-
 // -----------------------------
 // Lead parsing via Chat Completions
 // -----------------------------
@@ -1062,7 +964,7 @@ async function extractLeadFromConversation(conversationLog, connId, botName, bus
 
     const systemAddon = `
 חובה: להחזיר JSON תקין בלבד (ללא טקסט נוסף).
-חובה: השדות reason ו-notes בעברית (אפשר לתרגם מתוכן השיחה), כולל ציון מפורש אם נמסר מספר יבואן/מוביל.
+חובה: השדות reason ו-notes בעברית (אפשר לתרגם מתוכן השיחה). אם נמסרו בפועל מספרי מובילים/יבואנים במהלך השיחה—ציינו זאת; אחרת אל תזכירו יבואנים/מובילים כלל.
 	חובה: phone_number (אם קיים) חייב להיות מספר ישראלי מלא (0XXXXXXXXX/0XXXXXXXXXX לאחר normalize) — 4 ספרות אחרונות בלבד אינן טלפון תקין ואסור להחזיר אותן כשדה phone_number.
 	חובה: אם intent="message" — מלאו message_for (עבור מי ההודעה) במפורש.
 	חובה: אם intent הוא "sales" או "support" — מלאו brand ו-model גם אם הלקוח אמר שאין/לא יודע; במקרה כזה כתבו את ניסוח הלקוח כפי שנאמר (לדוגמה: "אין מותג" / "לא יודע דגם"), ואל תשאירו null.
@@ -1122,10 +1024,7 @@ function isAbandonedReason(reason) {
     r.includes("abandoned") ||
     r.includes("disconnect") ||
     r.includes("network") ||
-    r.includes("timeout") ||
-    r.includes("twilio_ws_closed") ||
-    r.includes("twilio_ws_error") ||
-    r.includes("twilio_stop")
+    r.includes("timeout") ||    r.includes("twilio_ws_error")
   );
 }
 
@@ -1378,60 +1277,12 @@ wss.on("connection", async (twilioWs, req) => {
   // Allowed business phone numbers (delivery/importers/main + caller-id). Used to prevent / correct hallucinated digits.
   let allowedPhonesDigits = new Set();
 
-  // Delivery phone disclosure tracking (deterministic).
-  let deliveryPhonesStructured = [];
-  let deliveryPhonesLast4Set = new Set();
+  // Delivery phones meta (from SETTINGS DELIVERY_PHONE_*).
+  // We never speak full numbers to callers; we only speak last4. For delivery numbers we must also preserve the driver name.
+  let deliveryPhonesMeta = [];
+  let deliveryLast4Set = new Set();
   let deliveryNumbersProvided = false;
 
-  // Deterministic commercial policy (coupon / price-claim) from SETTINGS.
-  // We use runtime interception + correction to prevent model hallucinations.
-  let couponHandledThisCall = false;
-  let priceClaimHandledThisCall = false;
-  let lastResponseCreatedAt = 0;
-
-  function getCouponCode() {
-    return String(getSetting("SALES_COUPON_CODE", "") || "").trim();
-  }
-
-  function getPriceClaimSentence() {
-    return String(getSetting("PRICE_CLAIM_SENTENCE", "") || "").trim();
-  }
-
-  function getNoDataMessage() {
-    return String(getSetting("NO_DATA_MESSAGE", "") || "").trim() || "אין לנו מידע זמין כרגע.";
-  }
-
-  function isCouponRequest(text) {
-    const n = normalizeTextLoose(text);
-    if (!n) return false;
-    return (
-      n.includes(normalizeTextLoose("קופון")) ||
-      n.includes(normalizeTextLoose("קוד קופון")) ||
-      (n.includes(normalizeTextLoose("קוד")) && n.includes(normalizeTextLoose("הנחה")))
-    );
-  }
-
-  function isPriceClaimRequest(text) {
-    const n = normalizeTextLoose(text);
-    if (!n) return false;
-    return (
-      n.includes(normalizeTextLoose("יותר זול")) ||
-      n.includes(normalizeTextLoose("מחיר זול")) ||
-      (n.includes(normalizeTextLoose("מחיר")) && n.includes(normalizeTextLoose("השווא")))
-    );
-  }
-
-  function cancelActiveResponseSafe(openAiWs) {
-    // "response_cancel_not_active" appears when we cancel without an active response.
-    // We gate cancellations by both the local flag and a recent "response.created" timestamp.
-    if (!openAiReady || !openAiWs || openAiWs.readyState !== WebSocket.OPEN) return;
-    if (!hasActiveResponse) return;
-    if (!lastResponseCreatedAt) return;
-    if (Date.now() - lastResponseCreatedAt > 15000) return;
-    try {
-      openAiWs.send(JSON.stringify({ type: "response.cancel" }));
-    } catch (_) {}
-  }
 
   function refreshAllowedPhonesFromSheets() {
     const s = sheetsCache.settings || {};
@@ -1443,25 +1294,45 @@ wss.on("connection", async (twilioWs, req) => {
       if (d.length >= 7 && d.length <= 12) out.add(d);
     };
 
+    // MAIN_PHONE (may be spaced in sheets)
     pushMaybe(getSetting("MAIN_PHONE", ""));
 
+    // Any *_PHONE and DELIVERY_PHONE_* (for hallucination correction / allow-list)
     for (const [k, v] of Object.entries(s)) {
       if (!k) continue;
       const key = String(k).toUpperCase();
       if (key.endsWith("_PHONE") || key.startsWith("DELIVERY_PHONE_")) pushMaybe(v);
     }
 
-    
     allowedPhonesDigits = out;
 
-    // Also refresh delivery phones structured list + last4 set (used for deterministic correction).
-    try {
-      deliveryPhonesStructured = buildDeliveryPhonesStructured(s);
-      deliveryPhonesLast4Set = new Set(deliveryPhonesStructured.map((x) => String(x.last4 || "").trim()).filter(Boolean));
-    } catch (_) {
-      deliveryPhonesStructured = [];
-      deliveryPhonesLast4Set = new Set();
+    // Delivery meta: [{ name, local, last4 }]
+    const dEntries = [];
+    for (const [k, v] of Object.entries(s)) {
+      const key = String(k || "").toUpperCase();
+      if (!key.startsWith("DELIVERY_PHONE_")) continue;
+      const raw = String(v || "").trim();
+      if (!raw) continue;
+      const local = toIsraeliLocalFromAny(raw) || toIsraeliLocalFromAny(digitsOnly(raw)) || null;
+      if (!local) continue;
+      const name = String(raw).replace(/\d/g, " ").replace(/\+/g, " ").replace(/\s+/g, " ").trim();
+      const suffix = key.slice("DELIVERY_PHONE_".length);
+      dEntries.push({ key, suffix, name, local, last4: last4Digits(local) });
     }
+
+    dEntries.sort((a, b) => {
+      const na = parseInt(a.suffix, 10);
+      const nb = parseInt(b.suffix, 10);
+      const aNum = Number.isFinite(na);
+      const bNum = Number.isFinite(nb);
+      if (aNum && bNum) return na - nb;
+      if (aNum && !bNum) return -1;
+      if (!aNum && bNum) return 1;
+      return String(a.suffix).localeCompare(String(b.suffix));
+    });
+
+    deliveryPhonesMeta = dEntries;
+    deliveryLast4Set = new Set(dEntries.map((x) => x.last4).filter((x) => x && x.length === 4));
   }
 
   function bestAllowedPhoneMatch(seqDigits) {
@@ -1529,7 +1400,11 @@ wss.on("connection", async (twilioWs, req) => {
           mode: mentionsCallerId ? "caller_id" : "captured_phone",
         });
 
-        cancelActiveResponseSafe();
+        if (hasActiveResponse) {
+          try {
+            openAiWs.send(JSON.stringify({ type: "response.cancel" }));
+          } catch (_) {}
+        }
 
         hasActiveResponse = false;
         botSpeaking = false;
@@ -1544,6 +1419,55 @@ wss.on("connection", async (twilioWs, req) => {
         return true;
       }
     }
+
+    // Special: delivery phones are spoken as LAST4 only, but must match SETTINGS (and include the mover name).
+    // If the model says any 4-digit chunk that is not one of the allowed delivery last4 digits, force a correction.
+    const normDelivery = normalizeTextLoose(botText);
+    if (deliveryLast4Set && deliveryLast4Set.size > 0 && (normDelivery.includes(normalizeTextLoose("מובילים")) || normDelivery.includes(normalizeTextLoose("מוביל")))) {
+      const rawDigitsJoined = digitsOnly(botText);
+      const hebDigitsJoined = extractHebrewSpokenDigits(botText);
+      const candidates = [];
+      for (const src of [rawDigitsJoined, hebDigitsJoined]) {
+        const d = String(src || "");
+        if (d.length >= 4) {
+          for (let i = 0; i <= d.length - 4; i++) {
+            const chunk = d.slice(i, i + 4);
+            if (/^\d{4}$/.test(chunk)) candidates.push(chunk);
+          }
+        }
+      }
+      const uniq = Array.from(new Set(candidates));
+      if (uniq.length > 0) {
+        const hasBad = uniq.some((x) => !deliveryLast4Set.has(x));
+        if (hasBad) {
+          phoneHallucinationCorrectionSent = true;
+
+          const lines = (deliveryPhonesMeta || [])
+            .filter((x) => x && x.last4 && x.last4.length === 4)
+            .map((x) => `${x.name ? x.name + ': ' : ''}${formatLast4ForHebrewSpeech(x.last4)}`)
+            .join("; ");
+
+          logError(connId, "Model spoke delivery last4 incorrectly; forcing correction.", { said_last4: uniq, expected_last4: Array.from(deliveryLast4Set) });
+
+          if (hasActiveResponse) {
+            try { openAiWs.send(JSON.stringify({ type: "response.cancel" })); } catch (_) {}
+          }
+
+          hasActiveResponse = false;
+          botSpeaking = false;
+          botTurnActive = false;
+
+          sendModelPrompt(
+            openAiWs,
+            `תיקון חובה: מספרי המובילים (רק 4 ספרות אחרונות לכל אחד) הם: ${lines}. הקריאו בדיוק כך, עם שם לכל מוביל, ושאלו שאלה אחת בלבד: "תרצו שאחזור על זה?"`,
+            "delivery_last4_correction"
+          );
+
+          return true;
+        }
+      }
+    }
+
 
     const seqs = extractDigitSequences(botText);
     // Also handle common speech formatting like "0 5 0 ..." or Hebrew digit-words.
@@ -1560,8 +1484,12 @@ wss.on("connection", async (twilioWs, req) => {
 
       logError(connId, "Model spoke a business phone number incorrectly; forcing correction.", m);
 
-      // Cancel safely (avoid response_cancel_not_active errors).
-      cancelActiveResponseSafe();
+      // Attempt to cancel only if a response is currently active; otherwise ignore.
+      if (hasActiveResponse) {
+        try {
+          openAiWs.send(JSON.stringify({ type: "response.cancel" }));
+        } catch (_) {}
+      }
 
       hasActiveResponse = false;
       botSpeaking = false;
@@ -1578,65 +1506,6 @@ wss.on("connection", async (twilioWs, req) => {
     return false;
   }
 
-
-
-  function maybeCorrectDeliveryPhones(botText) {
-    // If the bot is disclosing delivery driver numbers, enforce that:
-    // - only known delivery phone entries from SETTINGS are used
-    // - last4 digits are correct
-    // - names are included (if available)
-    if (!botText) return false;
-    if (!deliveryPhonesStructured || deliveryPhonesStructured.length === 0) return false;
-
-    const norm = normalizeTextLoose(botText);
-    if (!norm.includes(normalizeTextLoose("מוביל"))) return false;
-
-    // Extract all digits that appear (including spaced digits), then chunk into groups of 4.
-    const all = extractHebrewSpokenDigits(botText) || "";
-    if (!all) return false;
-
-    // Heuristic: if we have at least one 4-digit chunk and the utterance is about movers,
-    // validate chunks against the allowed delivery last4 set.
-    const chunks = [];
-    for (let i = 0; i + 4 <= all.length && chunks.length < 6; i += 4) {
-      chunks.push(all.slice(i, i + 4));
-    }
-    const used = chunks.filter((c) => c && c.length === 4);
-    if (used.length === 0) return false;
-
-    const allValid = used.every((c) => deliveryPhonesLast4Set.has(c));
-
-    // Check whether at least one of the known mover names is mentioned.
-    const hasAnyName = deliveryPhonesStructured.some((p) => {
-      const nm = normalizeTextLoose(p.name || "");
-      return nm && norm.includes(nm);
-    });
-
-    if (allValid && hasAnyName) {
-      deliveryNumbersProvided = true;
-      return false;
-    }
-
-    // Force deterministic correction.
-    cancelActiveResponseSafe();
-    hasActiveResponse = false;
-    botSpeaking = false;
-    botTurnActive = false;
-
-    const parts = deliveryPhonesStructured
-      .map((p) => {
-        const name = (p.name || "").trim();
-        const last4 = formatLast4ForHebrewSpeech(p.phone_il || "");
-        return name ? `${name}: ${last4}` : `${last4}`;
-      })
-      .filter(Boolean)
-      .slice(0, 3);
-
-    const msg = `הנה מספרי המובילים: ${parts.join(", ")}. תרצו שאחזור על זה שוב?`;
-    deliveryNumbersProvided = true;
-    sendModelPrompt(openAiWs, `השיבי בדיוק כך, בלי לשנות ספרות ובלי להוסיף מספרים: "${msg}"`, "delivery_phones_correction");
-    return true;
-  }
   function isGoodbyeUtterance(text) {
     const { closing } = buildSystemInstructionsFromSheets();
     const t = normalizeTextLoose(text);
@@ -1776,9 +1645,40 @@ wss.on("connection", async (twilioWs, req) => {
       parsedLead.is_lead = true;
     }
 
+    
+
+    // Clean webhook notes: do not include boilerplate about importers; include delivery movers only if actually provided.
+    function cleanLeadNotesText(notesRaw) {
+      let n = String(notesRaw || "").trim();
+      if (!n) return n;
+
+      // Remove any sentence/line that mentions importers (always forbidden / irrelevant for the webhook narrative)
+      n = n
+        .split(/\n+/)
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .filter((line) => !/[יי]בואן|יבואנים/.test(line))
+        .join("\n");
+
+      // Remove delivery movers boilerplate unless we actually provided mover numbers
+      if (!deliveryNumbersProvided) {
+        n = n
+          .split(/\n+/)
+          .map((line) => line.trim())
+          .filter(Boolean)
+          .filter((line) => !/מוביל|מובילים/.test(line))
+          .join("\n");
+      }
+
+      return n.trim();
+    }
+
+    if (parsedLead && typeof parsedLead === "object") {
+      if (parsedLead.notes) parsedLead.notes = cleanLeadNotesText(parsedLead.notes);
+    }
+
     const isFullLead = !!(hasName && hasPhone);
-    // Client rule: webhook call_status is determined solely by whether we have a full lead (name+valid phone).
-    const call_status = isFullLead ? "completed" : "abandoned";
+    const call_status = mapCallStatus(reason, plannedEnd);
 
     // Wait (briefly) for Twilio recording callback to arrive, so webhooks can include a recording link.
     if (MB_ENABLE_RECORDING && callSid) {
@@ -1793,11 +1693,6 @@ wss.on("connection", async (twilioWs, req) => {
     }
 
     const EVENT = mapEventHe(parsedLead?.intent);
-
-    // Post-process notes to avoid boilerplate about importers/movers...
-    if (parsedLead && typeof parsedLead === "object") {
-      parsedLead.notes = cleanLeadNotes(parsedLead.notes, parsedLead.intent, deliveryNumbersProvided);
-    }
 
     const payloadBase = {
       call_id: callSid || streamSid || `call_${Date.now()}`,
@@ -1937,7 +1832,6 @@ wss.on("connection", async (twilioWs, req) => {
     switch (msg.type) {
       case "response.created":
         hasActiveResponse = true;
-        lastResponseCreatedAt = Date.now();
         botTurnActive = true;
         botSpeaking = false;
         noListenUntilTs = Date.now() + (MB_ALLOW_BARGE_IN ? MB_BARGE_IN_COOLDOWN_MS : MB_NO_BARGE_TAIL_MS);
@@ -1958,35 +1852,23 @@ wss.on("connection", async (twilioWs, req) => {
           conversationLog.push({ from: "bot", text });
           logAlways(`[BOT][${connId}] ${text}`);
 
+          // Track: did we actually provide delivery mover numbers in this call?
+          try {
+            const nt = normalizeTextLoose(text);
+            if (deliveryLast4Set && deliveryLast4Set.size > 0 && (nt.includes(normalizeTextLoose('מובילים')) || nt.includes(normalizeTextLoose('מוביל')))) {
+              const joined = digitsOnly(text) || '';
+              // If any allowed delivery last4 appears in the spoken text, mark as provided.
+              for (const last4 of deliveryLast4Set) {
+                if (last4 && joined.includes(last4)) { deliveryNumbersProvided = true; break; }
+              }
+            }
+          } catch (_) {}
+
+
           // 1) Correct hallucinated business numbers (importer/delivery/main/caller-id) before anything else
           if (maybeCorrectHallucinatedPhone(text)) {
             currentBotText = "";
             break;
-          }
-
-          // 1b) If the bot is disclosing delivery mover numbers, enforce deterministic last4 + names.
-          if (maybeCorrectDeliveryPhones(text)) {
-            currentBotText = "";
-            break;
-          }
-
-          // 1c) Coupon code must be deterministic from SETTINGS.
-          // If the bot said a different numeric code, force an immediate correction.
-          const couponNow = getCouponCode();
-          if (couponNow && isCouponRequest(text)) {
-            const spoken = digitsOnly(text);
-            // Accept exact match, or match as a contiguous substring.
-            const ok = spoken && spoken.includes(digitsOnly(couponNow));
-            if (!ok) {
-              logError(connId, "Model spoke wrong coupon code; forcing correction.", { said: spoken || null, expected: couponNow });
-              cancelActiveResponseSafe();
-              hasActiveResponse = false;
-              botSpeaking = false;
-              botTurnActive = false;
-              sendModelPrompt(openAiWs, `תיקון חובה: קוד הקופון הוא "${couponNow}". אמרו זאת במשפט אחד, ואז שאלו שאלה אחת בלבד: "יש עוד משהו שתרצו?"`, "coupon_correction");
-              currentBotText = "";
-              break;
-            }
           }
 
           // 2) Correct repeated-captured phone if model said different digits
@@ -2001,9 +1883,11 @@ wss.on("connection", async (twilioWs, req) => {
               const capSpoken = formatLast4ForHebrewSpeech(cap);
               logError(connId, "Model repeated wrong phone digits; forcing correction.", {
                 captured: cap,
-                model_said_last4: saidLast4 || null,
+                model_said: said,
               });
-              cancelActiveResponseSafe();
+              try {
+                openAiWs.send(JSON.stringify({ type: "response.cancel" }));
+              } catch (_) {}
               hasActiveResponse = false;
               botSpeaking = false;
               botTurnActive = false;
@@ -2082,63 +1966,23 @@ wss.on("connection", async (twilioWs, req) => {
         conversationLog.push({ from: "user", text: t });
         logAlways(`[CALLER][${connId}] ${t}`);
 
-        // Deterministic interception for coupon / price-claim requests.
-        // This prevents the model from inventing values and keeps behavior consistent.
-        // We do not require route detection; we key off user intent keywords.
-        const nt0 = normalizeTextLoose(t);
-        if (!couponHandledThisCall && isCouponRequest(nt0)) {
-          couponHandledThisCall = true;
-          const coupon = getCouponCode();
-          const msg0 = coupon ? `קוד הקופון הוא ${coupon}.` : getNoDataMessage();
-          cancelActiveResponseSafe();
-          hasActiveResponse = false;
-          botSpeaking = false;
-          botTurnActive = false;
-          sendModelPrompt(openAiWs, `השיבי בדיוק במשפט אחד: "${msg0}" ובסוף שאלי שאלה אחת בלבד: "תרצו שאחזור על זה?"`, "coupon_deterministic");
-          break;
-        }
+        // Post-closing: if caller asks about coupon/price AFTER the closing was said, answer deterministically from SETTINGS.
+        if (goodbyePendingHangup && !callEnded) {
+          const n = normalizeTextLoose(t);
+          const wantsCoupon = n.includes(normalizeTextLoose('קופון')) || n.includes(normalizeTextLoose('הנחה')) || (n.includes(normalizeTextLoose('קוד')) && n.includes(normalizeTextLoose('קופון')));
+          const wantsPriceClaim = n.includes(normalizeTextLoose('יותר זול')) || (n.includes(normalizeTextLoose('מחיר')) && (n.includes(normalizeTextLoose('זול')) || n.includes(normalizeTextLoose('השווא'))));
 
-        if (!priceClaimHandledThisCall && isPriceClaimRequest(nt0)) {
-          priceClaimHandledThisCall = true;
-          const sent = getPriceClaimSentence() || getNoDataMessage();
-          cancelActiveResponseSafe();
-          hasActiveResponse = false;
-          botSpeaking = false;
-          botTurnActive = false;
-          sendModelPrompt(openAiWs, `השיבי בדיוק במשפט אחד: "${sent}" ובסוף שאלי שאלה אחת בלבד: "תרצו שאעביר פנייה למחלקת המכירות?"`, "price_claim_deterministic");
-          break;
-        }
-
-
-        // If the user asks a follow-up question after the bot already said the closing line,
-        // answer deterministically from SETTINGS (coupon / price claim) and then allow the call to hang up.
-        if (goodbyePendingHangup && MB_HANGUP_AFTER_GOODBYE && !callEnded) {
-          const nt = normalizeTextLoose(t);
-          const noData = getSetting("NO_DATA_MESSAGE", "אין לי מידע על זה כרגע, אוכל לקחת פרטים ונציג יחזור אליכם.");
-
-          // Coupon / discount
-          if (nt.includes(normalizeTextLoose("קופון")) || nt.includes(normalizeTextLoose("הנחה")) || nt.includes(normalizeTextLoose("קוד"))) {
-            const coupon = String(getSetting("SALES_COUPON_CODE", "")).trim();
-            const say = coupon ? `${coupon}. תרצו שאחזור על זה?` : `${noData} תרצו שאקח פרטים לחזרה?`;
-            // Cancel any active response and answer now.
-            cancelActiveResponseSafe();
-            hasActiveResponse = false;
-            botSpeaking = false;
-            botTurnActive = false;
-            sendModelPrompt(openAiWs, `השיבי בדיוק כך, בלי לשנות: "${say}"`, "post_close_coupon");
-          }
-
-          // Price claim / better price
-          else if (nt.includes(normalizeTextLoose("מחיר")) || nt.includes(normalizeTextLoose("יותר זול")) || nt.includes(normalizeTextLoose("יותר טוב")) || nt.includes(normalizeTextLoose("השווא"))) {
-            const claim = String(getSetting("PRICE_CLAIM_SENTENCE", "")).trim();
-            const say = claim ? `${claim}. תרצו שאחזור על זה?` : `${noData} תרצו שאקח פרטים לחזרה?`;
-            cancelActiveResponseSafe();
-            hasActiveResponse = false;
-            botSpeaking = false;
-            botTurnActive = false;
-            sendModelPrompt(openAiWs, `השיבי בדיוק כך, בלי לשנות: "${say}"`, "post_close_price_claim");
+          if (wantsCoupon) {
+            const coupon = String(getSetting('SALES_COUPON_CODE', '') || '').trim();
+            const msg = coupon ? coupon : String(getSetting('NO_DATA_MESSAGE', '') || '').trim();
+            sendModelPrompt(openAiWs, `עני בדיוק במשפט אחד: "${msg}". בסוף שאלי שאלה אחת בלבד: "יש עוד משהו שתרצו?"`, 'post_close_coupon_price');
+          } else if (wantsPriceClaim) {
+            const sent = String(getSetting('PRICE_CLAIM_SENTENCE', '') || '').trim();
+            const msg = sent ? sent : String(getSetting('NO_DATA_MESSAGE', '') || '').trim();
+            sendModelPrompt(openAiWs, `עני בדיוק במשפט אחד: "${msg}". בסוף שאלי שאלה אחת בלבד: "יש עוד משהו שתרצו?"`, 'post_close_coupon_price');
           }
         }
+
 
         const gPref = detectGenderPreference(t);
         if (gPref && gPref !== preferredGender) {
