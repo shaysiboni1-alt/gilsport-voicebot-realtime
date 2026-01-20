@@ -1850,6 +1850,77 @@ wss.on("connection", async (twilioWs, req) => {
             break;
           }
 
+          // 1b) Coupon / price-claim: enforce SETTINGS deterministically (model sometimes hallucinates)
+          // If the bot mentions a coupon/discount OR makes a price-claim but the spoken value differs
+          // from SETTINGS, we force a correction immediately.
+          try {
+            const nt = normalizeTextLoose(text);
+
+            // Coupon enforcement
+            const couponHint = nt.includes(normalizeTextLoose('קופון')) || nt.includes(normalizeTextLoose('הנחה'));
+            if (couponHint) {
+              const expectedCouponText = String(getSetting('SALES_COUPON_CODE', '') || '').trim();
+              const expectedDigits = digitsOnly(expectedCouponText);
+              // Find a likely coupon token in the bot text (digits or alphanumerics)
+              const digitCand = (String(text).match(/\d{3,10}/g) || [])[0] || '';
+              const saidDigits = digitsOnly(digitCand || text);
+
+              // If we have expected digits and the bot didn't say them, correct.
+              if (expectedCouponText && expectedDigits && saidDigits && saidDigits != expectedDigits) {
+                logError(connId, 'Model spoke wrong coupon; forcing correction.', { said: saidDigits, expected: expectedDigits });
+
+                // Best-effort cancel only when we believe there is an active response.
+                if (hasActiveResponse) {
+                  try { openAiWs.send(JSON.stringify({ type: 'response.cancel' })); } catch (_) {}
+                }
+
+                hasActiveResponse = false;
+                botSpeaking = false;
+                botTurnActive = false;
+
+                sendModelPrompt(
+                  openAiWs,
+                  `תיקון חובה: ענו בדיוק במשפט אחד בלבד: "${expectedCouponText}". בסוף שאלו שאלה אחת בלבד: "תרצו שאפתח פנייה למחלקת המכירות?"`,
+                  'coupon_correction'
+                );
+
+                currentBotText = '';
+                break;
+              }
+            }
+
+            // Price-claim enforcement
+            const priceHint = nt.includes(normalizeTextLoose('יותר זול')) || (nt.includes(normalizeTextLoose('מחיר')) && (nt.includes(normalizeTextLoose('זול')) || nt.includes(normalizeTextLoose('השווא'))));
+            if (priceHint) {
+              const expectedPrice = String(getSetting('PRICE_CLAIM_SENTENCE', '') || '').trim();
+              if (expectedPrice) {
+                const nExp = normalizeTextLoose(expectedPrice);
+                const nSaid = normalizeTextLoose(text);
+                // If the model didn't essentially say the expected sentence, correct.
+                if (nExp && nSaid && !nSaid.includes(nExp.slice(0, Math.min(18, nExp.length)))) {
+                  logError(connId, 'Model spoke wrong price-claim; forcing correction.', { expected: expectedPrice });
+
+                  if (hasActiveResponse) {
+                    try { openAiWs.send(JSON.stringify({ type: 'response.cancel' })); } catch (_) {}
+                  }
+
+                  hasActiveResponse = false;
+                  botSpeaking = false;
+                  botTurnActive = false;
+
+                  sendModelPrompt(
+                    openAiWs,
+                    `תיקון חובה: ענו בדיוק במשפט אחד בלבד: "${expectedPrice}". בסוף שאלו שאלה אחת בלבד: "תרצו שאפתח פנייה למחלקת המכירות או השירות?"`,
+                    'price_claim_correction'
+                  );
+
+                  currentBotText = '';
+                  break;
+                }
+              }
+            }
+          } catch (_) {}
+
           // 2) Correct repeated-captured phone if model said different digits
           if (!phoneCorrectionSent && capturedPhoneIL) {
             const saidDigits = extractHebrewSpokenDigits(text) || digitsOnly(text);
@@ -2089,6 +2160,12 @@ wss.on("connection", async (twilioWs, req) => {
       }
 
       case "error":
+        // Realtime sometimes returns this benign error if we try to cancel when there is no active response.
+        if (msg && msg.error && msg.error.code === "response_cancel_not_active") {
+          logDebug(connId, "OpenAI cancel ignored (no active response)", msg.error);
+          break;
+        }
+
         logError(connId, "OpenAI error event", msg);
 
         // If the Realtime session hit max duration, end the call cleanly.
