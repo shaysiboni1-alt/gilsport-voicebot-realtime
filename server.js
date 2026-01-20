@@ -964,7 +964,7 @@ async function extractLeadFromConversation(conversationLog, connId, botName, bus
 
     const systemAddon = `
 חובה: להחזיר JSON תקין בלבד (ללא טקסט נוסף).
-חובה: השדות reason ו-notes בעברית (אפשר לתרגם מתוכן השיחה), כולל ציון מפורש אם נמסר מספר יבואן/מוביל.
+חובה: השדות reason ו-notes בעברית (אפשר לתרגם מתוכן השיחה). אם נמסרו בפועל מספרי מובילים/יבואנים במהלך השיחה—ציינו זאת; אחרת אל תזכירו יבואנים/מובילים כלל.
 	חובה: phone_number (אם קיים) חייב להיות מספר ישראלי מלא (0XXXXXXXXX/0XXXXXXXXXX לאחר normalize) — 4 ספרות אחרונות בלבד אינן טלפון תקין ואסור להחזיר אותן כשדה phone_number.
 	חובה: אם intent="message" — מלאו message_for (עבור מי ההודעה) במפורש.
 	חובה: אם intent הוא "sales" או "support" — מלאו brand ו-model גם אם הלקוח אמר שאין/לא יודע; במקרה כזה כתבו את ניסוח הלקוח כפי שנאמר (לדוגמה: "אין מותג" / "לא יודע דגם"), ואל תשאירו null.
@@ -1024,10 +1024,7 @@ function isAbandonedReason(reason) {
     r.includes("abandoned") ||
     r.includes("disconnect") ||
     r.includes("network") ||
-    r.includes("timeout") ||
-    r.includes("twilio_ws_closed") ||
-    r.includes("twilio_ws_error") ||
-    r.includes("twilio_stop")
+    r.includes("timeout") ||    r.includes("twilio_ws_error")
   );
 }
 
@@ -1280,6 +1277,13 @@ wss.on("connection", async (twilioWs, req) => {
   // Allowed business phone numbers (delivery/importers/main + caller-id). Used to prevent / correct hallucinated digits.
   let allowedPhonesDigits = new Set();
 
+  // Delivery phones meta (from SETTINGS DELIVERY_PHONE_*).
+  // We never speak full numbers to callers; we only speak last4. For delivery numbers we must also preserve the driver name.
+  let deliveryPhonesMeta = [];
+  let deliveryLast4Set = new Set();
+  let deliveryNumbersProvided = false;
+
+
   function refreshAllowedPhonesFromSheets() {
     const s = sheetsCache.settings || {};
     const out = new Set();
@@ -1290,8 +1294,10 @@ wss.on("connection", async (twilioWs, req) => {
       if (d.length >= 7 && d.length <= 12) out.add(d);
     };
 
+    // MAIN_PHONE (may be spaced in sheets)
     pushMaybe(getSetting("MAIN_PHONE", ""));
 
+    // Any *_PHONE and DELIVERY_PHONE_* (for hallucination correction / allow-list)
     for (const [k, v] of Object.entries(s)) {
       if (!k) continue;
       const key = String(k).toUpperCase();
@@ -1299,6 +1305,34 @@ wss.on("connection", async (twilioWs, req) => {
     }
 
     allowedPhonesDigits = out;
+
+    // Delivery meta: [{ name, local, last4 }]
+    const dEntries = [];
+    for (const [k, v] of Object.entries(s)) {
+      const key = String(k || "").toUpperCase();
+      if (!key.startsWith("DELIVERY_PHONE_")) continue;
+      const raw = String(v || "").trim();
+      if (!raw) continue;
+      const local = toIsraeliLocalFromAny(raw) || toIsraeliLocalFromAny(digitsOnly(raw)) || null;
+      if (!local) continue;
+      const name = String(raw).replace(/\d/g, " ").replace(/\+/g, " ").replace(/\s+/g, " ").trim();
+      const suffix = key.slice("DELIVERY_PHONE_".length);
+      dEntries.push({ key, suffix, name, local, last4: last4Digits(local) });
+    }
+
+    dEntries.sort((a, b) => {
+      const na = parseInt(a.suffix, 10);
+      const nb = parseInt(b.suffix, 10);
+      const aNum = Number.isFinite(na);
+      const bNum = Number.isFinite(nb);
+      if (aNum && bNum) return na - nb;
+      if (aNum && !bNum) return -1;
+      if (!aNum && bNum) return 1;
+      return String(a.suffix).localeCompare(String(b.suffix));
+    });
+
+    deliveryPhonesMeta = dEntries;
+    deliveryLast4Set = new Set(dEntries.map((x) => x.last4).filter((x) => x && x.length === 4));
   }
 
   function bestAllowedPhoneMatch(seqDigits) {
@@ -1385,6 +1419,55 @@ wss.on("connection", async (twilioWs, req) => {
         return true;
       }
     }
+
+    // Special: delivery phones are spoken as LAST4 only, but must match SETTINGS (and include the mover name).
+    // If the model says any 4-digit chunk that is not one of the allowed delivery last4 digits, force a correction.
+    const normDelivery = normalizeTextLoose(botText);
+    if (deliveryLast4Set && deliveryLast4Set.size > 0 && (normDelivery.includes(normalizeTextLoose("מובילים")) || normDelivery.includes(normalizeTextLoose("מוביל")))) {
+      const rawDigitsJoined = digitsOnly(botText);
+      const hebDigitsJoined = extractHebrewSpokenDigits(botText);
+      const candidates = [];
+      for (const src of [rawDigitsJoined, hebDigitsJoined]) {
+        const d = String(src || "");
+        if (d.length >= 4) {
+          for (let i = 0; i <= d.length - 4; i++) {
+            const chunk = d.slice(i, i + 4);
+            if (/^\d{4}$/.test(chunk)) candidates.push(chunk);
+          }
+        }
+      }
+      const uniq = Array.from(new Set(candidates));
+      if (uniq.length > 0) {
+        const hasBad = uniq.some((x) => !deliveryLast4Set.has(x));
+        if (hasBad) {
+          phoneHallucinationCorrectionSent = true;
+
+          const lines = (deliveryPhonesMeta || [])
+            .filter((x) => x && x.last4 && x.last4.length === 4)
+            .map((x) => `${x.name ? x.name + ': ' : ''}${formatLast4ForHebrewSpeech(x.last4)}`)
+            .join("; ");
+
+          logError(connId, "Model spoke delivery last4 incorrectly; forcing correction.", { said_last4: uniq, expected_last4: Array.from(deliveryLast4Set) });
+
+          if (hasActiveResponse) {
+            try { openAiWs.send(JSON.stringify({ type: "response.cancel" })); } catch (_) {}
+          }
+
+          hasActiveResponse = false;
+          botSpeaking = false;
+          botTurnActive = false;
+
+          sendModelPrompt(
+            openAiWs,
+            `תיקון חובה: מספרי המובילים (רק 4 ספרות אחרונות לכל אחד) הם: ${lines}. הקריאו בדיוק כך, עם שם לכל מוביל, ושאלו שאלה אחת בלבד: "תרצו שאחזור על זה?"`,
+            "delivery_last4_correction"
+          );
+
+          return true;
+        }
+      }
+    }
+
 
     const seqs = extractDigitSequences(botText);
     // Also handle common speech formatting like "0 5 0 ..." or Hebrew digit-words.
@@ -1562,6 +1645,38 @@ wss.on("connection", async (twilioWs, req) => {
       parsedLead.is_lead = true;
     }
 
+    
+
+    // Clean webhook notes: do not include boilerplate about importers; include delivery movers only if actually provided.
+    function cleanLeadNotesText(notesRaw) {
+      let n = String(notesRaw || "").trim();
+      if (!n) return n;
+
+      // Remove any sentence/line that mentions importers (always forbidden / irrelevant for the webhook narrative)
+      n = n
+        .split(/\n+/)
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .filter((line) => !/[יי]בואן|יבואנים/.test(line))
+        .join("\n");
+
+      // Remove delivery movers boilerplate unless we actually provided mover numbers
+      if (!deliveryNumbersProvided) {
+        n = n
+          .split(/\n+/)
+          .map((line) => line.trim())
+          .filter(Boolean)
+          .filter((line) => !/מוביל|מובילים/.test(line))
+          .join("\n");
+      }
+
+      return n.trim();
+    }
+
+    if (parsedLead && typeof parsedLead === "object") {
+      if (parsedLead.notes) parsedLead.notes = cleanLeadNotesText(parsedLead.notes);
+    }
+
     const isFullLead = !!(hasName && hasPhone);
     const call_status = mapCallStatus(reason, plannedEnd);
 
@@ -1737,6 +1852,19 @@ wss.on("connection", async (twilioWs, req) => {
           conversationLog.push({ from: "bot", text });
           logAlways(`[BOT][${connId}] ${text}`);
 
+          // Track: did we actually provide delivery mover numbers in this call?
+          try {
+            const nt = normalizeTextLoose(text);
+            if (deliveryLast4Set && deliveryLast4Set.size > 0 && (nt.includes(normalizeTextLoose('מובילים')) || nt.includes(normalizeTextLoose('מוביל')))) {
+              const joined = digitsOnly(text) || '';
+              // If any allowed delivery last4 appears in the spoken text, mark as provided.
+              for (const last4 of deliveryLast4Set) {
+                if (last4 && joined.includes(last4)) { deliveryNumbersProvided = true; break; }
+              }
+            }
+          } catch (_) {}
+
+
           // 1) Correct hallucinated business numbers (importer/delivery/main/caller-id) before anything else
           if (maybeCorrectHallucinatedPhone(text)) {
             currentBotText = "";
@@ -1837,6 +1965,24 @@ wss.on("connection", async (twilioWs, req) => {
 
         conversationLog.push({ from: "user", text: t });
         logAlways(`[CALLER][${connId}] ${t}`);
+
+        // Post-closing: if caller asks about coupon/price AFTER the closing was said, answer deterministically from SETTINGS.
+        if (goodbyePendingHangup && !callEnded) {
+          const n = normalizeTextLoose(t);
+          const wantsCoupon = n.includes(normalizeTextLoose('קופון')) || n.includes(normalizeTextLoose('הנחה')) || (n.includes(normalizeTextLoose('קוד')) && n.includes(normalizeTextLoose('קופון')));
+          const wantsPriceClaim = n.includes(normalizeTextLoose('יותר זול')) || (n.includes(normalizeTextLoose('מחיר')) && (n.includes(normalizeTextLoose('זול')) || n.includes(normalizeTextLoose('השווא'))));
+
+          if (wantsCoupon) {
+            const coupon = String(getSetting('SALES_COUPON_CODE', '') || '').trim();
+            const msg = coupon ? coupon : String(getSetting('NO_DATA_MESSAGE', '') || '').trim();
+            sendModelPrompt(openAiWs, `עני בדיוק במשפט אחד: "${msg}". בסוף שאלי שאלה אחת בלבד: "יש עוד משהו שתרצו?"`, 'post_close_coupon_price');
+          } else if (wantsPriceClaim) {
+            const sent = String(getSetting('PRICE_CLAIM_SENTENCE', '') || '').trim();
+            const msg = sent ? sent : String(getSetting('NO_DATA_MESSAGE', '') || '').trim();
+            sendModelPrompt(openAiWs, `עני בדיוק במשפט אחד: "${msg}". בסוף שאלי שאלה אחת בלבד: "יש עוד משהו שתרצו?"`, 'post_close_coupon_price');
+          }
+        }
+
 
         const gPref = detectGenderPreference(t);
         if (gPref && gPref !== preferredGender) {
