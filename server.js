@@ -1299,6 +1299,11 @@ wss.on("connection", async (twilioWs, req) => {
 
   let conversationLog = [];
 
+  // One-shot deterministic coupon response per call
+  // (prevents repeated coupon handling and avoids hallucinated coupon codes)
+  let couponAnsweredThisCall = false;
+
+
   // Allowed business phone numbers (delivery/importers/main + caller-id). Used to prevent / correct hallucinated digits.
   let allowedPhonesDigits = new Set();
 
