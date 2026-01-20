@@ -86,27 +86,12 @@ function formatDigitsForTts(d) {
   return s.split("").join(" ");
 }
 
-// Stronger speech-friendly formatting: Hebrew digit-words with commas for clear pauses
-// Example: 0503222237 -> "אפס, חמש, אפס, שלוש, שתיים, שתיים, שתיים, שתיים, שלוש, שבע"
+// Speech-friendly formatting for phone validation: digit-by-digit with spaces.
+// IMPORTANT: keep leading zeros and never drop digits.
+// Example: 0503222237 -> "0 5 0 3 2 2 2 2 3 7"
 function formatDigitsForHebrewSpeech(d) {
   const s = digitsOnly(d);
-  if (!s) return "";
-  const map = {
-    "0": "אפס",
-    "1": "אחת",
-    "2": "שתיים",
-    "3": "שלוש",
-    "4": "ארבע",
-    "5": "חמש",
-    "6": "שש",
-    "7": "שבע",
-    "8": "שמונה",
-    "9": "תשע",
-  };
-  return s
-    .split("")
-    .map((ch) => map[ch] || ch)
-    .join(", ");
+  return s ? s.split("").join(" ") : "";
 }
 
 // Extract a digit string from Hebrew digit-words in model output.
@@ -1136,7 +1121,7 @@ app.get("/recording/:sid.mp3", async (req, res) => {
     if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) return res.status(500).send("twilio auth missing");
 
     const url = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Recordings/${sid}.mp3`;
-    const r = await fetch(url, { headers: { Authorization: twilioAuthHeader() } });
+    const r = await fetch(url, { headers: { Authorization: twilioBasicAuthHeader() } });
     if (!r.ok) {
       const t = await r.text().catch(() => "");
       return res.status(r.status).send(t || "failed to fetch");
@@ -1530,7 +1515,16 @@ wss.on("connection", async (twilioWs, req) => {
       }
     }
 
-    const isFullLead = !!(parsedLead && parsedLead.is_lead === true && coercedPhone);
+    // Full lead definition (client rule): lead is considered "not abandoned" only if we have
+    // at least a name and a valid Israeli phone number to call back.
+    // Do NOT rely solely on the model's is_lead flag.
+    const hasName = safeStr(parsedLead?.full_name).length >= 2;
+    const hasPhone = !!coercedPhone && digitsOnly(coercedPhone).length >= 9;
+    if (parsedLead && parsedLead.is_lead !== true && hasName && hasPhone) {
+      parsedLead.is_lead = true;
+    }
+
+    const isFullLead = !!(hasName && hasPhone);
     const call_status = mapCallStatus(reason, plannedEnd);
 
     // Wait (briefly) for Twilio recording callback to arrive, so webhooks can include a recording link.
