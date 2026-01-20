@@ -344,6 +344,13 @@ const MB_ENABLE_ABANDONED_WEBHOOK = envBool("MB_ENABLE_ABANDONED_WEBHOOK", !!MB_
 
 const MB_FINAL_WEBHOOK_ONLY = envBool("MB_FINAL_WEBHOOK_ONLY", true);
 
+// Recording (optional)
+// If enabled, the server will start a Twilio dual-channel recording for each call and expose
+// a public proxy URL via PUBLIC_BASE_URL/recording/:sid.mp3 (Twilio auth is kept server-side).
+// IMPORTANT: We only read these ENV vars; we do not rename or repurpose any existing ENV.
+const MB_ENABLE_RECORDING = envBool("MB_ENABLE_RECORDING", false);
+const PUBLIC_BASE_URL = safeStr(process.env.PUBLIC_BASE_URL || "");
+
 // Lead parse
 const MB_LEAD_PARSING_MODEL = process.env.MB_LEAD_PARSING_MODEL || "gpt-4.1-mini";
 
@@ -677,6 +684,88 @@ async function hangupTwilioCall(callSid, connId) {
 async function buildRecordingUrl(recordingSid) {
   if (!recordingSid || !TWILIO_ACCOUNT_SID) return null;
   return `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Recordings/${recordingSid}.mp3`;
+}
+
+// -------------------- Recording registry + public proxy --------------------
+// Twilio sends RecordingStatusCallback events asynchronously; we keep the latest per CallSid.
+const RECORDINGS = new Map();
+
+function getPublicOrigin() {
+  try {
+    if (!PUBLIC_BASE_URL) return "";
+    const u = new URL(PUBLIC_BASE_URL);
+    return `${u.protocol}//${u.host}`;
+  } catch {
+    return "";
+  }
+}
+
+function setRecordingForCall(callSid, { recordingSid, recordingUrl } = {}) {
+  const sid = safeStr(recordingSid);
+  const url = safeStr(recordingUrl);
+  if (!callSid) return;
+  const cur = RECORDINGS.get(callSid) || { callSid, recordingSid: "", recordingUrl: "", updatedAt: 0 };
+  if (sid) cur.recordingSid = sid;
+  if (url) cur.recordingUrl = url;
+  cur.updatedAt = Date.now();
+  RECORDINGS.set(callSid, cur);
+}
+
+function getRecordingForCall(callSid) {
+  return RECORDINGS.get(callSid) || { callSid, recordingSid: "", recordingUrl: "", updatedAt: 0 };
+}
+
+async function waitForRecording(callSid, timeoutMs) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const r = getRecordingForCall(callSid);
+    if (r.recordingSid || r.recordingUrl) return r;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  return getRecordingForCall(callSid);
+}
+
+function twilioBasicAuthHeader() {
+  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) return "";
+  const b64 = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64");
+  return `Basic ${b64}`;
+}
+
+async function startRecordingIfEnabled(callSid, connIdForLog) {
+  if (!MB_ENABLE_RECORDING) return { ok: false, reason: "recording_disabled" };
+  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) return { ok: false, reason: "twilio_auth_missing" };
+  if (!PUBLIC_BASE_URL) return { ok: false, reason: "public_base_url_missing" };
+
+  const cbUrl = `${getPublicOrigin()}/twilio-recording-callback`;
+  const url = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls/${callSid}/Recordings.json`;
+
+  const body = new URLSearchParams({
+    RecordingStatusCallback: cbUrl,
+    RecordingStatusCallbackMethod: "POST",
+    RecordingChannels: "dual",
+  });
+
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: twilioBasicAuthHeader(),
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body,
+    });
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      logError(connIdForLog || "startup", "Recording start failed", { status: res.status, body: json });
+      return { ok: false, reason: "recording_start_failed", status: res.status };
+    }
+    const sid = safeStr(json?.sid || "");
+    if (sid) setRecordingForCall(callSid, { recordingSid: sid });
+    return { ok: true, reason: "recording_started", sid };
+  } catch (err) {
+    logError(connIdForLog || "startup", "Recording start error", err);
+    return { ok: false, reason: "recording_start_error" };
+  }
 }
 
 // -----------------------------
@@ -1013,6 +1102,48 @@ app.get("/health", (req, res) => {
     settings_keys: Object.keys(sheetsCache.settings || {}).length,
     prompt_ids: Object.keys(sheetsCache.prompts || {}).length,
   });
+});
+
+// -------------------- Recording callback + public proxy --------------------
+// Twilio posts recording status updates asynchronously. We store RecordingSid/RecordingUrl
+// keyed by CallSid and expose a public, auth-free proxy URL for consumption by your webhook.
+app.post("/twilio-recording-callback", (req, res) => {
+  try {
+    const callSid = safeStr(req.body?.CallSid || "");
+    const recordingSid = safeStr(req.body?.RecordingSid || "");
+    const recordingUrl = safeStr(req.body?.RecordingUrl || "");
+
+    if (callSid) {
+      setRecordingForCall(callSid, { recordingSid, recordingUrl });
+      if (MB_DEBUG) console.log("[INFO] [RECORDING_CALLBACK]", { callSid, recordingSid, hasUrl: !!recordingUrl });
+    }
+  } catch (e) {
+    // ignore
+  }
+
+  res.status(200).send("OK");
+});
+
+// Public proxy for Twilio recording MP3. Keeps Twilio auth server-side.
+app.get("/recording/:sid.mp3", async (req, res) => {
+  try {
+    const sid = safeStr(req.params?.sid || "");
+    if (!sid) return res.status(400).send("missing sid");
+    if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) return res.status(500).send("twilio auth missing");
+
+    const url = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Recordings/${sid}.mp3`;
+    const r = await fetch(url, { headers: { Authorization: twilioAuthHeader() } });
+    if (!r.ok) {
+      const t = await r.text().catch(() => "");
+      return res.status(r.status).send(t || "failed to fetch");
+    }
+
+    res.setHeader("Content-Type", "audio/mpeg");
+    const buf = Buffer.from(await r.arrayBuffer());
+    res.status(200).send(buf);
+  } catch (e) {
+    res.status(500).send(String(e?.message || e));
+  }
 });
 
 // Manual reload of Google Sheets cache (admin)
@@ -1398,13 +1529,17 @@ wss.on("connection", async (twilioWs, req) => {
     const isFullLead = !!(parsedLead && parsedLead.is_lead === true && coercedPhone);
     const call_status = mapCallStatus(reason, plannedEnd);
 
+    // Wait (briefly) for Twilio recording callback to arrive, so webhooks can include a recording link.
+    if (MB_ENABLE_RECORDING && callSid) {
+      await waitForRecording(callSid, 12000);
+      const rec = getRecordingForCall(callSid);
+      if (rec?.recordingSid) recordingSid = rec.recordingSid;
+      if (rec?.recordingUrl) recordingUrl = rec.recordingUrl;
+    }
+
     if (recordingSid && !recordingUrl) {
       recordingUrl = await buildRecordingUrl(recordingSid);
     }
-
-    const transcript = conversationLog
-      .map((m) => `${m.from === "user" ? "לקוח" : botName}: ${m.text}`)
-      .join("\n");
 
     const EVENT = mapEventHe(parsedLead?.intent);
 
@@ -1436,10 +1571,16 @@ wss.on("connection", async (twilioWs, req) => {
       recording_sid: recordingSid || null,
       recording_url: recordingUrl || null,
 
-      transcript,
-      conversationLog,
-      parsedLead: parsedLead || null,
-      isFullLead,
+      // Public, auth-free proxy URL (Twilio media is fetched server-side using TWILIO_AUTH_TOKEN)
+      recording_public_url:
+        recordingSid && getPublicOrigin() ? `${getPublicOrigin()}/recording/${recordingSid}.mp3` : null,
+
+      // IMPORTANT: Do NOT include raw transcripts / conversation logs in webhook payloads.
+
+      parsedLeadCollection: {
+        ...(parsedLead || {}),
+        isFullLead: !!isFullLead,
+      },
     };
 
     if (MB_CALL_LOG_ENABLED && MB_CALL_LOG_WEBHOOK_URL) {
@@ -1767,10 +1908,16 @@ wss.on("connection", async (twilioWs, req) => {
 
       logAlways(`[TWILIO_START][${connId}] ${JSON.stringify(msg.start || {})}`);
 
-      if (msg.start?.recordingSid) {
-        recordingSid = msg.start.recordingSid;
-        recordingUrl = await buildRecordingUrl(recordingSid);
-        logInfo(connId, "Recording started.", { recording_sid: recordingSid });
+      // Start Twilio recording (optional). Recording callbacks arrive asynchronously to /twilio-recording-callback.
+      if (MB_ENABLE_RECORDING && callSid) {
+        const rec = await startRecordingIfEnabled(callSid);
+        if (rec.ok && rec.sid) {
+          recordingSid = rec.sid;
+          setRecordingForCall(callSid, { recordingSid: rec.sid, recordingUrl: rec.url || "" });
+          logInfo(connId, "Recording started.", { recording_sid: recordingSid });
+        } else {
+          logInfo(connId, "Recording not started.", rec);
+        }
       }
 
       idleCheckInterval = setInterval(() => {
