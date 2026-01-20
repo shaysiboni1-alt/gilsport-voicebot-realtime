@@ -614,6 +614,10 @@ function buildSystemInstructionsFromSheets() {
     OPENING_SCRIPT: opening,
     CLOSING_SCRIPT: closing,
 
+    // Pricing / coupon policy
+    SALES_COUPON_CODE: getSetting("SALES_COUPON_CODE", ""),
+    PRICE_CLAIM_SENTENCE: getSetting("PRICE_CLAIM_SENTENCE", ""),
+
     WEBSITE_URL: getSetting("WEBSITE_URL", ""),
     MAIN_PHONE: getSetting("MAIN_PHONE", ""),
     WORKING_HOURS: getSetting("WORKING_HOURS", ""),
@@ -639,8 +643,27 @@ function buildSystemInstructionsFromSheets() {
     IMPORTER_C_PHONE: getSetting("IMPORTER_C_PHONE", ""),
   };
 
-  const combined = [master, guard, kb].filter(Boolean).join("\n\n");
+  const combined = [master, guard, kb].filter(Boolean).join("
+
+");
   const final = interpolateVars(combined, vars);
+
+  // Hard guardrails for coupon / price-claim flows.
+  // These prevent the model from adding filler text beyond the required code/sentence.
+  const couponCode = safeStr(getSetting("SALES_COUPON_CODE", ""));
+  const priceClaimSentence = safeStr(getSetting("PRICE_CLAIM_SENTENCE", ""));
+  const enforcementAddon = `
+חיזוק קשיח (קופון/מחיר):
+- אם הלקוח מבקש קופון בלבד: מותר למסור אך ורק את קוד הקופון מתוך SETTINGS. אם קיים קוד—אמרו בדיוק את הקוד בלבד, ללא שום תוספות. אם אין קוד זמין—אמרו שאין קוד קופון זמין כרגע והציעו להשאיר פרטים.
+- אם הלקוח טוען למחיר/השוואת מחיר: מותר להגיב אך ורק במשפט PRICE_CLAIM_SENTENCE מתוך SETTINGS. אם קיים משפט—אמרו בדיוק את המשפט בלבד, ללא שום תוספות. אם אין משפט זמין—אמרו שאין מידע זמין לגבי התאמת מחיר והציעו להשאיר פרטים.
+איסור מוחלט להוסיף איחולים/ברכות/משפטי חיזוק, ואיסור מוחלט להמציא קוד או משפט חלופי.
+קוד קופון (אם קיים): ${couponCode || ""}
+משפט מחיר (אם קיים): ${priceClaimSentence || ""}
+`.trim();
+
+  const finalWithEnforcement = [final, enforcementAddon].filter(Boolean).join("
+
+");
 
   return {
     businessName,
@@ -648,7 +671,7 @@ function buildSystemInstructionsFromSheets() {
     opening,
     closing,
     instructions:
-      final ||
+      finalWithEnforcement ||
       `את/ה נציג/ת שירות ומכירה קולית בשם "${botName}" עבור "${businessName}". דבר/י בעברית כברירת מחדל, בלשון רבים, בטון שירותי וקצר.`,
   };
 }
@@ -1533,41 +1556,21 @@ wss.on("connection", async (twilioWs, req) => {
       }
     }
 
-    // Lead routing logic:
-    // - "Full lead" (unchanged definition): full_name + valid phone -> FINAL webhook.
-    // - Additionally (Option B): if there is a reachable phone AND the caller left *any*
-    //   meaningful details (message/support/sales), treat it as a lead (FINAL webhook)
-    //   and NOT as abandoned. This prevents almost-all calls from being classified as
-    //   abandoned just because caller-id exists.
-    // - "Abandoned" is reserved for calls that ended without leaving details.
-
+    // Lead routing logic (strict):
+    // - FINAL Lead webhook is sent ONLY for a "full lead": full_name + valid phone.
+    // - ABANDONED webhook is sent when the call ends WITHOUT a full lead, but there IS a caller-id (non-private).
+    //   This matches the rule: "שיחה ננטשת חייבת להגיע עם מספר מזוהה".
     const hasName = safeStr(parsedLead?.full_name).length >= 2;
     const hasPhone = !!coercedPhone && digitsOnly(coercedPhone).length >= 9;
 
-    const hasReason = safeStr(parsedLead?.reason).length >= 6;
-    const hasNotes = safeStr(parsedLead?.notes).length >= 10;
-    const hasMeaningfulDetails = hasReason || hasNotes;
-
-    // If the customer explicitly provided/confirmed an alternate phone, count that as details.
-    // (Even if they did not provide a name yet.)
-    const callerILDigits = callerILLocal ? digitsOnly(callerILLocal) : "";
-    const coercedDigits = coercedPhone ? digitsOnly(coercedPhone) : "";
-    const altPhoneConfirmed =
-      !!hasPhone &&
-      (
-        parsedLead?.prefers_caller_id === false ||
-        (callerILDigits && coercedDigits && coercedDigits !== callerILDigits)
-      );
-
-    // Maintain the model flag when it is clearly a lead (name+phone).
+    // Maintain the model flag when it is clearly a full lead (name+phone).
     if (parsedLead && parsedLead.is_lead !== true && hasName && hasPhone) {
       parsedLead.is_lead = true;
     }
 
     const isFullLead = !!(hasName && hasPhone);
-    const isQualifiedLead = !!(hasPhone && (hasName || hasMeaningfulDetails || altPhoneConfirmed));
+    const isQualifiedLead = isFullLead;
     const call_status = mapCallStatus(reason, plannedEnd);
-
     // Wait (briefly) for Twilio recording callback to arrive, so webhooks can include a recording link.
     if (MB_ENABLE_RECORDING && callSid) {
       await waitForRecording(callSid, 12000);
