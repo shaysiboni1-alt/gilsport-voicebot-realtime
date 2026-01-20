@@ -1764,7 +1764,7 @@ wss.on("connection", async (twilioWs, req) => {
               const capSpoken = formatLast4ForHebrewSpeech(cap);
               logError(connId, "Model repeated wrong phone digits; forcing correction.", {
                 captured: cap,
-                model_said: said,
+                model_said: saidDigits,
               });
               try {
                 openAiWs.send(JSON.stringify({ type: "response.cancel" }));
