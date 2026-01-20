@@ -193,19 +193,9 @@ function normalizePhoneNumber(rawPhone, callerNumber) {
 }
 
 function extractBestPhoneFromText(text) {
-  const raw = String(text || "");
-
-  // Prefer explicit digit sequences; fallback to Hebrew digit-words.
-  const cand1 = digitsOnly(raw);
-  const cand2 = extractHebrewSpokenDigits(raw);
-
-  for (const cand of [cand1, cand2]) {
-    if (!cand) continue;
-    const norm = normalizePhoneNumber(cand, null);
-    if (norm) return norm;
-  }
-
-  return null;
+  const d = digitsOnly(text);
+  if (!d) return null;
+  return normalizePhoneNumber(d, null);
 }
 
 function isTranscriptGarbage(t, hasRealUserYet) {
@@ -371,125 +361,6 @@ const MB_LEAD_PARSING_MODEL = process.env.MB_LEAD_PARSING_MODEL || "gpt-4.1-mini
 // Twilio credentials (for hangup, recording URL, caller resolution)
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
-
-// -----------------------------
-// Twilio helpers (hangup, recording URL)
-// -----------------------------
-async function hangupTwilioCall(callSid, connId) {
-  if (!callSid) return;
-  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) return;
-
-  try {
-    const url = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls/${callSid}.json`;
-    const body = new URLSearchParams({ Status: "completed" });
-
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        Authorization:
-          "Basic " + Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64"),
-        "Content-Type": "application/x-www-form-urlencoded",
-      },
-      body,
-    });
-
-    if (!res.ok) {
-      const txt = await res.text().catch(() => "");
-      logError(connId, `Twilio hangup HTTP ${res.status}`, txt);
-    } else {
-      logInfo(connId, "Twilio hangup requested.");
-    }
-  } catch (err) {
-    logError(connId, "Twilio hangup error", err);
-  }
-}
-
-async function buildRecordingUrl(recordingSid) {
-  if (!recordingSid || !TWILIO_ACCOUNT_SID) return null;
-  return `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Recordings/${recordingSid}.mp3`;
-}
-
-// -------------------- Recording registry + public proxy --------------------
-// Twilio sends RecordingStatusCallback events asynchronously; we keep the latest per CallSid.
-const RECORDINGS = new Map();
-
-function getPublicOrigin() {
-  try {
-    if (!PUBLIC_BASE_URL) return "";
-    const u = new URL(PUBLIC_BASE_URL);
-    return `${u.protocol}//${u.host}`;
-  } catch {
-    return "";
-  }
-}
-
-function setRecordingForCall(callSid, { recordingSid, recordingUrl } = {}) {
-  const sid = safeStr(recordingSid);
-  const url = safeStr(recordingUrl);
-  if (!callSid) return;
-  const cur = RECORDINGS.get(callSid) || { callSid, recordingSid: "", recordingUrl: "", updatedAt: 0 };
-  if (sid) cur.recordingSid = sid;
-  if (url) cur.recordingUrl = url;
-  cur.updatedAt = Date.now();
-  RECORDINGS.set(callSid, cur);
-}
-
-function getRecordingForCall(callSid) {
-  return RECORDINGS.get(callSid) || { callSid, recordingSid: "", recordingUrl: "", updatedAt: 0 };
-}
-
-async function waitForRecording(callSid, timeoutMs) {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    const r = getRecordingForCall(callSid);
-    if (r.recordingSid || r.recordingUrl) return r;
-    await new Promise((resolve) => setTimeout(resolve, 250));
-  }
-  return getRecordingForCall(callSid);
-}
-
-function twilioBasicAuthHeader() {
-  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) return "";
-  const b64 = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64");
-  return `Basic ${b64}`;
-}
-
-async function startRecordingIfEnabled(callSid, connIdForLog) {
-  if (!MB_ENABLE_RECORDING) return { ok: false, reason: "recording_disabled" };
-  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) return { ok: false, reason: "twilio_auth_missing" };
-  if (!PUBLIC_BASE_URL) return { ok: false, reason: "public_base_url_missing" };
-
-  const cbUrl = `${getPublicOrigin()}/twilio-recording-callback`;
-  const url = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls/${callSid}/Recordings.json`;
-
-  const body = new URLSearchParams({
-    RecordingStatusCallback: cbUrl,
-    RecordingStatusCallbackMethod: "POST",
-    RecordingChannels: "dual",
-  });
-
-  try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        Authorization: twilioBasicAuthHeader(),
-        "Content-Type": "application/x-www-form-urlencoded",
-      },
-      body,
-    });
-    const json = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      logError(connIdForLog || "startup", "Recording start failed", { status: res.status, body: json });
-      return { ok: false, reason: "recording_start_failed", status: res.status };
-    }
-    const sid = safeStr(json?.sid || "");
-    if (sid) setRecordingForCall(callSid, { recordingSid: sid });
-    return { ok: true, reason: "recording_started", sid };
-  } catch (err) {
-    logError(connIdForLog || "startup", "Recording start error", err);
-    return { ok: false, reason: "recording_start_error" };
-  }
-}
 
 function logDebug(connId, msg, extra) {
   if (!MB_DEBUG) return;
@@ -726,93 +597,195 @@ function buildImportersList(settings) {
   return items.join("; ");
 }
 
+function buildSystemInstructionsFromSheets() {
+  const businessName = getSetting("BUSINESS_NAME", "GilSport");
+  const botName = getSetting("BOT_NAME", "נטע");
+
+  const opening = getSetting("OPENING_SCRIPT", "שלום! מדברת נטע מגיל ספורט במה אפשר לעזור?");
+  const closing = getSetting("CLOSING_SCRIPT", "תודה שפנית אלינו. יום נעים!");
+
+  const master = getPrompt("MASTER_PROMPT", "");
+  const guard = getPrompt("GUARDRAILS_PROMPT", "");
+  const kb = getPrompt("KB_PROMPT", "");
+
+  const vars = {
+    BUSINESS_NAME: businessName,
+    BOT_NAME: botName,
+    OPENING_SCRIPT: opening,
+    CLOSING_SCRIPT: closing,
+
+    WEBSITE_URL: getSetting("WEBSITE_URL", ""),
+    MAIN_PHONE: getSetting("MAIN_PHONE", ""),
+    WORKING_HOURS: getSetting("WORKING_HOURS", ""),
+    AFTER_HOURS_DELIVERY_RULE: getSetting("AFTER_HOURS_DELIVERY_RULE", ""),
+
+    // Commercial policy (must come from SETTINGS; never invented)
+    SALES_COUPON_CODE: getSetting("SALES_COUPON_CODE", ""),
+    PRICE_CLAIM_SENTENCE: getSetting("PRICE_CLAIM_SENTENCE", ""),
+    NO_DATA_MESSAGE: getSetting("NO_DATA_MESSAGE", ""),
+
+    // Dynamic lists derived from SETTINGS (no code changes needed when adding more entries)
+    DELIVERY_PHONES_LIST: buildDeliveryPhonesList(sheetsCache.settings),
+    IMPORTERS_LIST: buildImportersList(sheetsCache.settings),
+
+    // Backward-compatible placeholders (still supported)
+    DELIVERY_PHONE_1: getSetting("DELIVERY_PHONE_1", ""),
+    DELIVERY_PHONE_2: getSetting("DELIVERY_PHONE_2", ""),
+    DELIVERY_PHONE_3: getSetting("DELIVERY_PHONE_3", ""),
+
+    IMPORTER_VO2_NAME: getSetting("IMPORTER_VO2_NAME", ""),
+    IMPORTER_VO2_PHONE: getSetting("IMPORTER_VO2_PHONE", ""),
+
+    IMPORTER_A_NAME: getSetting("IMPORTER_A_NAME", ""),
+    IMPORTER_A_PHONE: getSetting("IMPORTER_A_PHONE", ""),
+    IMPORTER_B_NAME: getSetting("IMPORTER_B_NAME", ""),
+    IMPORTER_B_PHONE: getSetting("IMPORTER_B_PHONE", ""),
+    IMPORTER_C_NAME: getSetting("IMPORTER_C_NAME", ""),
+    IMPORTER_C_PHONE: getSetting("IMPORTER_C_PHONE", ""),
+  };
+
+  const combined = [master, guard, kb].filter(Boolean).join("\n\n");
+  const final = interpolateVars(combined, vars);
+
+  // Hard guardrails injected at runtime (even if PROMPTS are accidentally loosened).
+  // Keep this minimal and deterministic.
+  const hardPolicy = `
+כללי Runtime קשיחים:
+- קופון: מותר למסור קוד קופון אך ורק מתוך SETTINGS (SALES_COUPON_CODE). איסור מוחלט להמציא קוד. אם הערך חסר/ריק—להשתמש ב-NO_DATA_MESSAGE.
+- טענת מחיר/השוואה: מותר להגיב אך ורק במשפט מתוך SETTINGS (PRICE_CLAIM_SENTENCE). איסור מוחלט להמציא משפט חלופי. אם הערך חסר/ריק—להשתמש ב-NO_DATA_MESSAGE.
+`.trim();
+
+  const finalWithHardPolicy = [final, hardPolicy].filter(Boolean).join("\n\n");
+
+  return {
+    businessName,
+    botName,
+    opening,
+    closing,
+    instructions:
+      finalWithHardPolicy ||
+      `את/ה נציג/ת שירות ומכירה קולית בשם "${botName}" עבור "${businessName}". דבר/י בעברית כברירת מחדל, בלשון רבים, בטון שירותי וקצר.`,
+  };
+}
 
 // -----------------------------
-// Delivery phones structured parsing (for deterministic last4 + names)
+// Twilio helpers (hangup, recording URL)
 // -----------------------------
-function buildDeliveryPhonesStructured(settings) {
-  const entries = [];
-  for (const [k, v] of Object.entries(settings || {})) {
-    if (!String(k).startsWith("DELIVERY_PHONE_")) continue;
-    const raw = String(v || "").trim();
-    if (!raw) continue;
+async function hangupTwilioCall(callSid, connId) {
+  if (!callSid) return;
+  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) return;
 
-    const digits = digitsOnly(raw);
-    const phoneIL = toIsraeliLocalFromAny(digits || raw);
-    if (!phoneIL) continue;
+  try {
+    const url = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls/${callSid}.json`;
+    const body = new URLSearchParams({ Status: "completed" });
 
-    // Name is whatever remains after removing digits; deterministic.
-    let name = raw.replace(digits, " ").replace(/\s+/g, " ").trim();
-    name = name.replace(/[-–—:]+$/g, "").trim();
-    if (!name) name = "מוביל";
-
-    entries.push({
-      key: String(k),
-      name,
-      phone_il: phoneIL,
-      last4: last4Digits(phoneIL),
-      last4_spoken: formatLast4ForHebrewSpeech(phoneIL),
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization:
+          "Basic " + Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64"),
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body,
     });
-  }
 
-  // Stable ordering by numeric suffix when present.
-  entries.sort((a, b) => {
-    const sa = a.key.slice("DELIVERY_PHONE_".length);
-    const sb = b.key.slice("DELIVERY_PHONE_".length);
-    const na = parseInt(sa, 10);
-    const nb = parseInt(sb, 10);
-    const aNum = Number.isFinite(na);
-    const bNum = Number.isFinite(nb);
-    if (aNum && bNum) return na - nb;
-    if (aNum && !bNum) return -1;
-    if (!aNum && bNum) return 1;
-    return String(sa).localeCompare(String(sb));
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      logError(connId, `Twilio hangup HTTP ${res.status}`, txt);
+    } else {
+      logInfo(connId, "Twilio hangup requested.");
+    }
+  } catch (err) {
+    logError(connId, "Twilio hangup error", err);
+  }
+}
+
+async function buildRecordingUrl(recordingSid) {
+  if (!recordingSid || !TWILIO_ACCOUNT_SID) return null;
+  return `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Recordings/${recordingSid}.mp3`;
+}
+
+// -------------------- Recording registry + public proxy --------------------
+// Twilio sends RecordingStatusCallback events asynchronously; we keep the latest per CallSid.
+const RECORDINGS = new Map();
+
+function getPublicOrigin() {
+  try {
+    if (!PUBLIC_BASE_URL) return "";
+    const u = new URL(PUBLIC_BASE_URL);
+    return `${u.protocol}//${u.host}`;
+  } catch {
+    return "";
+  }
+}
+
+function setRecordingForCall(callSid, { recordingSid, recordingUrl } = {}) {
+  const sid = safeStr(recordingSid);
+  const url = safeStr(recordingUrl);
+  if (!callSid) return;
+  const cur = RECORDINGS.get(callSid) || { callSid, recordingSid: "", recordingUrl: "", updatedAt: 0 };
+  if (sid) cur.recordingSid = sid;
+  if (url) cur.recordingUrl = url;
+  cur.updatedAt = Date.now();
+  RECORDINGS.set(callSid, cur);
+}
+
+function getRecordingForCall(callSid) {
+  return RECORDINGS.get(callSid) || { callSid, recordingSid: "", recordingUrl: "", updatedAt: 0 };
+}
+
+async function waitForRecording(callSid, timeoutMs) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const r = getRecordingForCall(callSid);
+    if (r.recordingSid || r.recordingUrl) return r;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  return getRecordingForCall(callSid);
+}
+
+function twilioBasicAuthHeader() {
+  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) return "";
+  const b64 = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64");
+  return `Basic ${b64}`;
+}
+
+async function startRecordingIfEnabled(callSid, connIdForLog) {
+  if (!MB_ENABLE_RECORDING) return { ok: false, reason: "recording_disabled" };
+  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) return { ok: false, reason: "twilio_auth_missing" };
+  if (!PUBLIC_BASE_URL) return { ok: false, reason: "public_base_url_missing" };
+
+  const cbUrl = `${getPublicOrigin()}/twilio-recording-callback`;
+  const url = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls/${callSid}/Recordings.json`;
+
+  const body = new URLSearchParams({
+    RecordingStatusCallback: cbUrl,
+    RecordingStatusCallbackMethod: "POST",
+    RecordingChannels: "dual",
   });
 
-  return entries;
-}
-
-function buildDeliveryLast4AllowList(settings) {
-  const items = buildDeliveryPhonesStructured(settings);
-  const set = new Set();
-  for (const it of items) {
-    if (it && it.last4 && String(it.last4).length === 4) set.add(String(it.last4));
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: twilioBasicAuthHeader(),
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body,
+    });
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      logError(connIdForLog || "startup", "Recording start failed", { status: res.status, body: json });
+      return { ok: false, reason: "recording_start_failed", status: res.status };
+    }
+    const sid = safeStr(json?.sid || "");
+    if (sid) setRecordingForCall(callSid, { recordingSid: sid });
+    return { ok: true, reason: "recording_started", sid };
+  } catch (err) {
+    logError(connIdForLog || "startup", "Recording start error", err);
+    return { ok: false, reason: "recording_start_error" };
   }
-  return { items, set };
 }
-
-// -----------------------------
-// Lead notes cleanup before webhook (deterministic)
-// -----------------------------
-function cleanLeadNotes(notes, intent, deliveryNumbersProvided) {
-  const raw = String(notes || "").trim();
-  const i = String(intent || "").toLowerCase();
-  const addDelivery = i === "delivery" && !!deliveryNumbersProvided;
-
-  if (!raw) return addDelivery ? "נמסרו מספרי מובילים: כן." : null;
-
-  const parts = raw
-    .replace(/\r\n/g, "\n")
-    .split(/[\n.!?]+/)
-    .map((s) => s.trim())
-    .filter(Boolean);
-
-  const out = [];
-  for (const p of parts) {
-    const n = normalizeTextLoose(p);
-    if (!n) continue;
-    if (n.includes(normalizeTextLoose("יבואנ"))) continue;
-    if (n.includes(normalizeTextLoose("יבואנים"))) continue;
-    if (n.includes(normalizeTextLoose("מוביל"))) continue;
-    out.push(p);
-  }
-
-  if (addDelivery) out.push("נמסרו מספרי מובילים: כן.");
-
-  const joined = out.join(". ");
-  return joined ? joined + "." : null;
-}
-
 
 // -----------------------------
 // Lead parsing via Chat Completions
@@ -1307,11 +1280,6 @@ wss.on("connection", async (twilioWs, req) => {
   // Allowed business phone numbers (delivery/importers/main + caller-id). Used to prevent / correct hallucinated digits.
   let allowedPhonesDigits = new Set();
 
-  // Delivery phone disclosure tracking (deterministic).
-  let deliveryPhonesStructured = [];
-  let deliveryPhonesLast4Set = new Set();
-  let deliveryNumbersProvided = false;
-
   function refreshAllowedPhonesFromSheets() {
     const s = sheetsCache.settings || {};
     const out = new Set();
@@ -1330,17 +1298,7 @@ wss.on("connection", async (twilioWs, req) => {
       if (key.endsWith("_PHONE") || key.startsWith("DELIVERY_PHONE_")) pushMaybe(v);
     }
 
-    
     allowedPhonesDigits = out;
-
-    // Also refresh delivery phones structured list + last4 set (used for deterministic correction).
-    try {
-      deliveryPhonesStructured = buildDeliveryPhonesStructured(s);
-      deliveryPhonesLast4Set = new Set(deliveryPhonesStructured.map((x) => String(x.last4 || "").trim()).filter(Boolean));
-    } catch (_) {
-      deliveryPhonesStructured = [];
-      deliveryPhonesLast4Set = new Set();
-    }
   }
 
   function bestAllowedPhoneMatch(seqDigits) {
@@ -1465,67 +1423,6 @@ wss.on("connection", async (twilioWs, req) => {
     return false;
   }
 
-
-
-  function maybeCorrectDeliveryPhones(botText) {
-    // If the bot is disclosing delivery driver numbers, enforce that:
-    // - only known delivery phone entries from SETTINGS are used
-    // - last4 digits are correct
-    // - names are included (if available)
-    if (!botText) return false;
-    if (!deliveryPhonesStructured || deliveryPhonesStructured.length === 0) return false;
-
-    const norm = normalizeTextLoose(botText);
-    if (!norm.includes(normalizeTextLoose("מוביל"))) return false;
-
-    // Extract all digits that appear (including spaced digits), then chunk into groups of 4.
-    const all = extractHebrewSpokenDigits(botText) || "";
-    if (!all) return false;
-
-    // Heuristic: if we have at least one 4-digit chunk and the utterance is about movers,
-    // validate chunks against the allowed delivery last4 set.
-    const chunks = [];
-    for (let i = 0; i + 4 <= all.length && chunks.length < 6; i += 4) {
-      chunks.push(all.slice(i, i + 4));
-    }
-    const used = chunks.filter((c) => c && c.length === 4);
-    if (used.length === 0) return false;
-
-    const allValid = used.every((c) => deliveryPhonesLast4Set.has(c));
-
-    // Check whether at least one of the known mover names is mentioned.
-    const hasAnyName = deliveryPhonesStructured.some((p) => {
-      const nm = normalizeTextLoose(p.name || "");
-      return nm && norm.includes(nm);
-    });
-
-    if (allValid && hasAnyName) {
-      deliveryNumbersProvided = true;
-      return false;
-    }
-
-    // Force deterministic correction.
-    if (hasActiveResponse) {
-      try { openAiWs.send(JSON.stringify({ type: "response.cancel" })); } catch (_) {}
-    }
-    hasActiveResponse = false;
-    botSpeaking = false;
-    botTurnActive = false;
-
-    const parts = deliveryPhonesStructured
-      .map((p) => {
-        const name = (p.name || "").trim();
-        const last4 = formatLast4ForHebrewSpeech(p.phone_il || "");
-        return name ? `${name}: ${last4}` : `${last4}`;
-      })
-      .filter(Boolean)
-      .slice(0, 3);
-
-    const msg = `הנה מספרי המובילים: ${parts.join(", ")}. תרצו שאחזור על זה שוב?`;
-    deliveryNumbersProvided = true;
-    sendModelPrompt(openAiWs, `השיבי בדיוק כך, בלי לשנות ספרות ובלי להוסיף מספרים: "${msg}"`, "delivery_phones_correction");
-    return true;
-  }
   function isGoodbyeUtterance(text) {
     const { closing } = buildSystemInstructionsFromSheets();
     const t = normalizeTextLoose(text);
@@ -1666,8 +1563,7 @@ wss.on("connection", async (twilioWs, req) => {
     }
 
     const isFullLead = !!(hasName && hasPhone);
-    // Client rule: webhook call_status is determined solely by whether we have a full lead (name+valid phone).
-    const call_status = isFullLead ? "completed" : "abandoned";
+    const call_status = mapCallStatus(reason, plannedEnd);
 
     // Wait (briefly) for Twilio recording callback to arrive, so webhooks can include a recording link.
     if (MB_ENABLE_RECORDING && callSid) {
@@ -1682,11 +1578,6 @@ wss.on("connection", async (twilioWs, req) => {
     }
 
     const EVENT = mapEventHe(parsedLead?.intent);
-
-    // Post-process notes to avoid boilerplate about importers/movers...
-    if (parsedLead && typeof parsedLead === "object") {
-      parsedLead.notes = cleanLeadNotes(parsedLead.notes, parsedLead.intent, deliveryNumbersProvided);
-    }
 
     const payloadBase = {
       call_id: callSid || streamSid || `call_${Date.now()}`,
@@ -1852,12 +1743,6 @@ wss.on("connection", async (twilioWs, req) => {
             break;
           }
 
-          // 1b) If the bot is disclosing delivery mover numbers, enforce deterministic last4 + names.
-          if (maybeCorrectDeliveryPhones(text)) {
-            currentBotText = "";
-            break;
-          }
-
           // 2) Correct repeated-captured phone if model said different digits
           if (!phoneCorrectionSent && capturedPhoneIL) {
             const saidDigits = extractHebrewSpokenDigits(text) || digitsOnly(text);
@@ -1870,7 +1755,7 @@ wss.on("connection", async (twilioWs, req) => {
               const capSpoken = formatLast4ForHebrewSpeech(cap);
               logError(connId, "Model repeated wrong phone digits; forcing correction.", {
                 captured: cap,
-                model_said_last4: saidLast4 || null,
+                model_said: said,
               });
               try {
                 openAiWs.send(JSON.stringify({ type: "response.cancel" }));
@@ -1952,37 +1837,6 @@ wss.on("connection", async (twilioWs, req) => {
 
         conversationLog.push({ from: "user", text: t });
         logAlways(`[CALLER][${connId}] ${t}`);
-
-
-        // If the user asks a follow-up question after the bot already said the closing line,
-        // answer deterministically from SETTINGS (coupon / price claim) and then allow the call to hang up.
-        if (goodbyePendingHangup && MB_HANGUP_AFTER_GOODBYE && !callEnded) {
-          const nt = normalizeTextLoose(t);
-          const noData = getSetting("NO_DATA_MESSAGE", "אין לי מידע על זה כרגע, אוכל לקחת פרטים ונציג יחזור אליכם.");
-
-          // Coupon / discount
-          if (nt.includes(normalizeTextLoose("קופון")) || nt.includes(normalizeTextLoose("הנחה")) || nt.includes(normalizeTextLoose("קוד"))) {
-            const coupon = String(getSetting("SALES_COUPON_CODE", "")).trim();
-            const say = coupon ? `${coupon}. תרצו שאחזור על זה?` : `${noData} תרצו שאקח פרטים לחזרה?`;
-            // Cancel any active response and answer now.
-            try { openAiWs.send(JSON.stringify({ type: "response.cancel" })); } catch (_) {}
-            hasActiveResponse = false;
-            botSpeaking = false;
-            botTurnActive = false;
-            sendModelPrompt(openAiWs, `השיבי בדיוק כך, בלי לשנות: "${say}"`, "post_close_coupon");
-          }
-
-          // Price claim / better price
-          if (nt.includes(normalizeTextLoose("מחיר")) || nt.includes(normalizeTextLoose("יותר זול")) || nt.includes(normalizeTextLoose("יותר טוב")) || nt.includes(normalizeTextLoose("השווא"))) {
-            const claim = String(getSetting("PRICE_CLAIM_SENTENCE", "")).trim();
-            const say = claim ? `${claim}. תרצו שאחזור על זה?` : `${noData} תרצו שאקח פרטים לחזרה?`;
-            try { openAiWs.send(JSON.stringify({ type: "response.cancel" })); } catch (_) {}
-            hasActiveResponse = false;
-            botSpeaking = false;
-            botTurnActive = false;
-            sendModelPrompt(openAiWs, `השיבי בדיוק כך, בלי לשנות: "${say}"`, "post_close_price_claim");
-          }
-        }
 
         const gPref = detectGenderPreference(t);
         if (gPref && gPref !== preferredGender) {
