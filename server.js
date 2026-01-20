@@ -94,15 +94,6 @@ function formatDigitsForHebrewSpeech(d) {
   return s ? s.split("").join(" ") : "";
 }
 
-// Speak only the last 4 digits (space-separated) to minimize TTS digit-loss.
-// IMPORTANT: This is intentional across ALL flows (caller-id, alternate phone, delivery phones, etc.).
-function formatLast4ForHebrewSpeech(d) {
-  const s = digitsOnly(d);
-  if (!s) return "";
-  const last4 = s.slice(-4);
-  return last4.split("").join(" ");
-}
-
 // Extract a digit string from Hebrew digit-words in model output.
 // Supports common variants and strips niqqud/punctuation.
 function extractHebrewSpokenDigits(text) {
@@ -613,13 +604,6 @@ function buildSystemInstructionsFromSheets() {
     WORKING_HOURS: getSetting("WORKING_HOURS", ""),
     AFTER_HOURS_DELIVERY_RULE: getSetting("AFTER_HOURS_DELIVERY_RULE", ""),
 
-    // Sales helpers from SETTINGS
-    SALES_COUPON_CODE: getSetting("SALES_COUPON_CODE", ""),
-    PRICE_CLAIM_SENTENCE: getSetting("PRICE_CLAIM_SENTENCE", ""),
-
-    // Generic fallback line from SETTINGS
-    NO_DATA_MESSAGE: getSetting("NO_DATA_MESSAGE", ""),
-
     // Dynamic lists derived from SETTINGS (no code changes needed when adding more entries)
     DELIVERY_PHONES_LIST: buildDeliveryPhonesList(sheetsCache.settings),
     IMPORTERS_LIST: buildImportersList(sheetsCache.settings),
@@ -641,24 +625,7 @@ function buildSystemInstructionsFromSheets() {
   };
 
   const combined = [master, guard, kb].filter(Boolean).join("\n\n");
-  let final = interpolateVars(combined, vars);
-
-  // Hard runtime rules (keep behavior consistent even when the prompts change)
-  // 1) Phone readout: ONLY last 4 digits across all flows to avoid digit-loss in TTS.
-  final +=
-    "\n\n" +
-    "כלל טלפונים (חובה): בכל מצב שבו את מקריאה מספר טלפון (מזוהה/חלופי/מובילים/טלפון ראשי/כל מספר אחר) — אל תקראי מספר מלא. " +
-    "קוראים אך ורק את 4 הספרות האחרונות, ספרה-ספרה עם רווחים, ואז שאלה אחת בלבד: \"רשמתם נכון?\".";
-
-  // 2) Sales: pin coupon + price-claim sentence explicitly from SETTINGS to prevent hallucinations.
-  const coupon = safeStr(vars.SALES_COUPON_CODE);
-  const priceClaim = safeStr(vars.PRICE_CLAIM_SENTENCE);
-  if (coupon) {
-    final += `\n\nקוד הקופון הרשמי למכירות הוא: ${coupon}. אין להמציא קופונים אחרים.`;
-  }
-  if (priceClaim) {
-    final += `\n\nמשפט החיזוק הרשמי לטענת מחיר הוא: ${priceClaim}. השתמשו רק בו, ללא ניסוחים חלופיים.`;
-  }
+  const final = interpolateVars(combined, vars);
 
   return {
     businessName,
@@ -1368,7 +1335,7 @@ wss.on("connection", async (twilioWs, req) => {
       const strictSpoken = extractHebrewSpokenDigits(botText) || digitsOnly(botText);
       if (!strictSpoken || strictSpoken.length < 7 || strictSpoken.length > 12 || strictSpoken !== strictExpected) {
         phoneHallucinationCorrectionSent = true;
-        const expectedSpoken = formatLast4ForHebrewSpeech(strictExpected);
+        const expectedSpoken = formatDigitsForHebrewSpeech(strictExpected);
 
         logError(connId, "Model spoke a validated phone number incorrectly; forcing correction.", {
           said: strictSpoken || null,
@@ -1388,7 +1355,7 @@ wss.on("connection", async (twilioWs, req) => {
 
         sendModelPrompt(
           openAiWs,
-          `תיקון חובה: ארבע הספרות האחרונות הנכונות הן "${expectedSpoken}". הקריאו אותן בדיוק ספרה-ספרה ושאלו שאלה אחת בלבד לאישור: "זה נכון?"`,
+          `תיקון חובה: המספר הנכון הוא "${expectedSpoken}". הקריאו אותו בדיוק ספרה-ספרה (מילות ספרות בעברית עם פסיקים) ושאלו שאלה אחת בלבד לאישור: "זה נכון?"`,
           "validated_phone_correction"
         );
 
@@ -1407,7 +1374,7 @@ wss.on("connection", async (twilioWs, req) => {
       if (!m) continue;
 
       phoneHallucinationCorrectionSent = true;
-      const expectedSpoken = formatLast4ForHebrewSpeech(m.expected);
+      const expectedSpoken = formatDigitsForHebrewSpeech(m.expected);
 
       logError(connId, "Model spoke a business phone number incorrectly; forcing correction.", m);
 
@@ -1424,7 +1391,7 @@ wss.on("connection", async (twilioWs, req) => {
 
       sendModelPrompt(
         openAiWs,
-        `תיקון חובה: ארבע הספרות האחרונות הנכונות הן "${expectedSpoken}". הקריאו אותן בדיוק ספרה-ספרה ושאלו: "זה נכון?" בלי תוספות.`,
+        `תיקון חובה: המספר הנכון הוא "${expectedSpoken}". הקריאו אותו בדיוק ספרה-ספרה (מילות ספרות בעברית עם פסיקים) ושאלו: "זה נכון?" בלי תוספות.`,
         "business_phone_correction"
       );
 
@@ -1620,15 +1587,7 @@ wss.on("connection", async (twilioWs, req) => {
 
     if (MB_ENABLE_LEAD_CAPTURE && MB_WEBHOOK_URL && isFullLead) {
       await sendWebhook(MB_WEBHOOK_URL, payloadBase, connId, "FINAL Lead");
-    }
-
-    if (
-      MB_ENABLE_ABANDONED_WEBHOOK &&
-      MB_ABANDONED_WEBHOOK_URL &&
-      !isFullLead &&
-      isAbandonedReason(reason) &&
-      !plannedEnd
-    ) {
+    } else if (MB_ENABLE_ABANDONED_WEBHOOK && MB_ABANDONED_WEBHOOK_URL && !isFullLead) {
       await sendWebhook(MB_ABANDONED_WEBHOOK_URL, payloadBase, connId, "ABANDONED");
     }
 
@@ -1753,7 +1712,7 @@ wss.on("connection", async (twilioWs, req) => {
             const cap = digitsOnly(capturedPhoneIL);
             if (said && said.length >= 7 && cap && said !== cap) {
               phoneCorrectionSent = true;
-              const capSpoken = formatLast4ForHebrewSpeech(cap);
+              const capSpoken = formatDigitsForHebrewSpeech(cap);
               logError(connId, "Model repeated wrong phone digits; forcing correction.", {
                 captured: cap,
                 model_said: said,
@@ -1927,9 +1886,9 @@ wss.on("connection", async (twilioWs, req) => {
       if (callerIL) {
         allowedPhonesDigits.add(digitsOnly(callerIL));
 
-        const callerSpoken = formatLast4ForHebrewSpeech(callerIL);
+        const callerSpoken = formatDigitsForHebrewSpeech(callerIL);
         queueSessionAddon(
-          `מספר הטלפון המזוהה של המתקשר: ${callerIL}. כשאת שואלת האם לחזור למספר המזוהה—את מקריאה **רק את 4 הספרות האחרונות** (ספרה-ספרה) בדיוק כך: "${callerSpoken}". אין להקריא את כל המספר, ואין להוסיף/להחסיר ספרות.`,
+          `מספר הטלפון המזוהה של המתקשר הוא (להקראה מדויקת): "${callerSpoken}". כשאת שואלת האם לחזור למספר המזוהה—חובה להקריא את המספר במלואו ספרה-ספרה בדיוק בפורמט הזה (מילות ספרות בעברית עם פסיקים). לעולם אל תגידי שאינך רואה/יודעת את המספר, ולעולם אל תחסירי/תוסיפי ספרה.`,
           "caller_id"
         );
       }
