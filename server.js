@@ -619,6 +619,11 @@ function buildSystemInstructionsFromSheets() {
     WORKING_HOURS: getSetting("WORKING_HOURS", ""),
     AFTER_HOURS_DELIVERY_RULE: getSetting("AFTER_HOURS_DELIVERY_RULE", ""),
 
+    // Commercial policy (must come from SETTINGS; never invented)
+    SALES_COUPON_CODE: getSetting("SALES_COUPON_CODE", ""),
+    PRICE_CLAIM_SENTENCE: getSetting("PRICE_CLAIM_SENTENCE", ""),
+    NO_DATA_MESSAGE: getSetting("NO_DATA_MESSAGE", ""),
+
     // Dynamic lists derived from SETTINGS (no code changes needed when adding more entries)
     DELIVERY_PHONES_LIST: buildDeliveryPhonesList(sheetsCache.settings),
     IMPORTERS_LIST: buildImportersList(sheetsCache.settings),
@@ -642,13 +647,23 @@ function buildSystemInstructionsFromSheets() {
   const combined = [master, guard, kb].filter(Boolean).join("\n\n");
   const final = interpolateVars(combined, vars);
 
+  // Hard guardrails injected at runtime (even if PROMPTS are accidentally loosened).
+  // Keep this minimal and deterministic.
+  const hardPolicy = `
+כללי Runtime קשיחים:
+- קופון: מותר למסור קוד קופון אך ורק מתוך SETTINGS (SALES_COUPON_CODE). איסור מוחלט להמציא קוד. אם הערך חסר/ריק—להשתמש ב-NO_DATA_MESSAGE.
+- טענת מחיר/השוואה: מותר להגיב אך ורק במשפט מתוך SETTINGS (PRICE_CLAIM_SENTENCE). איסור מוחלט להמציא משפט חלופי. אם הערך חסר/ריק—להשתמש ב-NO_DATA_MESSAGE.
+`.trim();
+
+  const finalWithHardPolicy = [final, hardPolicy].filter(Boolean).join("\n\n");
+
   return {
     businessName,
     botName,
     opening,
     closing,
     instructions:
-      final ||
+      finalWithHardPolicy ||
       `את/ה נציג/ת שירות ומכירה קולית בשם "${botName}" עבור "${businessName}". דבר/י בעברית כברירת מחדל, בלשון רבים, בטון שירותי וקצר.`,
   };
 }
@@ -824,6 +839,19 @@ function coerceLeadFields(obj) {
 
   out.brand = getLoose(["brand", "מותג"]) || null;
   out.model = getLoose(["model", "דגם"]) || null;
+  // Message routing target (intent="message")
+  out.message_for = getLoose([
+    "message_for",
+    "messagefor",
+    "for_whom",
+    "forwhom",
+    "recipient",
+    "target",
+    "עבורמי",
+    "עבור מי",
+    "למי",
+    "אל מי",
+  ]) || null;
   out.reason = getLoose(["reason", "סיבת_פנייה", "סיבתפנייה", "תקלה"]) || null;
   out.notes = getLoose(["notes", "הערות"]) || null;
 
@@ -856,7 +884,7 @@ async function ensureHebrewLeadFields(lead, conversationText, connId, botName, b
 You normalize call lead objects.
 Return ONLY valid JSON (no extra text).
 Output MUST keep the exact schema keys:
-{"is_lead":boolean,"intent":"sales"|"support"|"delivery"|"message"|"unknown","full_name":string|null,"phone_number":string|null,"prefers_caller_id":boolean|null,"brand":string|null,"model":string|null,"reason":string|null,"notes":string|null}
+	{"is_lead":boolean,"intent":"sales"|"support"|"delivery"|"message"|"unknown","full_name":string|null,"phone_number":string|null,"prefers_caller_id":boolean|null,"brand":string|null,"model":string|null,"message_for":string|null,"reason":string|null,"notes":string|null}
 Rules:
 - Translate reason and notes to Hebrew, professional and clear.
 - Expand notes to be explicit (what happened, what was requested, any number given such as importer/delivery).
@@ -937,6 +965,9 @@ async function extractLeadFromConversation(conversationLog, connId, botName, bus
     const systemAddon = `
 חובה: להחזיר JSON תקין בלבד (ללא טקסט נוסף).
 חובה: השדות reason ו-notes בעברית (אפשר לתרגם מתוכן השיחה), כולל ציון מפורש אם נמסר מספר יבואן/מוביל.
+	חובה: phone_number (אם קיים) חייב להיות מספר ישראלי מלא (0XXXXXXXXX/0XXXXXXXXXX לאחר normalize) — 4 ספרות אחרונות בלבד אינן טלפון תקין ואסור להחזיר אותן כשדה phone_number.
+	חובה: אם intent="message" — מלאו message_for (עבור מי ההודעה) במפורש.
+	חובה: אם intent הוא "sales" או "support" — מלאו brand ו-model גם אם הלקוח אמר שאין/לא יודע; במקרה כזה כתבו את ניסוח הלקוח כפי שנאמר (לדוגמה: "אין מותג" / "לא יודע דגם"), ואל תשאירו null.
 `.trim();
 
     const response = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -980,80 +1011,6 @@ async function extractLeadFromConversation(conversationLog, connId, botName, bus
   } catch (err) {
     logError(connId, "Lead parse error", err);
     return null;
-  }
-}
-
-function hasHebrew(text) {
-  return /[\u0590-\u05FF]/.test(String(text || ""));
-}
-
-function isMostlyNonHebrew(text) {
-  const s = String(text || "").trim();
-  if (!s) return false;
-  const heb = (s.match(/[\u0590-\u05FF]/g) || []).length;
-  const lat = (s.match(/[A-Za-z]/g) || []).length;
-  // If there's meaningful Latin and almost no Hebrew, treat as non-Hebrew.
-  return lat >= 6 && heb < 3;
-}
-
-async function ensureHebrewLeadFields(leadObj, conversationText, connId, botName, businessName) {
-  // We only enforce Hebrew for reason/notes (names can legitimately be in Latin).
-  const reasonBad = isMostlyNonHebrew(leadObj?.reason);
-  const notesBad = isMostlyNonHebrew(leadObj?.notes);
-  if (!reasonBad && !notesBad) return leadObj;
-  if (!OPENAI_API_KEY) return leadObj;
-
-  try {
-    const systemPrompt = `
-You normalize call-lead JSON fields. Return ONLY valid JSON (no extra text).
-Goal: reason and notes MUST be in Hebrew, detailed, and business-useful.
-If the caller spoke English, translate to Hebrew.
-Include: what the customer reported, brand/model if present, and if an importer phone was provided (mention it).
-Keep the same schema keys.
-`.trim();
-
-    const userPrompt = `
-Bot name: "${botName}". Business: "${businessName}".
-Original extracted lead JSON:
-${JSON.stringify(leadObj)}
-
-Transcript:
-${conversationText}
-`.trim();
-
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: MB_LEAD_PARSING_MODEL,
-        response_format: { type: "json_object" },
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: userPrompt },
-        ],
-      }),
-    });
-
-    if (!response.ok) return leadObj;
-    const data = await response.json();
-    const raw = data.choices?.[0]?.message?.content;
-    if (!raw) return leadObj;
-
-    let parsed;
-    try {
-      parsed = JSON.parse(raw);
-    } catch (_) {
-      parsed = null;
-    }
-    if (!parsed || typeof parsed !== "object") return leadObj;
-
-    const coerced = coerceLeadFields(parsed);
-    // Preserve phone_number if we already normalized it later.
-    if (leadObj?.phone_number) coerced.phone_number = leadObj.phone_number;
-    return coerced;
-  } catch (err) {
-    logError(connId, "ensureHebrewLeadFields error", err);
-    return leadObj;
   }
 }
 
@@ -1221,6 +1178,54 @@ async function sendWebhook(url, payload, connId, label) {
 }
 
 // -----------------------------
+// Lead post-processing helpers (minimal, deterministic)
+// -----------------------------
+function extractMessageForFromConversation(conversationLog) {
+  if (!Array.isArray(conversationLog) || conversationLog.length === 0) return null;
+  for (let i = 0; i < conversationLog.length - 1; i++) {
+    const cur = conversationLog[i];
+    const next = conversationLog[i + 1];
+    if (!cur || !next) continue;
+    if (cur.from !== "bot" || next.from !== "user") continue;
+    const b = normalizeTextLoose(cur.text || "");
+    if (!b) continue;
+    // Any variant of "for whom is the message"
+    if (b.includes(normalizeTextLoose("עבור מי")) || b.includes(normalizeTextLoose("למי ההודעה")) || b.includes(normalizeTextLoose("ההודעה מיועדת"))) {
+      const ans = safeStr(next.text);
+      return ans && ans.length >= 2 ? ans : null;
+    }
+  }
+  return null;
+}
+
+function extractBrandModelFallback(conversationLog) {
+  const out = { brand: null, model: null };
+  if (!Array.isArray(conversationLog) || conversationLog.length === 0) return out;
+
+  const userText = conversationLog
+    .filter((m) => m && m.from === "user")
+    .map((m) => String(m.text || "").trim())
+    .filter(Boolean)
+    .join(" \n");
+
+  const norm = normalizeTextLoose(userText);
+  if (!norm) return out;
+
+  // If the caller explicitly says there is no brand/model, capture that verbatim-ish.
+  if (/(אין|לא\s*יודע|לא\s*בטוח).{0,12}(מותג)/.test(norm)) out.brand = "אין מותג";
+  if (/(אין|לא\s*יודע|לא\s*בטוח).{0,12}(דגם)/.test(norm)) out.model = "אין דגם";
+
+  // If the caller gave a product type as "model" (common: "אופניים", "הליכון"), keep it.
+  // We do not attempt deep NLP here; this is only a fallback when fields are empty.
+  if (!out.model) {
+    const candidates = (userText.match(/[\u0590-\u05FF]{3,}/g) || []).slice(0, 8);
+    if (candidates.length) out.model = candidates.join(" ").slice(0, 60);
+  }
+
+  return out;
+}
+
+// -----------------------------
 // Per-call handler
 // -----------------------------
 wss.on("connection", async (twilioWs, req) => {
@@ -1271,34 +1276,6 @@ wss.on("connection", async (twilioWs, req) => {
   let baseInstructions = null;
 
   let conversationLog = [];
-
-  // Deterministic overrides: coupon-only / price-claim
-  // If the caller explicitly asks only for a coupon code, we respond with the exact code from SETTINGS (no extra words).
-  // If the caller makes a price-claim / price comparison, we respond with the exact PRICE_CLAIM_SENTENCE from SETTINGS (no extra words).
-  let forceDeterministicReply = null; // { type: 'coupon'|'price', text: string }
-
-  function isCouponOnlyRequest(userText) {
-    const t = normalizeTextLoose(userText);
-    if (!t) return false;
-    // Strong coupon keywords
-    const hasCoupon = t.includes(normalizeTextLoose("קופון")) || t.includes(normalizeTextLoose("קוד קופון")) || t.includes(normalizeTextLoose("קופון הנחה"));
-    if (!hasCoupon) return false;
-    // If they mention products/service/support/delivery, it's not coupon-only.
-    const blockers = ["תקלה","שירות","תמיכה","יבואן","אספקה","מוביל","משלוח","הזמנה","קנייה","רכישה","הליכון","אופניים","מחיר","הנחה על","הצעת מחיר","דגם","מותג","בעיה","חלק","תיקון","זיכוי","החלפה"]; 
-    for (const b of blockers) {
-      if (t.includes(normalizeTextLoose(b))) return false;
-    }
-    return true;
-  }
-
-  function isPriceClaimRequest(userText) {
-    const t = normalizeTextLoose(userText);
-    if (!t) return false;
-    // Price-claim indicators (comparison / match / cheaper elsewhere)
-    const patterns = ["יותר זול","זול יותר","אצל","במקום אחר","השוואת מחיר","להשוות מחיר","תחרות","תתאימו מחיר","התאמת מחיר","להוריד מחיר","מחיר אחר","מחיר זול","מצאתי בזול","באמזון","בזאפ","זאפ"]; 
-    return patterns.some((p) => t.includes(normalizeTextLoose(p)));
-  }
-
 
   // Allowed business phone numbers (delivery/importers/main + caller-id). Used to prevent / correct hallucinated digits.
   let allowedPhonesDigits = new Set();
@@ -1546,6 +1523,21 @@ wss.on("connection", async (twilioWs, req) => {
 
     if (parsedLead && typeof parsedLead === "object") {
       parsedLead.phone_number = coercedPhone;
+
+	  // Ensure message target is captured as a separate field (intent="message").
+	  if (String(parsedLead.intent || "").toLowerCase() === "message") {
+	    if (!safeStr(parsedLead.message_for)) {
+	      parsedLead.message_for = extractMessageForFromConversation(conversationLog) || null;
+	    }
+	  }
+
+	  // Ensure brand/model are never null for sales/support: if caller said "no brand/model", keep that.
+	  const intent = String(parsedLead.intent || "").toLowerCase();
+	  if (intent === "sales" || intent === "support") {
+	    const fb = extractBrandModelFallback(conversationLog);
+	    if (!safeStr(parsedLead.brand)) parsedLead.brand = fb.brand || "לא צוין";
+	    if (!safeStr(parsedLead.model)) parsedLead.model = fb.model || "לא צוין";
+	  }
     }
 
     // If the model forgot to set is_lead=true on a completed "message" flow,
@@ -1561,36 +1553,16 @@ wss.on("connection", async (twilioWs, req) => {
       }
     }
 
-    // Lead routing logic:
-    // - "Full lead" (unchanged definition): full_name + valid phone -> FINAL webhook.
-    // - FINAL Lead webhook is sent ONLY for a "full lead": full_name + valid phone.
-// - ABANDONED webhook is sent when the call ends without a full lead, but there is a caller-id (non-private).
-
+    // Full lead definition (client rule): lead is considered "not abandoned" only if we have
+    // at least a name and a valid Israeli phone number to call back.
+    // Do NOT rely solely on the model's is_lead flag.
     const hasName = safeStr(parsedLead?.full_name).length >= 2;
     const hasPhone = !!coercedPhone && digitsOnly(coercedPhone).length >= 9;
-
-    const hasReason = safeStr(parsedLead?.reason).length >= 6;
-    const hasNotes = safeStr(parsedLead?.notes).length >= 10;
-    const hasMeaningfulDetails = hasReason || hasNotes;
-
-    // If the customer explicitly provided/confirmed an alternate phone, count that as details.
-    // (Even if they did not provide a name yet.)
-    const callerILDigits = callerILLocal ? digitsOnly(callerILLocal) : "";
-    const coercedDigits = coercedPhone ? digitsOnly(coercedPhone) : "";
-    const altPhoneConfirmed =
-      !!hasPhone &&
-      (
-        parsedLead?.prefers_caller_id === false ||
-        (callerILDigits && coercedDigits && coercedDigits !== callerILDigits)
-      );
-
-    // Maintain the model flag when it is clearly a lead (name+phone).
     if (parsedLead && parsedLead.is_lead !== true && hasName && hasPhone) {
       parsedLead.is_lead = true;
     }
 
     const isFullLead = !!(hasName && hasPhone);
-    const isQualifiedLead = isFullLead;
     const call_status = mapCallStatus(reason, plannedEnd);
 
     // Wait (briefly) for Twilio recording callback to arrive, so webhooks can include a recording link.
@@ -1644,7 +1616,6 @@ wss.on("connection", async (twilioWs, req) => {
       parsedLeadCollection: {
         ...(parsedLead || {}),
         isFullLead: !!isFullLead,
-        isQualifiedLead: !!isQualifiedLead,
       },
     };
 
@@ -1652,14 +1623,9 @@ wss.on("connection", async (twilioWs, req) => {
       await sendWebhook(MB_CALL_LOG_WEBHOOK_URL, payloadBase, connId, "CallLog");
     }
 
-    if (MB_ENABLE_LEAD_CAPTURE && MB_WEBHOOK_URL && isQualifiedLead) {
+    if (MB_ENABLE_LEAD_CAPTURE && MB_WEBHOOK_URL && isFullLead) {
       await sendWebhook(MB_WEBHOOK_URL, payloadBase, connId, "FINAL Lead");
-    } else if (
-      MB_ENABLE_ABANDONED_WEBHOOK &&
-      MB_ABANDONED_WEBHOOK_URL &&
-      !isQualifiedLead &&
-      !!callerILLocal
-    ) {
+    } else if (MB_ENABLE_ABANDONED_WEBHOOK && MB_ABANDONED_WEBHOOK_URL && !isFullLead) {
       await sendWebhook(MB_ABANDONED_WEBHOOK_URL, payloadBase, connId, "ABANDONED");
     }
 
@@ -1789,7 +1755,7 @@ wss.on("connection", async (twilioWs, req) => {
               const capSpoken = formatLast4ForHebrewSpeech(cap);
               logError(connId, "Model repeated wrong phone digits; forcing correction.", {
                 captured: cap,
-                model_said: saidDigits,
+                model_said: said,
               });
               try {
                 openAiWs.send(JSON.stringify({ type: "response.cancel" }));
@@ -1871,42 +1837,6 @@ wss.on("connection", async (twilioWs, req) => {
 
         conversationLog.push({ from: "user", text: t });
         logAlways(`[CALLER][${connId}] ${t}`);
-
-        // Deterministic override for coupon-only / price-claim: cancel any auto response and force an exact reply.
-        // This is intentionally narrow to avoid affecting other flows.
-        const couponCode = safeStr(getSetting("SALES_COUPON_CODE", ""));
-        const priceClaimSentence = safeStr(getSetting("PRICE_CLAIM_SENTENCE", ""));
-
-        if (isCouponOnlyRequest(t)) {
-          if (couponCode) {
-            forceDeterministicReply = { type: "coupon", text: couponCode };
-          } else {
-            forceDeterministicReply = { type: "coupon", text: "אין קוד קופון זמין כרגע. תרצו להשאיר פרטים לחזרה?" };
-          }
-        } else if (isPriceClaimRequest(t)) {
-          if (priceClaimSentence) {
-            forceDeterministicReply = { type: "price", text: priceClaimSentence };
-          } else {
-            forceDeterministicReply = { type: "price", text: "אין מידע זמין לגבי התאמת מחיר כרגע. תרצו להשאיר פרטים לחזרה?" };
-          }
-        } else {
-          forceDeterministicReply = null;
-        }
-
-        if (forceDeterministicReply && openAiReady && openAiWs && openAiWs.readyState === WebSocket.OPEN) {
-          // Try to cancel any in-flight response quickly, then force a minimal deterministic response.
-          try { openAiWs.send(JSON.stringify({ type: "response.cancel" })); } catch (_) {}
-          hasActiveResponse = false;
-          botSpeaking = false;
-          botTurnActive = false;
-
-          sendModelPrompt(
-            openAiWs,
-            `תשובה חובה וללא תוספות: אמרי בדיוק את הטקסט הבא בלבד: "${forceDeterministicReply.text}"`,
-            "deterministic_override"
-          );
-        }
-
 
         const gPref = detectGenderPreference(t);
         if (gPref && gPref !== preferredGender) {
