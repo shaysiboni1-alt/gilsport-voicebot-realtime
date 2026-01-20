@@ -372,6 +372,125 @@ const MB_LEAD_PARSING_MODEL = process.env.MB_LEAD_PARSING_MODEL || "gpt-4.1-mini
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
 
+// -----------------------------
+// Twilio helpers (hangup, recording URL)
+// -----------------------------
+async function hangupTwilioCall(callSid, connId) {
+  if (!callSid) return;
+  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) return;
+
+  try {
+    const url = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls/${callSid}.json`;
+    const body = new URLSearchParams({ Status: "completed" });
+
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization:
+          "Basic " + Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64"),
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body,
+    });
+
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      logError(connId, `Twilio hangup HTTP ${res.status}`, txt);
+    } else {
+      logInfo(connId, "Twilio hangup requested.");
+    }
+  } catch (err) {
+    logError(connId, "Twilio hangup error", err);
+  }
+}
+
+async function buildRecordingUrl(recordingSid) {
+  if (!recordingSid || !TWILIO_ACCOUNT_SID) return null;
+  return `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Recordings/${recordingSid}.mp3`;
+}
+
+// -------------------- Recording registry + public proxy --------------------
+// Twilio sends RecordingStatusCallback events asynchronously; we keep the latest per CallSid.
+const RECORDINGS = new Map();
+
+function getPublicOrigin() {
+  try {
+    if (!PUBLIC_BASE_URL) return "";
+    const u = new URL(PUBLIC_BASE_URL);
+    return `${u.protocol}//${u.host}`;
+  } catch {
+    return "";
+  }
+}
+
+function setRecordingForCall(callSid, { recordingSid, recordingUrl } = {}) {
+  const sid = safeStr(recordingSid);
+  const url = safeStr(recordingUrl);
+  if (!callSid) return;
+  const cur = RECORDINGS.get(callSid) || { callSid, recordingSid: "", recordingUrl: "", updatedAt: 0 };
+  if (sid) cur.recordingSid = sid;
+  if (url) cur.recordingUrl = url;
+  cur.updatedAt = Date.now();
+  RECORDINGS.set(callSid, cur);
+}
+
+function getRecordingForCall(callSid) {
+  return RECORDINGS.get(callSid) || { callSid, recordingSid: "", recordingUrl: "", updatedAt: 0 };
+}
+
+async function waitForRecording(callSid, timeoutMs) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const r = getRecordingForCall(callSid);
+    if (r.recordingSid || r.recordingUrl) return r;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  return getRecordingForCall(callSid);
+}
+
+function twilioBasicAuthHeader() {
+  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) return "";
+  const b64 = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64");
+  return `Basic ${b64}`;
+}
+
+async function startRecordingIfEnabled(callSid, connIdForLog) {
+  if (!MB_ENABLE_RECORDING) return { ok: false, reason: "recording_disabled" };
+  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) return { ok: false, reason: "twilio_auth_missing" };
+  if (!PUBLIC_BASE_URL) return { ok: false, reason: "public_base_url_missing" };
+
+  const cbUrl = `${getPublicOrigin()}/twilio-recording-callback`;
+  const url = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls/${callSid}/Recordings.json`;
+
+  const body = new URLSearchParams({
+    RecordingStatusCallback: cbUrl,
+    RecordingStatusCallbackMethod: "POST",
+    RecordingChannels: "dual",
+  });
+
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: twilioBasicAuthHeader(),
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body,
+    });
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      logError(connIdForLog || "startup", "Recording start failed", { status: res.status, body: json });
+      return { ok: false, reason: "recording_start_failed", status: res.status };
+    }
+    const sid = safeStr(json?.sid || "");
+    if (sid) setRecordingForCall(callSid, { recordingSid: sid });
+    return { ok: true, reason: "recording_started", sid };
+  } catch (err) {
+    logError(connIdForLog || "startup", "Recording start error", err);
+    return { ok: false, reason: "recording_start_error" };
+  }
+}
+
 function logDebug(connId, msg, extra) {
   if (!MB_DEBUG) return;
   if (extra !== undefined) console.log(`[DEBUG] [${connId}] ${msg}`, extra);
