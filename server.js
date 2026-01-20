@@ -264,89 +264,6 @@ function isLowValueUtterance(raw) {
   return false;
 }
 
-
-// Semantic gate: treat only meaningful transcripts as real user turns.
-// This prevents the bot from responding to background noise that Whisper sometimes transcribes.
-// IMPORTANT: No business-specific hardcoding here (brands/names). Generic intent/need patterns only.
-function isSemanticallyValidUserTurn(raw) {
-  const t0 = String(raw || "").trim();
-  if (!t0) return false;
-
-  const norm = normalizeTextLoose(t0); // lowercase, no niqqud, punctuation stripped
-  if (!norm) return false;
-
-  // If there are digits (phone/model), it's meaningful.
-  if (/\d/.test(norm)) return true;
-
-  // Require at least 2 words for non-digit turns.
-  const words = norm.split(" ").filter(Boolean);
-  if (words.length < 2) return false;
-
-  // Reject ultra-short alpha-only content (often breath/noise even after prior filters).
-  const lettersOnly = norm.replace(/[^a-z֐-׿]/g, "");
-  if (lettersOnly.length < 8) return false;
-
-  // Generic Hebrew intent / problem / request cues.
-  // NOTE: keep this list conservative to avoid false positives.
-  const cues = [
-    // intents
-    "מכירה",
-    "מכירות",
-    "שירות",
-    "שירות לקוחות",
-    "אחריות",
-    "תקלה",
-    "בעיה",
-    "משלוח",
-    "אספקה",
-    "הובלה",
-    "הודעה",
-    // verbs / need
-    "רוצה",
-    "צריך",
-    "צריכה",
-    "מחפש",
-    "מחפשת",
-    "מתעניין",
-    "מתעניינת",
-    "שואל",
-    "שואלת",
-    "אפשר",
-    "תוכלו",
-    "אפשרות",
-    // common support phrasing
-    "לא עובד",
-    "לא עובדת",
-    "לא נדלק",
-    "לא נדלקת",
-    "התקלקל",
-    "התקלקלה",
-    "נשבר",
-    "נשברה",
-    "רעשים",
-    "מוזר",
-    // contact details talk
-    "טלפון",
-    "מספר",
-    "לחזור",
-    "שם",
-  ];
-
-  for (const c of cues) {
-    if (norm.includes(normalizeTextLoose(c))) return true;
-  }
-
-  // If it's a real sentence-like utterance in Hebrew (long enough), accept.
-  const hasHeb = /[֐-׿]/.test(norm);
-  if (hasHeb && norm.length >= 14) return true;
-
-  // For meaningful English sentences (rare, but happens): 3+ words and longer text.
-  const hasLat = /[a-z]/.test(norm);
-  if (hasLat && words.length >= 3 && norm.length >= 18) return true;
-
-  return false;
-}
-
 // For robust matching (goodbye detection / phone correction)
 function normalizeTextLoose(str) {
   return String(str || "")
@@ -1741,13 +1658,6 @@ wss.on("connection", async (twilioWs, req) => {
         // Additional gate: ignore low-signal utterances (breath/noise/fillers) so the bot does not respond "on its own".
         if (isLowValueUtterance(raw)) {
           logDebug(connId, `Filtered low-value utterance: "${raw}"`);
-          break;
-        }
-
-        // Semantic gate: require a meaningful user turn before we treat it as input.
-        // This is the primary protection against "the bot talks by itself" complaints.
-        if (!isSemanticallyValidUserTurn(raw)) {
-          logDebug(connId, `Filtered non-semantic turn: "${raw}"`);
           break;
         }
 
