@@ -109,25 +109,6 @@ function formatLast4ForHebrewSpeech(d) {
 }
 
 
-// Coupon speech formatting: if coupon is digits-only, speak digit-by-digit (keeps leading zeros).
-function formatCouponForSpeech(code) {
-  const raw = String(code || "").trim();
-  if (!raw) return "";
-  const d = digitsOnly(raw);
-  if (d && d === raw && d.length <= 12) return d.split("").join(" ");
-  return raw;
-}
-
-// Foreign/noise guard: returns true if transcript has no Hebrew letters and no digits.
-function isForeignNoHebNoDigits(t) {
-  const s = String(t || "").trim();
-  if (!s) return true;
-  const hasHeb = /[֐-׿]/.test(s);
-  const hasDigits = /\d/.test(s);
-  return !hasHeb && !hasDigits;
-}
-
-
 // Extract a digit string from Hebrew digit-words in model output.
 // Supports common variants and strips niqqud/punctuation.
 function extractHebrewSpokenDigits(text) {
@@ -672,9 +653,6 @@ function buildSystemInstructionsFromSheets() {
 כללי Runtime קשיחים:
 - קופון: מותר למסור קוד קופון אך ורק מתוך SETTINGS (SALES_COUPON_CODE). איסור מוחלט להמציא קוד. אם הערך חסר/ריק—להשתמש ב-NO_DATA_MESSAGE.
 - טענת מחיר/השוואה: מותר להגיב אך ורק במשפט מתוך SETTINGS (PRICE_CLAIM_SENTENCE). איסור מוחלט להמציא משפט חלופי. אם הערך חסר/ריק—להשתמש ב-NO_DATA_MESSAGE.
-- עברית בלבד: אסור להתייחס לתמלולים באנגלית/ג׳יבריש כאילו הם בקשה תקפה; אם לא נשמעת עברית או ספרות—להמתין לשאלה מחדש.
-- קופון: אסור להציע/ליזום קופון או הנחה. מוסרים קוד קופון רק אם הלקוח ביקש מפורשות.
-- טענת מחיר/השוואה: מגיבים רק אם הלקוח העלה מחיר/השוואה.
 `.trim();
 
   const finalWithHardPolicy = [final, hardPolicy].filter(Boolean).join("\n\n");
@@ -1299,107 +1277,6 @@ wss.on("connection", async (twilioWs, req) => {
 
   let conversationLog = [];
 
-  // -----------------------------
-  // Deterministic lead gating (NAME + PHONE are mandatory)
-  // -----------------------------
-  let leadFullName = null;
-  let leadPhoneIL = null;
-  let leadPhoneConfirmed = false;
-  let leadWaiting = null; // 'name' | 'phone' | 'phone_confirm' | null
-  let leadPhoneConfirmKind = null; // 'caller_id' | 'captured'
-  let leadPhoneConfirmUntilTs = 0;
-  let pendingUserTurns = []; // stored when we must interrupt for lead gating
-  let pendingCouponAsked = false;
-  let pendingPriceClaimAsked = false;
-
-  function askedCouponByText(userText) {
-    const n = normalizeTextLoose(userText);
-    return (
-      n.includes(normalizeTextLoose('קופון')) ||
-      n.includes(normalizeTextLoose('קוד קופון')) ||
-      (n.includes(normalizeTextLoose('קוד')) && n.includes(normalizeTextLoose('הנחה')))
-    );
-  }
-
-  function askedPriceClaimByText(userText) {
-    const n = normalizeTextLoose(userText);
-    if (!n) return false;
-    // caller mentions price/cheaper/comparison
-    return (
-      n.includes(normalizeTextLoose('מחיר')) ||
-      n.includes(normalizeTextLoose('יותר זול')) ||
-      n.includes(normalizeTextLoose('השווא')) ||
-      n.includes(normalizeTextLoose('יקר')) ||
-      n.includes(normalizeTextLoose('זול'))
-    );
-  }
-
-  function isPlausibleHebrewFullName(t) {
-    const s = safeStr(t);
-    if (!s) return false;
-    const hasHeb = /[\u0590-\u05FF]/.test(s);
-    if (!hasHeb) return false;
-    // avoid accepting sentence-like requests as a name
-    if (s.length > 60) return false;
-    const n = normalizeTextLoose(s);
-    if (!n) return false;
-    // if it clearly contains 'קופון/מחיר/משלוח/תקלה' it's not a name
-    const bad = ['קופון','מחיר','משלוח','אספק','תקלה','שירות','מכירה','נציג','הודעה','רציתי','אפשר','שלום'];
-    if (bad.some((w)=> n.includes(normalizeTextLoose(w)))) return false;
-    const parts = s.split(/\s+/).filter(Boolean);
-    return parts.length >= 2 || s.length >= 4;
-  }
-
-  function cancelActiveResponseQuietly() {
-    if (!hasActiveResponse) return;
-    try { openAiWs.send(JSON.stringify({ type: 'response.cancel' })); } catch (_) {}
-    hasActiveResponse = false;
-    botSpeaking = false;
-    botTurnActive = false;
-  }
-
-  function promptForName() {
-    leadWaiting = 'name';
-    cancelActiveResponseQuietly();
-    sendModelPrompt(openAiWs, 'כדי שאוכל לעזור ולתעד פנייה מסודרת, מה השם המלא שלכם?', 'lead_require_name');
-  }
-
-  function promptForPhone() {
-    // Prefer caller-id confirmation if available, otherwise ask for a callback number.
-    if (callerIL) {
-      const last4 = formatLast4ForHebrewSpeech(callerIL);
-      leadWaiting = 'phone_confirm';
-      leadPhoneConfirmKind = 'caller_id';
-      leadPhoneConfirmUntilTs = Date.now() + 25000;
-      cancelActiveResponseQuietly();
-      sendModelPrompt(openAiWs, `כדי שנוכל לחזור אליכם, האם נוח לחזור למספר המזוהה שמסתיים ב-${last4}? זה נכון?`, 'lead_require_phone_confirm_caller');
-      return;
-    }
-
-    leadWaiting = 'phone';
-    leadPhoneConfirmKind = 'captured';
-    cancelActiveResponseQuietly();
-    sendModelPrompt(openAiWs, 'כדי שנוכל לחזור אליכם, מה מספר הטלפון לחזרה? נא לומר את המספר בצורה ברורה, ואם צריך—ספרה-ספרה.', 'lead_require_phone');
-  }
-
-  function leadIsComplete() {
-    return safeStr(leadFullName).length >= 2 && leadPhoneConfirmed === true && !!normalizePhoneNumber(leadPhoneIL, callerRaw);
-  }
-
-  // One-shot deterministic coupon response per call
-  // (prevents repeated coupon handling and avoids hallucinated coupon codes)
-  let couponAnsweredThisCall = false;
-
-  function userAskedCouponRecently() {
-    // Check last few user turns for an explicit coupon/discount request
-    const lastUsers = conversationLog.filter((m) => m && m.from === 'user').slice(-4);
-    const joined = lastUsers.map((m) => String(m.text || '')).join(' ');
-    const n = normalizeTextLoose(joined);
-    if (!n) return false;
-    return n.includes(normalizeTextLoose('קופון')) || n.includes(normalizeTextLoose('קוד קופון')) || (n.includes(normalizeTextLoose('קוד')) && n.includes(normalizeTextLoose('הנחה'))) || n.includes(normalizeTextLoose('הנחה'));
-  }
-
-
   // Allowed business phone numbers (delivery/importers/main + caller-id). Used to prevent / correct hallucinated digits.
   let allowedPhonesDigits = new Set();
 
@@ -1860,88 +1737,11 @@ wss.on("connection", async (twilioWs, req) => {
           conversationLog.push({ from: "bot", text });
           logAlways(`[BOT][${connId}] ${text}`);
 
-          // Coupon mention guardrail: if the bot starts talking about coupons without an explicit request,
-          // cancel and force it back on track (prevents inventions like "גיל 20" or random codes).
-          try {
-            const nt = normalizeTextLoose(text);
-            const botMentionsCoupon = nt.includes(normalizeTextLoose('קופון')) || nt.includes(normalizeTextLoose('קוד')) && nt.includes(normalizeTextLoose('הנחה'));
-            if (botMentionsCoupon && !userAskedCouponRecently()) {
-              logError(connId, 'Model mentioned coupon without explicit user request; blocking.', { text: text.slice(0, 160) });
-              if (hasActiveResponse) {
-                try { openAiWs.send(JSON.stringify({ type: 'response.cancel' })); } catch (_) {}
-              }
-              hasActiveResponse = false;
-              botSpeaking = false;
-              botTurnActive = false;
-              sendModelPrompt(
-                openAiWs,
-                'תיקון חובה: אל תזכירו קופונים/הנחות אם הלקוח לא ביקש זאת במפורש. המשיכו לשאלה/טיפול האחרון של הלקוח בעברית בלבד, בקצרה.',
-                'coupon_hallucination_block'
-              );
-              currentBotText = '';
-              break;
-            }
-          } catch (_) {}
-
           // 1) Correct hallucinated business numbers (importer/delivery/main/caller-id) before anything else
           if (maybeCorrectHallucinatedPhone(text)) {
             currentBotText = "";
             break;
           }
-
-
-          // coupon_price_runtime_enforcement
-          // Enforce deterministic coupon + price-claim (model may hallucinate). If detected, force a correction.
-          try {
-            const nt = normalizeTextLoose(text);
-
-            // Coupon enforcement: only allow the exact SETTINGS code (and only when user asked earlier).
-            const couponHint = nt.includes(normalizeTextLoose("קופון")) || nt.includes(normalizeTextLoose("קוד קופון")) || nt.includes(normalizeTextLoose("הנחה"));
-            if (couponHint) {
-              const expectedRaw = String(getSetting("SALES_COUPON_CODE", "") || "").trim();
-              const expectedSpoken = formatCouponForSpeech(expectedRaw);
-              const expectedDigits = digitsOnly(expectedRaw);
-
-              // Extract any digits/alphanum token the model said (best-effort).
-              const saidDigits = digitsOnly(text);
-
-              // If expected is digits-only, enforce digit match. Otherwise enforce substring presence.
-              const ok = expectedRaw && (
-                (expectedDigits && saidDigits && saidDigits === expectedDigits) ||
-                (!expectedDigits && normalizeTextLoose(text).includes(normalizeTextLoose(expectedRaw)))
-              );
-
-              if (!ok && expectedRaw) {
-                logError(connId, "Model spoke wrong coupon; forcing correction.", { expected: expectedRaw });
-                if (hasActiveResponse) {
-                  try { openAiWs.send(JSON.stringify({ type: "response.cancel" })); } catch (_) {}
-                }
-                hasActiveResponse = false;
-                botSpeaking = false;
-                botTurnActive = false;
-                sendModelPrompt(
-                  openAiWs,
-                  `תיקון חובה: אמרו בדיוק: "קוד הקופון הוא ${expectedSpoken}". בסוף שאלו שאלה אחת בלבד: "האם יש עוד משהו שאוכל לעזור בו?"`,
-                  "coupon_correction"
-                );
-                currentBotText = "";
-                break;
-              }
-            }
-
-            // Price-claim enforcement: only allow the exact SETTINGS sentence.
-            const priceHint = nt.includes(normalizeTextLoose("יותר זול")) || (nt.includes(normalizeTextLoose("מחיר")) && (nt.includes(normalizeTextLoose("השווא")) || nt.includes(normalizeTextLoose("זול"))));
-            if (priceHint) {
-              const expected = String(getSetting("PRICE_CLAIM_SENTENCE", "") || "").trim();
-              if (expected) {
-                const nExp = normalizeTextLoose(expected);
-                const nSaid = normalizeTextLoose(text);
-                if (nExp && nSaid && !nSaid.includes(nExp.slice(0, Math.min(18, nExp.length))) ) {
-                  // This line will be replaced below (JS has no min/len) — placeholder
-                }
-              }
-            }
-          } catch (_) {}
 
           // 2) Correct repeated-captured phone if model said different digits
           if (!phoneCorrectionSent && capturedPhoneIL) {
@@ -2018,23 +1818,6 @@ wss.on("connection", async (twilioWs, req) => {
         if (!MB_LOG_TRANSCRIPTS) break;
 
         const raw = String(msg.transcript || "").trim();
-
-
-        // foreign_transcript_hard_filter
-        // If we received a transcript with no Hebrew and no digits, treat it as noise and do not advance the flow.
-        // Exception: if the bot just asked for the caller's name, allow Latin full-name capture.
-        const lastBot = [...conversationLog].reverse().find((m) => m && m.from === "bot" && String(m.text || "").trim().length > 0);
-        const lastBotNorm = normalizeTextLoose(lastBot ? lastBot.text : "");
-        const botAsksName = lastBotNorm.includes(normalizeTextLoose("מה השם")) || (lastBotNorm.includes(normalizeTextLoose("שם")) && lastBotNorm.includes(normalizeTextLoose("מלא")));
-
-        if (isForeignNoHebNoDigits(raw)) {
-          const words = raw.split(/\s+/).filter(Boolean);
-          const allowAsName = botAsksName && words.length >= 2 && raw.length >= 4 && raw.length <= 60;
-          if (!allowAsName) {
-            logDebug(connId, `Filtered foreign/noise transcript: "${raw}"`);
-            break;
-          }
-        }
         const hasRealUserYet = conversationLog.some((m) => m.from === "user" && (m.text || "").trim().length >= 4);
 
         if (!raw) break;
@@ -2054,162 +1837,6 @@ wss.on("connection", async (twilioWs, req) => {
 
         conversationLog.push({ from: "user", text: t });
         logAlways(`[CALLER][${connId}] ${t}`);
-
-        // -----------------------------
-        // LEAD GATE: NAME + PHONE mandatory (all flows)
-        // -----------------------------
-        // If we still miss mandatory lead fields, we intercept the turn deterministically,
-        // store the user's intent, and only then continue to business handling.
-        try {
-          const userNorm = normalizeTextLoose(t);
-          const asksCouponNow = userNorm.includes(normalizeTextLoose('קופון')) || userNorm.includes(normalizeTextLoose('קוד קופון')) || (userNorm.includes(normalizeTextLoose('קוד')) && userNorm.includes(normalizeTextLoose('הנחה')));
-          const priceNow = userNorm.includes(normalizeTextLoose('מחיר')) || userNorm.includes(normalizeTextLoose('יותר זול')) || userNorm.includes(normalizeTextLoose('השווא'));
-
-          // 1) If we are mid-collection, handle it first.
-          if (leadWaiting === 'name') {
-            // Accept Hebrew 2+ words as a name; otherwise reprompt.
-            const hasHeb = /[֐-׿]/.test(t);
-            const words = t.split(/\s+/).filter(Boolean);
-            if (hasHeb && (words.length >= 2 || t.length >= 4)) {
-              leadFullName = t;
-              leadWaiting = 'none';
-              // Immediately continue to phone step.
-              promptForPhone();
-            } else {
-              promptForName();
-            }
-            break;
-          }
-
-          if (leadWaiting === 'phone') {
-            const candidate = extractBestPhoneFromText(t);
-            if (candidate) {
-              leadPhoneIL = candidate;
-              leadWaiting = 'phone_confirm';
-              leadPhoneConfirmKind = 'captured';
-              leadPhoneConfirmUntilTs = Date.now() + 25000;
-              const last4 = formatLast4ForHebrewSpeech(candidate);
-              cancelActiveResponseQuietly();
-              sendModelPrompt(openAiWs, `רק לוודא—מספר הטלפון לחזרה מסתיים ב-${last4}. זה נכון?`, 'lead_phone_confirm_captured');
-            } else {
-              promptForPhone();
-            }
-            break;
-          }
-
-          if (leadWaiting === 'phone_confirm') {
-            const isYes = (userNorm === 'כן' || userNorm === 'נכון' || userNorm === 'כן כן' || userNorm === 'בטח' || userNorm === 'ברור');
-            const isNo = (userNorm === 'לא' || userNorm === 'לא נכון' || userNorm === 'ממש לא');
-
-            if (isYes) {
-              leadPhoneConfirmed = true;
-              leadWaiting = 'none';
-
-              // If caller-id was confirmed, store it as the callback phone.
-              if (leadPhoneConfirmKind === 'caller_id' && callerIL) {
-                leadPhoneIL = callerIL;
-              }
-
-              // If we had a pending request, resume it deterministically.
-              if (pendingUserTurns.length > 0) {
-                const pending = pendingUserTurns.shift();
-                // deterministic coupon if it was asked
-                if (pending?.asksCoupon && !couponAnsweredThisCall) {
-                  const coupon = String(getSetting('SALES_COUPON_CODE', '') || '').trim();
-                  const fallback = String(getSetting('NO_DATA_MESSAGE', '') || '').trim();
-                  const msgCoupon = coupon || fallback || 'אין לי מידע על זה כרגע, אוכל לפתוח פנייה ונציג יחזור אליכם.';
-                  const spoken = formatCouponForSpeech(msgCoupon);
-                  couponAnsweredThisCall = true;
-                  cancelActiveResponseQuietly();
-                  sendModelPrompt(openAiWs, `עני בדיוק במשפט אחד: "${spoken}". אחר כך שאלי שאלה אחת בלבד: "תרצו שאפתח פנייה למחלקת המכירות?"`, 'coupon_after_lead');
-                } else {
-                  // Let the model answer the original user request now.
-                  cancelActiveResponseQuietly();
-                  sendModelPrompt(openAiWs, `הלקוח אמר: "${pending.text}". ענו בהתאם להנחיות ולמידע מה-Sheets.`, 'resume_after_lead');
-                }
-              }
-
-              break;
-            }
-
-            if (isNo) {
-              leadPhoneConfirmed = false;
-              leadPhoneIL = null;
-              leadWaiting = 'phone';
-              cancelActiveResponseQuietly();
-              sendModelPrompt(openAiWs, 'בסדר. מה מספר הטלפון הנכון לחזרה? נא לומר את המספר בצורה ברורה, ואם צריך—ספרה-ספרה.', 'lead_phone_retry');
-              break;
-            }
-
-            // If unclear, re-ask.
-            cancelActiveResponseQuietly();
-            sendModelPrompt(openAiWs, 'רק לוודא—זה נכון? אפשר לענות כן או לא.', 'lead_phone_confirm_repeat');
-            break;
-          }
-
-          // 2) Not in a collection step; if lead is incomplete, start gating and store intent.
-          if (!leadIsComplete()) {
-            pendingUserTurns.push({ text: t, asksCoupon: asksCouponNow, priceClaim: priceNow, at: Date.now() });
-            if (!safeStr(leadFullName)) {
-              promptForName();
-            } else {
-              promptForPhone();
-            }
-            break;
-          }
-        } catch (_) {}
-
-
-        // deterministic_coupon_logic
-        // Deterministic coupon: only when caller explicitly asks. One-shot per call.
-        const ntt = normalizeTextLoose(t);
-        const asksCoupon = ntt.includes(normalizeTextLoose("קופון")) || ntt.includes(normalizeTextLoose("קוד קופון")) || (ntt.includes(normalizeTextLoose("קוד")) && ntt.includes(normalizeTextLoose("הנחה")));
-        if (asksCoupon && !couponAnsweredThisCall) {
-          couponAnsweredThisCall = true;
-          const rawCode = String(getSetting("SALES_COUPON_CODE", "") || "").trim();
-          const spoken = formatCouponForSpeech(rawCode);
-          const fallback = String(getSetting("NO_DATA_MESSAGE", "") || "").trim();
-
-          const sentence = rawCode ? `קוד הקופון הוא ${spoken}.` : (fallback || "אין לי מידע זמין כרגע על קוד קופון.");
-
-          if (hasActiveResponse) {
-            try { openAiWs.send(JSON.stringify({ type: "response.cancel" })); } catch (_) {}
-            hasActiveResponse = false;
-            botSpeaking = false;
-            botTurnActive = false;
-          }
-
-          sendModelPrompt(
-            openAiWs,
-            `ענו בדיוק במשפט אחד בלבד: "${sentence}" בסוף שאלו שאלה אחת בלבד: "האם יש עוד משהו שאוכל לעזור בו?"`,
-            "coupon_deterministic"
-          );
-          break;
-        }
-
-        // deterministic_price_claim_logic
-        // Deterministic price-claim: only when caller explicitly raises price/cheaper comparison.
-        const asksPrice = ntt.includes(normalizeTextLoose("יותר זול")) || (ntt.includes(normalizeTextLoose("מחיר")) && (ntt.includes(normalizeTextLoose("השווא")) || ntt.includes(normalizeTextLoose("זול")) || ntt.includes(normalizeTextLoose("יקר"))));
-        if (asksPrice && !priceClaimAnsweredThisCall) {
-          priceClaimAnsweredThisCall = true;
-          const expected = String(getSetting("PRICE_CLAIM_SENTENCE", "") || "").trim();
-          const fallback = String(getSetting("NO_DATA_MESSAGE", "") || "").trim();
-          const sentence = expected || fallback || "אין לי מידע זמין כרגע בנושא מחיר, אוכל לקחת פרטים ונציג יחזור אליכם.";
-
-          if (hasActiveResponse) {
-            try { openAiWs.send(JSON.stringify({ type: "response.cancel" })); } catch (_) {}
-            hasActiveResponse = false;
-            botSpeaking = false;
-            botTurnActive = false;
-          }
-
-          sendModelPrompt(
-            openAiWs,
-            `ענו בדיוק במשפט אחד בלבד: "${sentence}" בסוף שאלו שאלה אחת בלבד: "האם תרצו שאפתח פנייה כדי שנחזור אליכם?"`,
-            "price_claim_deterministic"
-          );
-          break;
-        }
 
         const gPref = detectGenderPreference(t);
         if (gPref && gPref !== preferredGender) {
@@ -2238,11 +1865,6 @@ wss.on("connection", async (twilioWs, req) => {
       }
 
       case "error":
-        // Realtime sometimes returns this benign error if we try to cancel when there is no active response.
-        if (msg && msg.error && msg.error.code === "response_cancel_not_active") {
-          logDebug(connId, "OpenAI cancel ignored (no active response)", msg.error);
-          break;
-        }
         logError(connId, "OpenAI error event", msg);
 
         // If the Realtime session hit max duration, end the call cleanly.
