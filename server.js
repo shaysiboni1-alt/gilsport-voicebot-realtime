@@ -1308,9 +1308,7 @@ wss.on("connection", async (twilioWs, req) => {
   let leadWaiting = null; // 'name' | 'phone' | 'phone_confirm' | null
   let leadPhoneConfirmKind = null; // 'caller_id' | 'captured'
   let leadPhoneConfirmUntilTs = 0;
-  
-  let callerIdConfirmAsked = false; // ask caller-id last4 confirmation once only
-let pendingUserTurns = []; // stored when we must interrupt for lead gating
+  let pendingUserTurns = []; // stored when we must interrupt for lead gating
   let pendingCouponAsked = false;
   let pendingPriceClaimAsked = false;
 
@@ -1367,10 +1365,8 @@ let pendingUserTurns = []; // stored when we must interrupt for lead gating
   }
 
   function promptForPhone() {
-    // Rule: In all flows, confirm caller-id (last 4 digits) at most once.
-    // If the caller provides a callback number verbally, accept it as-is (no last4 validation).
-    if (callerIL && !callerIdConfirmAsked) {
-      callerIdConfirmAsked = true;
+    // Prefer caller-id confirmation if available, otherwise ask for a callback number.
+    if (callerIL) {
       const last4 = formatLast4ForHebrewSpeech(callerIL);
       leadWaiting = 'phone_confirm';
       leadPhoneConfirmKind = 'caller_id';
@@ -1380,7 +1376,6 @@ let pendingUserTurns = []; // stored when we must interrupt for lead gating
       return;
     }
 
-    // Otherwise, ask for the callback number. No confirmation step (customer-provided number is final).
     leadWaiting = 'phone';
     leadPhoneConfirmKind = 'captured';
     cancelActiveResponseQuietly();
@@ -1391,36 +1386,11 @@ let pendingUserTurns = []; // stored when we must interrupt for lead gating
     return safeStr(leadFullName).length >= 2 && leadPhoneConfirmed === true && !!normalizePhoneNumber(leadPhoneIL, callerRaw);
   }
 
-  
-  function resumePendingTurnsAfterLead() {
-    if (!pendingUserTurns || pendingUserTurns.length === 0) return;
-    const pending = pendingUserTurns.shift();
-    if (!pending) return;
-
-    // If a coupon was explicitly requested, answer deterministically from SETTINGS once.
-    if (pending.asksCoupon && !couponAnsweredThisCall) {
-      const coupon = String(getSetting('SALES_COUPON_CODE', '') || '').trim();
-      const fallback = String(getSetting('NO_DATA_MESSAGE', '') || '').trim();
-      const msgCoupon = coupon || fallback || 'אין לי מידע על זה כרגע, אוכל לפתוח פנייה ונציג יחזור אליכם.';
-      const spoken = formatCouponForSpeech(msgCoupon);
-      couponAnsweredThisCall = true;
-      cancelActiveResponseQuietly();
-      sendModelPrompt(openAiWs, `עני בדיוק במשפט אחד: "${spoken}". אחר כך שאלי שאלה אחת בלבד: "האם יש עוד משהו שאוכל לעזור בו?"`, 'coupon_after_lead');
-      return;
-    }
-
-    cancelActiveResponseQuietly();
-    sendModelPrompt(openAiWs, `הלקוח אמר: "${pending.text}". ענו בהתאם להנחיות ולמידע מה-Sheets.`, 'resume_after_lead');
-  }
-
-
   // One-shot deterministic coupon response per call
   // (prevents repeated coupon handling and avoids hallucinated coupon codes)
   let couponAnsweredThisCall = false;
 
-  
-  let priceClaimAnsweredThisCall = false;
-function userAskedCouponRecently() {
+  function userAskedCouponRecently() {
     // Check last few user turns for an explicit coupon/discount request
     const lastUsers = conversationLog.filter((m) => m && m.from === 'user').slice(-4);
     const joined = lastUsers.map((m) => String(m.text || '')).join(' ');
@@ -1567,7 +1537,7 @@ function userAskedCouponRecently() {
 
       sendModelPrompt(
         openAiWs,
-        `תיקון חובה: המספר הנכון הוא "${formatDigitsForHebrewSpeech(m.expected)}". הקריאו אותו בדיוק ספרה-ספרה בלי להשמיט ספרות.`,
+        `תיקון חובה: 4 הספרות האחרונות הנכונות הן "${expectedSpoken}". הקריאו אותן בדיוק ספרה-ספרה ושאלו: "זה נכון?" בלי תוספות.`,
         "business_phone_correction"
       );
 
@@ -1876,18 +1846,15 @@ function userAskedCouponRecently() {
         currentBotText = "";
         break;
 
-      case "response.output_text.delta": {
+      case "response.output_text.delta":
+      case "response.audio_transcript.delta": {
         const delta = msg.delta || "";
         if (delta) currentBotText += delta;
         break;
       }
 
-      case "response.audio_transcript.delta": {
-        // Ignore transcript deltas to prevent duplicate / repeated sentences.
-        break;
-      }
-
-      case "response.output_text.done": {
+      case "response.output_text.done":
+      case "response.audio_transcript.done": {
         const text = String(currentBotText || "").trim();
         if (text) {
           conversationLog.push({ from: "bot", text });
@@ -1969,21 +1936,8 @@ function userAskedCouponRecently() {
               if (expected) {
                 const nExp = normalizeTextLoose(expected);
                 const nSaid = normalizeTextLoose(text);
-                if (nExp && nSaid && !nSaid.includes(nExp.slice(0, Math.min(18, nExp.length)))) {
-                  logError(connId, "Model spoke a price-claim sentence different from SETTINGS; forcing correction.", { expected });
-                  if (hasActiveResponse) {
-                    try { openAiWs.send(JSON.stringify({ type: "response.cancel" })); } catch (_) {}
-                  }
-                  hasActiveResponse = false;
-                  botSpeaking = false;
-                  botTurnActive = false;
-                  sendModelPrompt(
-                    openAiWs,
-                    `תיקון חובה: אמרו בדיוק את המשפט הבא מילה במילה: "${expected}". בסוף שאלו שאלה אחת בלבד: "האם יש עוד משהו שאוכל לעזור בו?"`,
-                    "price_claim_correction"
-                  );
-                  currentBotText = "";
-                  break;
+                if (nExp && nSaid && !nSaid.includes(nExp.slice(0, Math.min(18, nExp.length))) ) {
+                  // This line will be replaced below (JS has no min/len) — placeholder
                 }
               }
             }
@@ -2024,11 +1978,6 @@ function userAskedCouponRecently() {
           }
         }
         currentBotText = "";
-        break;
-      }
-
-      case "response.audio_transcript.done": {
-        // Ignore transcript done events (text already handled by output_text.done).
         break;
       }
 
@@ -2135,45 +2084,66 @@ function userAskedCouponRecently() {
           if (leadWaiting === 'phone') {
             const candidate = extractBestPhoneFromText(t);
             if (candidate) {
-              // Rule: if customer provided a number verbally, accept it as-is (no last4 validation).
               leadPhoneIL = candidate;
-              leadPhoneConfirmed = true;
-              leadWaiting = 'none';
-              resumePendingTurnsAfterLead();
+              leadWaiting = 'phone_confirm';
+              leadPhoneConfirmKind = 'captured';
+              leadPhoneConfirmUntilTs = Date.now() + 25000;
+              const last4 = formatLast4ForHebrewSpeech(candidate);
+              cancelActiveResponseQuietly();
+              sendModelPrompt(openAiWs, `רק לוודא—מספר הטלפון לחזרה מסתיים ב-${last4}. זה נכון?`, 'lead_phone_confirm_captured');
             } else {
-              // Re-ask (will not re-ask caller-id confirm; that is one-shot).
               promptForPhone();
             }
             break;
           }
 
           if (leadWaiting === 'phone_confirm') {
-            // One-shot caller-id confirmation (last4). If not a clear "כן", move on to asking for a callback number.
-            const candidate = extractBestPhoneFromText(t);
-            if (candidate) {
-              leadPhoneIL = candidate;
-              leadPhoneConfirmed = true;
-              leadWaiting = 'none';
-              resumePendingTurnsAfterLead();
-              break;
-            }
-
             const isYes = (userNorm === 'כן' || userNorm === 'נכון' || userNorm === 'כן כן' || userNorm === 'בטח' || userNorm === 'ברור');
+            const isNo = (userNorm === 'לא' || userNorm === 'לא נכון' || userNorm === 'ממש לא');
 
             if (isYes) {
               leadPhoneConfirmed = true;
               leadWaiting = 'none';
-              if (callerIL) leadPhoneIL = callerIL;
-              resumePendingTurnsAfterLead();
+
+              // If caller-id was confirmed, store it as the callback phone.
+              if (leadPhoneConfirmKind === 'caller_id' && callerIL) {
+                leadPhoneIL = callerIL;
+              }
+
+              // If we had a pending request, resume it deterministically.
+              if (pendingUserTurns.length > 0) {
+                const pending = pendingUserTurns.shift();
+                // deterministic coupon if it was asked
+                if (pending?.asksCoupon && !couponAnsweredThisCall) {
+                  const coupon = String(getSetting('SALES_COUPON_CODE', '') || '').trim();
+                  const fallback = String(getSetting('NO_DATA_MESSAGE', '') || '').trim();
+                  const msgCoupon = coupon || fallback || 'אין לי מידע על זה כרגע, אוכל לפתוח פנייה ונציג יחזור אליכם.';
+                  const spoken = formatCouponForSpeech(msgCoupon);
+                  couponAnsweredThisCall = true;
+                  cancelActiveResponseQuietly();
+                  sendModelPrompt(openAiWs, `עני בדיוק במשפט אחד: "${spoken}". אחר כך שאלי שאלה אחת בלבד: "תרצו שאפתח פנייה למחלקת המכירות?"`, 'coupon_after_lead');
+                } else {
+                  // Let the model answer the original user request now.
+                  cancelActiveResponseQuietly();
+                  sendModelPrompt(openAiWs, `הלקוח אמר: "${pending.text}". ענו בהתאם להנחיות ולמידע מה-Sheets.`, 'resume_after_lead');
+                }
+              }
+
               break;
             }
 
-            // Any other answer is treated as "no/unclear" (we do not ask again).
-            leadPhoneConfirmed = false;
-            leadPhoneIL = null;
-            leadWaiting = 'phone';
+            if (isNo) {
+              leadPhoneConfirmed = false;
+              leadPhoneIL = null;
+              leadWaiting = 'phone';
+              cancelActiveResponseQuietly();
+              sendModelPrompt(openAiWs, 'בסדר. מה מספר הטלפון הנכון לחזרה? נא לומר את המספר בצורה ברורה, ואם צריך—ספרה-ספרה.', 'lead_phone_retry');
+              break;
+            }
+
+            // If unclear, re-ask.
             cancelActiveResponseQuietly();
-            sendModelPrompt(openAiWs, 'בסדר. מה מספר הטלפון לחזרה? נא לומר את המספר בצורה ברורה, ואם צריך—ספרה-ספרה.', 'lead_phone_after_caller_id_no');
+            sendModelPrompt(openAiWs, 'רק לוודא—זה נכון? אפשר לענות כן או לא.', 'lead_phone_confirm_repeat');
             break;
           }
 
