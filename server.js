@@ -321,6 +321,8 @@ const MB_NO_BARGE_TAIL_MS = envNumber("MB_NO_BARGE_TAIL_MS", 1600);
 const MB_BARGE_IN_COOLDOWN_MS = envNumber("MB_BARGE_IN_COOLDOWN_MS", 500);
 const MB_ALLOW_BARGE_IN = envBool("MB_ALLOW_BARGE_IN", false);
 const MB_HANGUP_AFTER_GOODBYE = envBool("MB_HANGUP_AFTER_GOODBYE", true);
+const MB_TTS_SPEED = envNumber("MB_TTS_SPEED", 1.0);
+const MB_TTS_SPEED_CLAMPED = Math.max(0.9, Math.min(MB_TTS_SPEED, 1.2));
 
 const MB_VAD_THRESHOLD = envNumber("MB_VAD_THRESHOLD", 0.65);
 const MB_VAD_SILENCE_MS = envNumber("MB_VAD_SILENCE_MS", 900);
@@ -1679,6 +1681,7 @@ wss.on("connection", async (twilioWs, req) => {
           model: OPENAI_REALTIME_MODEL,
           modalities: ["audio", "text"],
           voice: OPENAI_VOICE,
+          speed: MB_TTS_SPEED_CLAMPED,
           input_audio_format: "g711_ulaw",
           output_audio_format: "g711_ulaw",
           input_audio_transcription: { model: "whisper-1" },
@@ -1693,6 +1696,8 @@ wss.on("connection", async (twilioWs, req) => {
         },
       })
     );
+
+    if (MB_DEBUG) logInfo(connId, "TTS speed set", { speed: MB_TTS_SPEED_CLAMPED });
 
     flushSessionAddons();
 
