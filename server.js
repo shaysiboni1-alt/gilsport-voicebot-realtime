@@ -403,7 +403,9 @@ async function getGeminiAccessToken() {
   });
   const client = await auth.getClient();
   const token = await client.getAccessToken();
-  return token || "";
+  if (typeof token === "string") return token;
+  if (token && typeof token === "object" && typeof token.token === "string") return token.token;
+  return "";
 }
 
 if (MB_GEMINI_POC_ENABLED && GCP_SA_JSON_B64) {
