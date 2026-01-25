@@ -64,6 +64,31 @@ function digitsOnly(v) {
   return String(v).replace(/\D/g, "");
 }
 
+function getTimeParts(timeZone) {
+  try {
+    const now = new Date();
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone,
+      hour12: false,
+      hour: "2-digit",
+      minute: "2-digit",
+    }).formatToParts(now);
+    const hour = Number(parts.find((p) => p.type === "hour")?.value || "0");
+    const minute = Number(parts.find((p) => p.type === "minute")?.value || "0");
+    return { hour, minute };
+  } catch (_) {
+    return { hour: new Date().getHours(), minute: new Date().getMinutes() };
+  }
+}
+
+function getGreetingForNow(timeZone) {
+  const { hour } = getTimeParts(timeZone);
+  if (hour >= 5 && hour < 12) return "בוקר טוב";
+  if (hour >= 12 && hour < 17) return "צהריים טובים";
+  if (hour >= 17 && hour < 22) return "ערב טוב";
+  return "לילה טוב";
+}
+
 function toIsraeliLocalFromAny(raw) {
   const d = digitsOnly(raw);
   if (!d) return null;
@@ -187,8 +212,8 @@ function normalizePhoneNumber(rawPhone, callerNumber) {
       local = "0" + local.slice(3);
     }
 
-    // IL validation basic
-    if (!/^0\d{8,9}$/.test(local)) return null;
+    // Basic validation: digits length 9-10 only (no advanced rules)
+    if (!/^\d{9,10}$/.test(local)) return null;
     return local;
   }
 
@@ -294,6 +319,19 @@ function isEnglishRequest(text) {
   return t.includes("english") || t.includes("in english") || t.includes("אנגלית") || t.includes("באנגלית");
 }
 
+function isCallerIdBlockedValue(raw) {
+  const callerLabel = String(raw || "").toLowerCase().trim();
+  return (
+    !callerLabel ||
+    callerLabel === "anonymous" ||
+    callerLabel === "blocked" ||
+    callerLabel === "null" ||
+    callerLabel === "unknown" ||
+    callerLabel === "restricted" ||
+    callerLabel === "private"
+  );
+}
+
 function extractDigitSequences(text) {
   const s = String(text || "");
   const matches = s.match(/\d{7,12}/g);
@@ -327,6 +365,7 @@ function levenshtein(a, b) {
 // -----------------------------
 const PORT = envNumber("PORT", 10000);
 
+const TIME_ZONE = process.env.TIME_ZONE || "Asia/Jerusalem";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const OPENAI_REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview-2024-12-17";
 const OPENAI_VOICE = process.env.OPENAI_VOICE || "alloy";
@@ -515,6 +554,63 @@ function logError(connId, msg, extra) {
 function logAlways(msg, extra) {
   if (extra !== undefined) console.log(`[ALWAYS] ${msg}`, extra);
   else console.log(`[ALWAYS] ${msg}`);
+}
+
+function logEnvFallback(name, fallback) {
+  const raw = process.env[name];
+  if (raw !== undefined && String(raw).trim() !== "") return;
+  logAlways(`[ENV] Missing ${name}; using fallback "${fallback}".`);
+}
+
+function logEnvPresence(name) {
+  const raw = process.env[name];
+  if (raw !== undefined && String(raw).trim() !== "") return;
+  logAlways(`[ENV] Missing ${name}; feature may be disabled.`);
+}
+
+function logEnvStatus() {
+  logEnvFallback("TIME_ZONE", TIME_ZONE);
+  logEnvFallback("OPENAI_REALTIME_MODEL", OPENAI_REALTIME_MODEL);
+  logEnvFallback("OPENAI_VOICE", OPENAI_VOICE);
+  logEnvPresence("GSHEET_ID");
+  logEnvPresence("GOOGLE_SERVICE_ACCOUNT_JSON_B64");
+  logEnvPresence("PUBLIC_BASE_URL");
+
+  const mbEnvFallbacks = [
+    ["MB_DEBUG", MB_DEBUG],
+    ["MB_LOG_TRANSCRIPTS", MB_LOG_TRANSCRIPTS],
+    ["MB_NO_BARGE_TAIL_MS", MB_NO_BARGE_TAIL_MS],
+    ["MB_BARGE_IN_COOLDOWN_MS", MB_BARGE_IN_COOLDOWN_MS],
+    ["MB_ALLOW_BARGE_IN", MB_ALLOW_BARGE_IN],
+    ["MB_HANGUP_AFTER_GOODBYE", MB_HANGUP_AFTER_GOODBYE],
+    ["MB_TTS_SPEED", MB_TTS_SPEED],
+    ["MB_TRANSCRIPTION_LANGUAGE", MB_TRANSCRIPTION_LANGUAGE],
+    ["MB_LLM_PROVIDER", MB_LLM_PROVIDER],
+    ["MB_GEMINI_TEXT_MODEL", MB_GEMINI_TEXT_MODEL],
+    ["MB_GEMINI_POC_ENABLED", MB_GEMINI_POC_ENABLED],
+    ["MB_GEMINI_LIVE_MODEL", MB_GEMINI_LIVE_MODEL],
+    ["MB_VAD_THRESHOLD", MB_VAD_THRESHOLD],
+    ["MB_VAD_SILENCE_MS", MB_VAD_SILENCE_MS],
+    ["MB_VAD_PREFIX_MS", MB_VAD_PREFIX_MS],
+    ["MB_VAD_SUFFIX_MS", MB_VAD_SUFFIX_MS],
+    ["MB_IDLE_WARNING_MS", MB_IDLE_WARNING_MS],
+    ["MB_IDLE_HANGUP_MS", MB_IDLE_HANGUP_MS],
+    ["MB_MAX_CALL_MS", MB_MAX_CALL_MS],
+    ["MB_MAX_WARN_BEFORE_MS", MB_MAX_WARN_BEFORE_MS],
+    ["MB_HANGUP_GRACE_MS", MB_HANGUP_GRACE_MS],
+    ["MB_CALL_LOG_WEBHOOK_URL", MB_CALL_LOG_WEBHOOK_URL],
+    ["MB_CALL_LOG_ENABLED", MB_CALL_LOG_ENABLED],
+    ["MB_WEBHOOK_URL", MB_WEBHOOK_URL],
+    ["MB_ENABLE_LEAD_CAPTURE", MB_ENABLE_LEAD_CAPTURE],
+    ["MB_ABANDONED_WEBHOOK_URL", MB_ABANDONED_WEBHOOK_URL],
+    ["MB_ENABLE_ABANDONED_WEBHOOK", MB_ENABLE_ABANDONED_WEBHOOK],
+    ["MB_FINAL_WEBHOOK_ONLY", MB_FINAL_WEBHOOK_ONLY],
+    ["MB_ENABLE_RECORDING", MB_ENABLE_RECORDING],
+    ["MB_LEAD_PARSING_MODEL", MB_LEAD_PARSING_MODEL],
+  ];
+  for (const [name, fallback] of mbEnvFallbacks) {
+    logEnvFallback(name, String(fallback));
+  }
 }
 
 // -----------------------------
@@ -738,7 +834,19 @@ function buildSystemInstructionsFromSheets() {
   const businessName = getSetting("BUSINESS_NAME", "GilSport");
   const botName = getSetting("BOT_NAME", "נטע");
 
-  const opening = getSetting("OPENING_SCRIPT", "שלום! מדברת נטע מגיל ספורט במה אפשר לעזור?");
+  const greeting = getGreetingForNow(TIME_ZONE || "Asia/Jerusalem");
+  const openingTemplate = getSetting("OPENING_SCRIPT", "");
+  const openingRaw = openingTemplate
+    ? openingTemplate
+    : `${greeting}! מדברת ${botName} מ${businessName}, במה אפשר לעזור?`;
+  const openingInterpolated = interpolateVars(openingRaw, {
+    GREETING: greeting,
+    BOT_NAME: botName,
+    BUSINESS_NAME: businessName,
+  });
+  const opening = openingInterpolated.includes(greeting)
+    ? openingInterpolated
+    : `${greeting} ${openingInterpolated}`.replace(/\s+/g, " ").trim();
   const closing = getSetting("CLOSING_SCRIPT", "תודה שפנית אלינו. יום נעים!");
 
   const master = getPrompt("MASTER_PROMPT", "");
@@ -750,6 +858,7 @@ function buildSystemInstructionsFromSheets() {
     BOT_NAME: botName,
     OPENING_SCRIPT: opening,
     CLOSING_SCRIPT: closing,
+    GREETING: greeting,
 
     WEBSITE_URL: getSetting("WEBSITE_URL", ""),
     MAIN_PHONE: getSetting("MAIN_PHONE", ""),
@@ -790,6 +899,7 @@ function buildSystemInstructionsFromSheets() {
 כללי Runtime קשיחים:
 - קופון: מותר למסור קוד קופון אך ורק מתוך SETTINGS (SALES_COUPON_CODE). איסור מוחלט להמציא קוד. אם הערך חסר/ריק—להשתמש ב-NO_DATA_MESSAGE.
 - טענת מחיר/השוואה: מותר להגיב אך ורק במשפט מתוך SETTINGS (PRICE_CLAIM_SENTENCE). איסור מוחלט להמציא משפט חלופי. אם הערך חסר/ריק—להשתמש ב-NO_DATA_MESSAGE.
+- לשון דיבור: ברירת מחדל לשון רבים בלבד ("אתם/תרצו/נחזור אליכם"). אין להשתמש ביחיד/זכר/נקבה אלא אם הלקוח ביקש במפורש.
 `.trim();
 
   const finalWithHardPolicy = [final, hardPolicy].filter(Boolean).join("\n\n");
@@ -1087,7 +1197,6 @@ async function extractLeadFromConversation(conversationLog, connId, botName, bus
 חובה: השדות reason ו-notes בעברית (אפשר לתרגם מתוכן השיחה), כולל ציון מפורש אם נמסר מספר יבואן/מוביל.
 	חובה: phone_number (אם קיים) חייב להיות מספר ישראלי מלא (0XXXXXXXXX/0XXXXXXXXXX לאחר normalize) — 4 ספרות אחרונות בלבד אינן טלפון תקין ואסור להחזיר אותן כשדה phone_number.
 	חובה: אם intent="message" — מלאו message_for (עבור מי ההודעה) במפורש.
-	חובה: אם intent הוא "sales" או "support" — מלאו brand ו-model גם אם הלקוח אמר שאין/לא יודע; במקרה כזה כתבו את ניסוח הלקוח כפי שנאמר (לדוגמה: "אין מותג" / "לא יודע דגם"), ואל תשאירו null.
 `.trim();
 
     const raw = await callLeadParsingLlm(
@@ -1607,10 +1716,11 @@ wss.on("connection", async (twilioWs, req) => {
   let goodbyePendingText = null;
 
   let capturedPhoneIL = null;
-  let phoneCorrectionSent = false;
   let phoneHallucinationCorrectionSent = false;
 
-  let preferredGender = null;
+  let preferredGrammar = "plural";
+  let prefersCallerId = false;
+  let needsPhoneCapture = false;
   let genderInstructionSent = false;
   let baseInstructions = null;
 
@@ -1673,57 +1783,6 @@ wss.on("connection", async (twilioWs, req) => {
     if (phoneHallucinationCorrectionSent) return false;
     if (!botText) return false;
     if (!allowedPhonesDigits || allowedPhonesDigits.size === 0) return false;
-
-    // Strict enforcement for validated numbers (caller-id / captured callback).
-    // If we are in a validation turn and the model speaks a different sequence, force a correction.
-    const normText = normalizeTextLoose(botText);
-    const expectedCaller = callerIL ? digitsOnly(callerIL) : null;
-    const expectedCaptured = capturedPhoneIL ? digitsOnly(capturedPhoneIL) : null;
-
-    const mentionsCallerId = !!(expectedCaller && (normText.includes(normalizeTextLoose("מספר המזוהה")) || normText.includes(normalizeTextLoose("המספר המזוהה"))));
-    const mentionsCallback = !!(expectedCaptured && (
-      normText.includes(normalizeTextLoose("מספר הטלפון שלך")) ||
-      normText.includes(normalizeTextLoose("המספר שלך")) ||
-      normText.includes(normalizeTextLoose("מספר הטלפון לחזרה")) ||
-      normText.includes(normalizeTextLoose("המספר לחזרה")) ||
-      normText.includes(normalizeTextLoose("לחזור למספר"))
-    ));
-
-    const strictExpected = mentionsCallerId ? expectedCaller : (mentionsCallback ? expectedCaptured : null);
-    if (strictExpected) {
-      const spokenDigits = extractHebrewSpokenDigits(botText) || digitsOnly(botText);
-      const expectedLast4 = last4Digits(strictExpected);
-      const spokenLast4 = last4Digits(spokenDigits);
-      // In validation turns we only speak last4; force correction if last4 mismatches or missing.
-      if (!spokenLast4 || spokenLast4.length !== 4 || spokenLast4 !== expectedLast4) {
-        phoneHallucinationCorrectionSent = true;
-        const expectedSpoken = formatLast4ForHebrewSpeech(strictExpected);
-
-        logError(connId, "Model spoke a validated phone number incorrectly; forcing correction.", {
-          said: spokenLast4 || null,
-          expected: expectedLast4,
-          mode: mentionsCallerId ? "caller_id" : "captured_phone",
-        });
-
-        if (hasActiveResponse) {
-          try {
-            openAiWs.send(JSON.stringify({ type: "response.cancel" }));
-          } catch (_) {}
-        }
-
-        hasActiveResponse = false;
-        botSpeaking = false;
-        botTurnActive = false;
-
-        sendModelPrompt(
-          openAiWs,
-          `תיקון חובה: 4 הספרות האחרונות הנכונות הן "${expectedSpoken}". הקריאו אותן בדיוק ספרה-ספרה ושאלו שאלה אחת בלבד לאישור: "זה נכון?"`,
-          "validated_phone_correction"
-        );
-
-        return true;
-      }
-    }
 
     const seqs = extractDigitSequences(botText);
     // Also handle common speech formatting like "0 5 0 ..." or Hebrew digit-words.
@@ -1795,8 +1854,8 @@ wss.on("connection", async (twilioWs, req) => {
 
   function detectGenderPreference(text) {
     const t = String(text || "").toLowerCase();
-    if (/(אני\s*(?:גבר|בן)|פנה\s*אלי\s*בלשון\s*זכר|בלשון\s*זכר|תדבר\s*אלי\s*בלשון\s*זכר)/.test(t)) return "male";
-    if (/(אני\s*(?:אישה|בת)|פני\s*אלי\s*בלשון\s*נקבה|בלשון\s*נקבה|תדברי\s*אלי\s*בלשון\s*נקבה)/.test(t)) return "female";
+    if (/(אני\s*(?:גבר|בן)|פנה\s*אלי\s*בלשון\s*זכר|בלשון\s*זכר|תדבר\s*אלי\s*בלשון\s*זכר)/.test(t)) return "masculine";
+    if (/(אני\s*(?:אישה|בת)|פני\s*אלי\s*בלשון\s*נקבה|בלשון\s*נקבה|תדברי\s*אלי\s*בלשון\s*נקבה)/.test(t)) return "feminine";
     return null;
   }
 
@@ -1854,14 +1913,19 @@ wss.on("connection", async (twilioWs, req) => {
 
     const callerILLocal = toIsraeliLocalFromAny(callerRaw) || null;
 
-    const coercedPhone =
+    let coercedPhone =
       normalizePhoneNumber(parsedLead?.phone_number, callerRaw) ||
       normalizePhoneNumber(capturedPhoneIL, callerRaw) ||
       normalizePhoneNumber(callerILLocal, callerRaw) ||
       null;
 
+    if (prefersCallerId) {
+      coercedPhone = null;
+    }
+
     if (parsedLead && typeof parsedLead === "object") {
       parsedLead.phone_number = coercedPhone;
+      if (prefersCallerId) parsedLead.prefers_caller_id = true;
 
 	  // Ensure message target is captured as a separate field (intent="message").
 	  if (String(parsedLead.intent || "").toLowerCase() === "message") {
@@ -1874,8 +1938,8 @@ wss.on("connection", async (twilioWs, req) => {
 	  const intent = String(parsedLead.intent || "").toLowerCase();
 	  if (intent === "sales" || intent === "support") {
 	    const fb = extractBrandModelFallback(conversationLog);
-	    if (!safeStr(parsedLead.brand)) parsedLead.brand = fb.brand || "לא צוין";
-	    if (!safeStr(parsedLead.model)) parsedLead.model = fb.model || "לא צוין";
+	    if (!safeStr(parsedLead.brand)) parsedLead.brand = fb.brand || null;
+	    if (!safeStr(parsedLead.model)) parsedLead.model = fb.model || null;
 	  }
     }
 
@@ -1883,15 +1947,7 @@ wss.on("connection", async (twilioWs, req) => {
     // we still want the webhook to go to the FINAL webhook (not ABANDONED).
     // Keep this override narrowly scoped to intent="message" to avoid changing
     // behavior in other flows.
-    const callerLabel = String(callerRaw || "").toLowerCase().trim();
-    const isCallerBlocked =
-      !callerLabel ||
-      callerLabel === "anonymous" ||
-      callerLabel === "blocked" ||
-      callerLabel === "null" ||
-      callerLabel === "unknown" ||
-      callerLabel === "restricted" ||
-      callerLabel === "private";
+    const isCallerBlocked = isCallerIdBlockedValue(callerRaw);
 
     const hasName = safeStr(parsedLead?.full_name).length >= 2;
     const hasContent = safeStr(parsedLead?.reason || parsedLead?.notes).length > 0;
@@ -2048,7 +2104,7 @@ wss.on("connection", async (twilioWs, req) => {
 
     sendModelPrompt(
       openAiWs,
-      `פתחי את השיחה עם הלקוח במשפט הבא (אפשר לשנות מעט את הניסוח אבל לא להאריך): "${opening}" ואז עצרי והמתיני לתשובה שלו.`,
+      `פתחו את השיחה עם הלקוח במשפט הבא (אפשר לשנות מעט את הניסוח אבל לא להאריך): "${opening}" ואז עצרו והמתינו לתשובתם.`,
       "opening_greeting"
     );
   });
@@ -2093,35 +2149,7 @@ wss.on("connection", async (twilioWs, req) => {
             break;
           }
 
-          // 2) Correct repeated-captured phone if model said different digits
-          if (!phoneCorrectionSent && capturedPhoneIL) {
-            const saidDigits = extractHebrewSpokenDigits(text) || digitsOnly(text);
-            const cap = digitsOnly(capturedPhoneIL);
-            const saidLast4 = last4Digits(saidDigits);
-            const capLast4 = last4Digits(cap);
-            // We only speak last4 for privacy; correct if last4 mismatches.
-            if (saidLast4 && saidLast4.length === 4 && capLast4 && saidLast4 !== capLast4) {
-              phoneCorrectionSent = true;
-              const capSpoken = formatLast4ForHebrewSpeech(cap);
-              logError(connId, "Model repeated wrong phone digits; forcing correction.", {
-                captured: cap,
-                model_said: said,
-              });
-              try {
-                openAiWs.send(JSON.stringify({ type: "response.cancel" }));
-              } catch (_) {}
-              hasActiveResponse = false;
-              botSpeaking = false;
-              botTurnActive = false;
-              sendModelPrompt(
-                openAiWs,
-                `תיקון חובה: 4 הספרות האחרונות שנקלטו הן "${capSpoken}". הקריאו אותן בדיוק ספרה-ספרה ושאלו: "זה נכון?" בלי להוסיף או להשמיט ספרות.`,
-                "phone_correction"
-              );
-            }
-          }
-
-          // 3) If the bot said a goodbye, hang up after audio finishes
+          // 2) If the bot said a goodbye, hang up after audio finishes
           if (!goodbyePendingHangup && MB_HANGUP_AFTER_GOODBYE && isGoodbyeUtterance(text)) {
             goodbyePendingHangup = true;
             goodbyePendingText = text;
@@ -2198,19 +2226,19 @@ wss.on("connection", async (twilioWs, req) => {
         logAlways(`[CALLER][${connId}] ${t}`);
 
         const gPref = detectGenderPreference(t);
-        if (gPref && gPref !== preferredGender) {
-          preferredGender = gPref;
+        if (gPref && gPref !== preferredGrammar) {
+          preferredGrammar = gPref;
           const addon =
-            gPref === "male"
-              ? 'הלקוח ביקש לפנות אליו בלשון זכר (אבל עדיין ברבים: "אתם"). אל תתנצלי ואל תדגישי את זה, פשוט התאימי ניסוח.'
-              : 'הלקוחה ביקשה לפנות אליה בלשון נקבה (אבל עדיין ברבים: "אתן"). אל תתנצלי ואל תדגישי את זה, פשוט התאימי ניסוח.';
+            gPref === "masculine"
+              ? 'הלקוח ביקש לשון זכר. דברו בלשון זכר ברבים ("אתם"). אל תתנצלו ואל תדגישו את זה, פשוט התאימו ניסוח.'
+              : 'הלקוחה ביקשה לשון נקבה. דברו בלשון נקבה ברבים ("אתן"). אל תתנצלו ואל תדגישו את זה, פשוט התאימו ניסוח.';
           if (!genderInstructionSent) {
             genderInstructionSent = true;
             updateSessionInstructions(openAiWs, addon, "gender_pref");
           }
         }
 
-        const phoneFromSpeech = extractBestPhoneFromText(t);
+        const phoneFromSpeech = needsPhoneCapture ? extractBestPhoneFromText(t) : null;
         if (phoneFromSpeech) {
           capturedPhoneIL = phoneFromSpeech;
           logDebug(connId, `Captured phone from speech: ${capturedPhoneIL}`);
@@ -2282,13 +2310,18 @@ wss.on("connection", async (twilioWs, req) => {
       refreshAllowedPhonesFromSheets();
 
       callerIL = toIsraeliLocalFromAny(callerRaw) || null;
+      prefersCallerId = !!callerIL;
+      needsPhoneCapture = !prefersCallerId;
       if (callerIL) {
         allowedPhonesDigits.add(digitsOnly(callerIL));
-
-        const callerSpoken = formatLast4ForHebrewSpeech(callerIL);
         queueSessionAddon(
-          `מספר הטלפון המזוהה של המתקשר (לשמירה פנימית) מסתיים ב-4 ספרות אחרונות: "${callerSpoken}". כשאת שואלת האם לחזור למספר המזוהה—חובה להקריא ללקוח אך ורק את 4 הספרות האחרונות (בפורמט הזה, ספרה-ספרה), ולבקש אישור ("זה נכון?"). לעולם אל תקריאי את המספר המלא, ולעולם אל תגידי שאינך רואה/יודעת את המספר.`,
+          'אם השיחה הגיעה עם מספר מזוהה: אסור לבקש מספר טלפון, אסור לבצע ולידציה, ואסור להקריא ספרות. מותר לומר רק: "אם נצטרך לחזור אליכם, נחזור למספר שממנו התקשרתם".',
           "caller_id"
+        );
+      } else {
+        queueSessionAddon(
+          "אם אין מספר מזוהה: מותר לשאול שאלה אחת בלבד לקבלת מספר טלפון (באורך 9–10 ספרות). אין ולידציה מתקדמת ואין חזרה על הספרות.",
+          "no_caller_id"
         );
       }
 
@@ -2383,5 +2416,6 @@ wss.on("connection", async (twilioWs, req) => {
 server.listen(PORT, () => {
   console.log(`==> Your service is live`);
   console.log(`==> Available at your primary URL ${process.env.RENDER_EXTERNAL_URL || ""}`);
+  logEnvStatus();
   loadSheetsCache("Startup").catch((err) => console.error("[ERROR] Startup sheets load failed", err));
 });
