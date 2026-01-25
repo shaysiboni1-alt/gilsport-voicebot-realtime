@@ -48,9 +48,16 @@ function safeStr(v) {
   return (v === undefined || v === null) ? "" : String(v).trim();
 }
 
-async function fetchWithTimeout(url, options = {}, timeoutMs = 4500) {
+function resolveTurnTimeoutMs(fallbackMs) {
+  if (TURN_TIMEOUT_MS_SET) return TURN_TIMEOUT_MS;
+  return fallbackMs;
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs) {
+  const effectiveTimeoutMs = resolveTurnTimeoutMs(timeoutMs ?? 4500);
+  if (effectiveTimeoutMs <= 0) return fetch(url, options);
   const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  const t = setTimeout(() => ctrl.abort(), effectiveTimeoutMs);
   try {
     const res = await fetch(url, { ...options, signal: ctrl.signal });
     return res;
@@ -369,17 +376,23 @@ const TIME_ZONE = process.env.TIME_ZONE || "Asia/Jerusalem";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const OPENAI_REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview-2024-12-17";
 const OPENAI_VOICE = process.env.OPENAI_VOICE || "alloy";
+const OPENAI_SUMMARY_MODEL = process.env.OPENAI_SUMMARY_MODEL || "";
 
 const MB_DEBUG = envBool("MB_DEBUG", true);
 const MB_LOG_TRANSCRIPTS = envBool("MB_LOG_TRANSCRIPTS", true);
 const MB_NO_BARGE_TAIL_MS = envNumber("MB_NO_BARGE_TAIL_MS", 1600);
 const MB_BARGE_IN_COOLDOWN_MS = envNumber("MB_BARGE_IN_COOLDOWN_MS", 500);
+const MB_BARGE_IN_DEBOUNCE_MS = envNumber("MB_BARGE_IN_DEBOUNCE_MS", 0);
+const MB_BARGE_IN_MIN_MS = envNumber("MB_BARGE_IN_MIN_MS", 0);
 const MB_ALLOW_BARGE_IN = envBool("MB_ALLOW_BARGE_IN", false);
 const MB_HANGUP_AFTER_GOODBYE = envBool("MB_HANGUP_AFTER_GOODBYE", true);
 const MB_TTS_SPEED = envNumber("MB_TTS_SPEED", 1.0);
 const MB_TTS_SPEED_CLAMPED = Math.max(0.9, Math.min(MB_TTS_SPEED, 1.2));
+const OPENAI_SPEAKING_RATE = envNumber("OPENAI_SPEAKING_RATE", MB_TTS_SPEED);
+const OPENAI_SPEAKING_RATE_CLAMPED = Math.max(0.9, Math.min(OPENAI_SPEAKING_RATE, 1.2));
 
 const MB_TRANSCRIPTION_LANGUAGE = process.env.MB_TRANSCRIPTION_LANGUAGE || "he";
+const MB_TRANSCRIPTION_MODEL = process.env.MB_TRANSCRIPTION_MODEL || "whisper-1";
 
 const MB_LLM_PROVIDER = String(process.env.MB_LLM_PROVIDER || "openai").toLowerCase();
 const MB_GEMINI_TEXT_MODEL = process.env.MB_GEMINI_TEXT_MODEL || "gemini-1.5-pro";
@@ -399,6 +412,10 @@ const MB_VAD_SUFFIX_MS = envNumber("MB_VAD_SUFFIX_MS", 200);
 // Idle / Duration
 const MB_IDLE_WARNING_MS = envNumber("MB_IDLE_WARNING_MS", 40000);
 const MB_IDLE_HANGUP_MS = envNumber("MB_IDLE_HANGUP_MS", 90000);
+
+const TURN_TIMEOUT_MS = envNumber("TURN_TIMEOUT_MS", 0);
+const TURN_TIMEOUT_MS_SET = process.env.TURN_TIMEOUT_MS !== undefined
+  && String(process.env.TURN_TIMEOUT_MS).trim() !== "";
 
 // Max call
 const MB_MAX_CALL_MS = envNumber("MB_MAX_CALL_MS", 5 * 60 * 1000);
@@ -508,7 +525,7 @@ async function callLeadParsingLlm(systemPrompt, userPrompt, connId, tag) {
   }
 
   if (!OPENAI_API_KEY) return null;
-  const response = await fetchWithTimeout(
+  const response = await fetch(
     "https://api.openai.com/v1/chat/completions",
     {
       method: "POST",
@@ -521,8 +538,7 @@ async function callLeadParsingLlm(systemPrompt, userPrompt, connId, tag) {
           { role: "user", content: userPrompt },
         ],
       }),
-    },
-    6000
+    }
   );
 
   if (!response.ok) return null;
@@ -572,6 +588,9 @@ function logEnvStatus() {
   logEnvFallback("TIME_ZONE", TIME_ZONE);
   logEnvFallback("OPENAI_REALTIME_MODEL", OPENAI_REALTIME_MODEL);
   logEnvFallback("OPENAI_VOICE", OPENAI_VOICE);
+  logEnvFallback("OPENAI_SUMMARY_MODEL", OPENAI_SUMMARY_MODEL);
+  logEnvFallback("OPENAI_SPEAKING_RATE", OPENAI_SPEAKING_RATE);
+  logEnvFallback("TURN_TIMEOUT_MS", TURN_TIMEOUT_MS);
   logEnvPresence("GSHEET_ID");
   logEnvPresence("GOOGLE_SERVICE_ACCOUNT_JSON_B64");
   logEnvPresence("PUBLIC_BASE_URL");
@@ -581,9 +600,12 @@ function logEnvStatus() {
     ["MB_LOG_TRANSCRIPTS", MB_LOG_TRANSCRIPTS],
     ["MB_NO_BARGE_TAIL_MS", MB_NO_BARGE_TAIL_MS],
     ["MB_BARGE_IN_COOLDOWN_MS", MB_BARGE_IN_COOLDOWN_MS],
+    ["MB_BARGE_IN_DEBOUNCE_MS", MB_BARGE_IN_DEBOUNCE_MS],
+    ["MB_BARGE_IN_MIN_MS", MB_BARGE_IN_MIN_MS],
     ["MB_ALLOW_BARGE_IN", MB_ALLOW_BARGE_IN],
     ["MB_HANGUP_AFTER_GOODBYE", MB_HANGUP_AFTER_GOODBYE],
     ["MB_TTS_SPEED", MB_TTS_SPEED],
+    ["MB_TRANSCRIPTION_MODEL", MB_TRANSCRIPTION_MODEL],
     ["MB_TRANSCRIPTION_LANGUAGE", MB_TRANSCRIPTION_LANGUAGE],
     ["MB_LLM_PROVIDER", MB_LLM_PROVIDER],
     ["MB_GEMINI_TEXT_MODEL", MB_GEMINI_TEXT_MODEL],
@@ -1673,6 +1695,55 @@ function extractBrandModelFallback(conversationLog) {
   return out;
 }
 
+function normalizeNameCandidate(raw) {
+  const cleaned = String(raw || "").replace(/["'`]/g, "").replace(/\s+/g, " ").trim();
+  return cleaned;
+}
+
+function extractNameCorrection(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return null;
+
+  const correction = raw.match(/לא\s+([^\d,.!?]{2,40})[, ]+([^\d,.!?]{2,40})/);
+  if (correction) {
+    const candidate = normalizeNameCandidate(correction[2]);
+    if (candidate && /[\u0590-\u05FF]/.test(candidate)) return candidate;
+  }
+
+  const patterns = [
+    /(?:שמי|שמי הוא|קוראים לי|השם שלי|אני)\s+([^\d,.!?]{2,60})/,
+    /(?:תרשמו|תרשמי|לרשום|לכתוב)\s+([^\d,.!?]{2,60})/,
+  ];
+  for (const re of patterns) {
+    const match = raw.match(re);
+    if (match) {
+      const candidate = normalizeNameCandidate(match[1]);
+      if (candidate && /[\u0590-\u05FF]/.test(candidate)) return candidate;
+    }
+  }
+  return null;
+}
+
+function isLeadConfirmationPrompt(text) {
+  const t = normalizeTextLoose(text || "");
+  return (
+    t.includes(normalizeTextLoose("זה נכון")) ||
+    t.includes(normalizeTextLoose("נכון?")) ||
+    t.includes(normalizeTextLoose("זה בסדר")) ||
+    t.includes(normalizeTextLoose("מאשר"))
+  );
+}
+
+function isAffirmativeReply(text) {
+  const t = normalizeTextLoose(text || "");
+  return /^(כן|נכון|מאשר|מאשרת|זה בסדר|בסדר)/.test(t);
+}
+
+function isNegativeReply(text) {
+  const t = normalizeTextLoose(text || "");
+  return /^(לא|לא נכון|לא זה|זה לא)/.test(t);
+}
+
 // -----------------------------
 // Per-call handler
 // -----------------------------
@@ -1710,6 +1781,14 @@ wss.on("connection", async (twilioWs, req) => {
   let maxCallWarningTimeout = null;
 
   let callEnded = false;
+  let lastOpenAiAudioTs = 0;
+  let bargeInSequenceStartTs = null;
+  let lastBargeInMediaTs = 0;
+  let finalFullName = null;
+  let finalPhoneIL = null;
+  let leadConfirmed = false;
+  let awaitingLeadConfirmation = false;
+  let leadConfirmationAttempts = 0;
 
   // When the bot says the closing line, we want to hang up automatically (so Twilio doesn't keep the line open)
   let goodbyePendingHangup = false;
@@ -1913,17 +1992,22 @@ wss.on("connection", async (twilioWs, req) => {
 
     const callerILLocal = toIsraeliLocalFromAny(callerRaw) || null;
 
-    let coercedPhone =
-      normalizePhoneNumber(parsedLead?.phone_number, callerRaw) ||
-      normalizePhoneNumber(capturedPhoneIL, callerRaw) ||
-      normalizePhoneNumber(callerILLocal, callerRaw) ||
-      null;
+    const effectiveFullName = safeStr(finalFullName) || safeStr(parsedLead?.full_name) || "";
 
-    if (prefersCallerId) {
-      coercedPhone = null;
+    let coercedPhone = null;
+    if (prefersCallerId && callerILLocal) {
+      coercedPhone = normalizePhoneNumber(callerILLocal, callerRaw) || null;
+    } else {
+      coercedPhone =
+        normalizePhoneNumber(finalPhoneIL, callerRaw) ||
+        normalizePhoneNumber(parsedLead?.phone_number, callerRaw) ||
+        normalizePhoneNumber(capturedPhoneIL, callerRaw) ||
+        normalizePhoneNumber(callerILLocal, callerRaw) ||
+        null;
     }
 
     if (parsedLead && typeof parsedLead === "object") {
+      parsedLead.full_name = effectiveFullName || null;
       parsedLead.phone_number = coercedPhone;
       if (prefersCallerId) parsedLead.prefers_caller_id = true;
 
@@ -1949,14 +2033,16 @@ wss.on("connection", async (twilioWs, req) => {
     // behavior in other flows.
     const isCallerBlocked = isCallerIdBlockedValue(callerRaw);
 
-    const hasName = safeStr(parsedLead?.full_name).length >= 2;
+    const hasName = safeStr(effectiveFullName).length >= 2;
     const hasContent = safeStr(parsedLead?.reason || parsedLead?.notes).length > 0;
     const hasPhone = !!coercedPhone && digitsOnly(coercedPhone).length >= 9;
     const intent = String(parsedLead?.intent || "").toLowerCase();
     const hasMessageFor = safeStr(parsedLead?.message_for).length > 0;
-    const phoneRequired = isCallerBlocked;
+    const phoneRequired = !prefersCallerId && isCallerBlocked;
 
     const isFullLead = !!(
+      plannedEnd &&
+      leadConfirmed &&
       hasName &&
       hasContent &&
       (!phoneRequired || hasPhone) &&
@@ -2082,10 +2168,10 @@ wss.on("connection", async (twilioWs, req) => {
           model: OPENAI_REALTIME_MODEL,
           modalities: ["audio", "text"],
           voice: OPENAI_VOICE,
-          speed: MB_TTS_SPEED_CLAMPED,
+          speed: OPENAI_SPEAKING_RATE_CLAMPED,
           input_audio_format: "g711_ulaw",
           output_audio_format: "g711_ulaw",
-          input_audio_transcription: { model: "whisper-1", language: MB_TRANSCRIPTION_LANGUAGE },
+          input_audio_transcription: { model: MB_TRANSCRIPTION_MODEL, language: MB_TRANSCRIPTION_LANGUAGE },
           turn_detection: {
             type: "server_vad",
             threshold: MB_VAD_THRESHOLD,
@@ -2098,7 +2184,7 @@ wss.on("connection", async (twilioWs, req) => {
       })
     );
 
-    if (MB_DEBUG) logInfo(connId, "TTS speed set", { speed: MB_TTS_SPEED_CLAMPED });
+    if (MB_DEBUG) logInfo(connId, "TTS speed set", { speed: OPENAI_SPEAKING_RATE_CLAMPED });
 
     flushSessionAddons();
 
@@ -2153,6 +2239,14 @@ wss.on("connection", async (twilioWs, req) => {
           if (!goodbyePendingHangup && MB_HANGUP_AFTER_GOODBYE && isGoodbyeUtterance(text)) {
             goodbyePendingHangup = true;
             goodbyePendingText = text;
+          }
+
+          if (isLeadConfirmationPrompt(text)) {
+            leadConfirmationAttempts += 1;
+            if (leadConfirmationAttempts <= 2) {
+              awaitingLeadConfirmation = true;
+              leadConfirmed = false;
+            }
           }
         }
         currentBotText = "";
@@ -2225,6 +2319,30 @@ wss.on("connection", async (twilioWs, req) => {
         conversationLog.push({ from: "user", text: t });
         logAlways(`[CALLER][${connId}] ${t}`);
 
+        if (awaitingLeadConfirmation) {
+          if (isAffirmativeReply(t)) {
+            leadConfirmed = true;
+            awaitingLeadConfirmation = false;
+          } else if (isNegativeReply(t)) {
+            leadConfirmed = false;
+            awaitingLeadConfirmation = false;
+          }
+        }
+
+        const nameCorrection = extractNameCorrection(t);
+        if (nameCorrection && nameCorrection !== finalFullName) {
+          finalFullName = nameCorrection;
+          leadConfirmed = false;
+        }
+
+        if (needsPhoneCapture) {
+          const phoneCorrection = extractBestPhoneFromText(t);
+          if (phoneCorrection && phoneCorrection !== finalPhoneIL) {
+            finalPhoneIL = phoneCorrection;
+            leadConfirmed = false;
+          }
+        }
+
         const gPref = detectGenderPreference(t);
         if (gPref && gPref !== preferredGrammar) {
           preferredGrammar = gPref;
@@ -2256,7 +2374,6 @@ wss.on("connection", async (twilioWs, req) => {
 
         // If the Realtime session hit max duration, end the call cleanly.
         if (msg && msg.error && msg.error.code === "session_expired") {
-          plannedEnd = true;
           // Avoid trying to keep streaming into an expired session
           hasActiveResponse = false;
           botSpeaking = false;
@@ -2388,7 +2505,24 @@ wss.on("connection", async (twilioWs, req) => {
         if (botTurnActive || botSpeaking) return;
       }
 
+      const inBargeInWindow = MB_ALLOW_BARGE_IN && (botTurnActive || botSpeaking);
+      if (MB_BARGE_IN_MIN_MS > 0 && inBargeInWindow) {
+        if (!bargeInSequenceStartTs || (lastBargeInMediaTs && now - lastBargeInMediaTs > MB_BARGE_IN_MIN_MS)) {
+          bargeInSequenceStartTs = now;
+        }
+        lastBargeInMediaTs = now;
+        if (now - bargeInSequenceStartTs < MB_BARGE_IN_MIN_MS) return;
+      } else {
+        bargeInSequenceStartTs = null;
+        lastBargeInMediaTs = 0;
+      }
+
+      if (MB_BARGE_IN_DEBOUNCE_MS > 0 && lastOpenAiAudioTs && now - lastOpenAiAudioTs < MB_BARGE_IN_DEBOUNCE_MS) {
+        return;
+      }
+
       openAiWs.send(JSON.stringify({ type: "input_audio_buffer.append", audio: payload }));
+      lastOpenAiAudioTs = now;
     } else if (event === "stop") {
       logAlways(`[TWILIO_STOP][${connId}] stream stopped`);
       if (!plannedEnd && !callEnded) {
