@@ -7,6 +7,9 @@ require("dotenv").config();
 const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
 
 // Node 18+: fetch is global; otherwise fall back
 const fetch = global.fetch || require("node-fetch");
@@ -324,6 +327,13 @@ const MB_HANGUP_AFTER_GOODBYE = envBool("MB_HANGUP_AFTER_GOODBYE", true);
 const MB_TTS_SPEED = envNumber("MB_TTS_SPEED", 1.0);
 const MB_TTS_SPEED_CLAMPED = Math.max(0.9, Math.min(MB_TTS_SPEED, 1.2));
 
+// Gemini Live POC (no effect unless explicitly enabled)
+const MB_GEMINI_POC_ENABLED = envBool("MB_GEMINI_POC_ENABLED", false);
+const MB_GEMINI_LIVE_MODEL = process.env.MB_GEMINI_LIVE_MODEL || "gemini-live-2.5-flash-native-audio";
+const GCP_PROJECT_ID = process.env.GCP_PROJECT_ID || "";
+const GCP_LOCATION = process.env.GCP_LOCATION || "us-central1";
+const GCP_SA_JSON_B64 = process.env.GCP_SA_JSON_B64 || "";
+
 const MB_VAD_THRESHOLD = envNumber("MB_VAD_THRESHOLD", 0.65);
 const MB_VAD_SILENCE_MS = envNumber("MB_VAD_SILENCE_MS", 900);
 const MB_VAD_PREFIX_MS = envNumber("MB_VAD_PREFIX_MS", 200);
@@ -363,6 +373,47 @@ const MB_LEAD_PARSING_MODEL = process.env.MB_LEAD_PARSING_MODEL || "gpt-4.1-mini
 // Twilio credentials (for hangup, recording URL, caller resolution)
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
+
+// -----------------------------
+// Gemini Live POC helpers
+// -----------------------------
+const geminiPocState = {
+  credentialsLoaded: false,
+  credentialsPath: "",
+  credentialsError: "",
+};
+
+function loadGcpCredentialsFromB64(b64) {
+  if (!b64) return { loaded: false, path: "", error: "" };
+  try {
+    const decoded = Buffer.from(b64, "base64").toString("utf8");
+    JSON.parse(decoded);
+    const targetPath = path.join(os.tmpdir(), "gcp-sa.json");
+    fs.writeFileSync(targetPath, decoded, { mode: 0o600 });
+    process.env.GOOGLE_APPLICATION_CREDENTIALS = targetPath;
+    return { loaded: true, path: targetPath, error: "" };
+  } catch (err) {
+    return { loaded: false, path: "", error: String(err?.message || err) };
+  }
+}
+
+async function getGeminiAccessToken() {
+  const auth = new google.auth.GoogleAuth({
+    scopes: ["https://www.googleapis.com/auth/cloud-platform"],
+  });
+  const client = await auth.getClient();
+  const token = await client.getAccessToken();
+  if (typeof token === "string") return token;
+  if (token && typeof token === "object" && typeof token.token === "string") return token.token;
+  return "";
+}
+
+if (MB_GEMINI_POC_ENABLED && GCP_SA_JSON_B64) {
+  const loaded = loadGcpCredentialsFromB64(GCP_SA_JSON_B64);
+  geminiPocState.credentialsLoaded = loaded.loaded;
+  geminiPocState.credentialsPath = loaded.path;
+  geminiPocState.credentialsError = loaded.error;
+}
 
 function logDebug(connId, msg, extra) {
   if (!MB_DEBUG) return;
@@ -1065,6 +1116,239 @@ app.get("/health", (req, res) => {
     settings_keys: Object.keys(sheetsCache.settings || {}).length,
     prompt_ids: Object.keys(sheetsCache.prompts || {}).length,
   });
+});
+
+// -------------------- Gemini Live POC (disabled by default) --------------------
+app.get("/poc/gemini/health", (req, res) => {
+  res.status(200).json({
+    enabled: MB_GEMINI_POC_ENABLED,
+    project: GCP_PROJECT_ID || "",
+    location: GCP_LOCATION,
+    model: MB_GEMINI_LIVE_MODEL,
+    has_credentials: !!(process.env.GOOGLE_APPLICATION_CREDENTIALS || GCP_SA_JSON_B64),
+    credentials_loaded: geminiPocState.credentialsLoaded,
+    timestamp: nowIso(),
+  });
+});
+
+app.post("/poc/gemini/live-test", async (req, res) => {
+  if (!MB_GEMINI_POC_ENABLED) {
+    return res.status(404).json({ ok: false, error: "Gemini POC disabled" });
+  }
+  if (!GCP_PROJECT_ID) {
+    return res.status(400).json({ ok: false, error: "Missing GCP_PROJECT_ID" });
+  }
+
+  const speakText = safeStr(req.body?.speak_text || "שלום, מדברת נטע. איך אפשר לעזור?");
+  const expectLanguage = safeStr(req.body?.expect_language || "he-IL");
+  const startAt = Date.now();
+  let firstAudioAt = null;
+  let audioBytes = 0;
+  let audioFrames = 0;
+  let textParts = [];
+  let streamError = "";
+
+  try {
+    const token = await getGeminiAccessToken();
+    if (!token) {
+      return res.status(500).json({ ok: false, error: "Failed to obtain GCP access token" });
+    }
+
+    const url = `wss://${GCP_LOCATION}-aiplatform.googleapis.com/v1beta1/projects/${GCP_PROJECT_ID}/locations/${GCP_LOCATION}/publishers/google/models/${MB_GEMINI_LIVE_MODEL}:streamGenerateContent`;
+    const setupMessage = {
+      setup: {
+        model: MB_GEMINI_LIVE_MODEL,
+        generation_config: {
+          response_modalities: ["AUDIO"],
+          audio_config: {
+            audio_encoding: "MULAW",
+            sample_rate_hertz: 8000,
+          },
+        },
+      },
+    };
+    const contentMessage = {
+      client_content: {
+        turns: [
+          {
+            role: "user",
+            parts: [
+              {
+                text: `Please respond in ${expectLanguage} with natural, fluent Hebrew speech. Speak this text: ${speakText}`,
+              },
+            ],
+          },
+        ],
+        turn_complete: true,
+      },
+    };
+
+    await new Promise((resolve) => {
+      let resolved = false;
+      const ws = new WebSocket(url, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      });
+
+      const finish = () => {
+        if (resolved) return;
+        resolved = true;
+        try {
+          ws.close();
+        } catch (_) {
+          // ignore
+        }
+        resolve();
+      };
+
+      const timeout = setTimeout(() => {
+        streamError = streamError || "Gemini Live timeout";
+        finish();
+      }, 20000);
+
+      ws.on("open", () => {
+        ws.send(JSON.stringify(setupMessage));
+        ws.send(JSON.stringify(contentMessage));
+      });
+
+      ws.on("message", (data) => {
+        let message;
+        try {
+          const raw = typeof data === "string" ? data : data.toString("utf8");
+          message = JSON.parse(raw);
+        } catch (_) {
+          return;
+        }
+
+        const serverContent = message?.serverContent || message?.server_content;
+        const modelTurn = serverContent?.modelTurn || serverContent?.model_turn;
+        const parts = modelTurn?.parts || [];
+        for (const part of parts) {
+          if (part?.text) {
+            textParts.push(part.text);
+          }
+          const inlineData = part?.inlineData || part?.inline_data;
+          const audioData = inlineData?.data;
+          if (audioData) {
+            if (!firstAudioAt) firstAudioAt = Date.now();
+            const buf = Buffer.from(audioData, "base64");
+            audioBytes += buf.length;
+            audioFrames += 1;
+          }
+        }
+
+        const turnComplete =
+          serverContent?.turnComplete ||
+          serverContent?.turn_complete ||
+          message?.turnComplete ||
+          message?.turn_complete;
+
+        if (turnComplete) {
+          clearTimeout(timeout);
+          finish();
+        }
+      });
+
+      ws.on("error", (err) => {
+        streamError = String(err?.message || err);
+        clearTimeout(timeout);
+        finish();
+      });
+
+      ws.on("close", () => {
+        clearTimeout(timeout);
+        finish();
+      });
+    });
+  } catch (err) {
+    streamError = String(err?.message || err);
+  }
+
+  const finishedAt = Date.now();
+  const latencyMs = firstAudioAt ? firstAudioAt - startAt : null;
+  const audioReceived = audioBytes > 0;
+
+  res.status(200).json({
+    ok: !streamError,
+    session_opened: !streamError,
+    model: MB_GEMINI_LIVE_MODEL,
+    latency_ms: latencyMs,
+    total_duration_ms: finishedAt - startAt,
+    audio_received: audioReceived || audioFrames > 0,
+    audio_bytes: audioBytes,
+    text: textParts.join(" ").trim(),
+    error: streamError || undefined,
+  });
+});
+
+app.post("/poc/gemini/stt-test", async (req, res) => {
+  if (!MB_GEMINI_POC_ENABLED) {
+    return res.status(404).json({ ok: false, error: "Gemini POC disabled" });
+  }
+  if (!GCP_PROJECT_ID) {
+    return res.status(400).json({ ok: false, error: "Missing GCP_PROJECT_ID" });
+  }
+
+  const audioB64 = safeStr(req.body?.audio_b64 || "");
+  const mimeType = safeStr(req.body?.mime_type || "audio/wav");
+  const prompt = safeStr(req.body?.prompt || "Transcribe this audio in Hebrew.");
+  if (!audioB64) {
+    return res.status(400).json({ ok: false, error: "Missing audio_b64" });
+  }
+
+  try {
+    const token = await getGeminiAccessToken();
+    if (!token) {
+      return res.status(500).json({ ok: false, error: "Failed to obtain GCP access token" });
+    }
+
+    const url = `https://${GCP_LOCATION}-aiplatform.googleapis.com/v1beta1/projects/${GCP_PROJECT_ID}/locations/${GCP_LOCATION}/publishers/google/models/${MB_GEMINI_LIVE_MODEL}:generateContent`;
+    const payload = {
+      contents: [
+        {
+          role: "user",
+          parts: [
+            { text: prompt },
+            { inlineData: { data: audioB64, mimeType } },
+          ],
+        },
+      ],
+      generationConfig: {
+        responseModalities: ["TEXT"],
+      },
+    };
+
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
+
+    if (!response.ok) {
+      const errText = await response.text().catch(() => "");
+      return res.status(response.status || 500).json({
+        ok: false,
+        error: errText || "Gemini STT request failed",
+        status: response.status,
+      });
+    }
+
+    const data = await response.json();
+    const parts = data?.candidates?.[0]?.content?.parts || [];
+    const transcript = parts.map((part) => part?.text).filter(Boolean).join(" ").trim();
+
+    return res.status(200).json({
+      ok: true,
+      model: MB_GEMINI_LIVE_MODEL,
+      transcript,
+    });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: String(err?.message || err) });
+  }
 });
 
 // -------------------- Recording callback + public proxy --------------------
