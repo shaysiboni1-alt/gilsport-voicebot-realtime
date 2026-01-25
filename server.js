@@ -525,7 +525,7 @@ async function callLeadParsingLlm(systemPrompt, userPrompt, connId, tag) {
   }
 
   if (!OPENAI_API_KEY) return null;
-  const response = await fetchWithTimeout(
+  const response = await fetch(
     "https://api.openai.com/v1/chat/completions",
     {
       method: "POST",
@@ -538,8 +538,7 @@ async function callLeadParsingLlm(systemPrompt, userPrompt, connId, tag) {
           { role: "user", content: userPrompt },
         ],
       }),
-    },
-    6000
+    }
   );
 
   if (!response.ok) return null;
@@ -1696,6 +1695,55 @@ function extractBrandModelFallback(conversationLog) {
   return out;
 }
 
+function normalizeNameCandidate(raw) {
+  const cleaned = String(raw || "").replace(/["'`]/g, "").replace(/\s+/g, " ").trim();
+  return cleaned;
+}
+
+function extractNameCorrection(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return null;
+
+  const correction = raw.match(/לא\s+([^\d,.!?]{2,40})[, ]+([^\d,.!?]{2,40})/);
+  if (correction) {
+    const candidate = normalizeNameCandidate(correction[2]);
+    if (candidate && /[\u0590-\u05FF]/.test(candidate)) return candidate;
+  }
+
+  const patterns = [
+    /(?:שמי|שמי הוא|קוראים לי|השם שלי|אני)\s+([^\d,.!?]{2,60})/,
+    /(?:תרשמו|תרשמי|לרשום|לכתוב)\s+([^\d,.!?]{2,60})/,
+  ];
+  for (const re of patterns) {
+    const match = raw.match(re);
+    if (match) {
+      const candidate = normalizeNameCandidate(match[1]);
+      if (candidate && /[\u0590-\u05FF]/.test(candidate)) return candidate;
+    }
+  }
+  return null;
+}
+
+function isLeadConfirmationPrompt(text) {
+  const t = normalizeTextLoose(text || "");
+  return (
+    t.includes(normalizeTextLoose("זה נכון")) ||
+    t.includes(normalizeTextLoose("נכון?")) ||
+    t.includes(normalizeTextLoose("זה בסדר")) ||
+    t.includes(normalizeTextLoose("מאשר"))
+  );
+}
+
+function isAffirmativeReply(text) {
+  const t = normalizeTextLoose(text || "");
+  return /^(כן|נכון|מאשר|מאשרת|זה בסדר|בסדר)/.test(t);
+}
+
+function isNegativeReply(text) {
+  const t = normalizeTextLoose(text || "");
+  return /^(לא|לא נכון|לא זה|זה לא)/.test(t);
+}
+
 // -----------------------------
 // Per-call handler
 // -----------------------------
@@ -1736,6 +1784,11 @@ wss.on("connection", async (twilioWs, req) => {
   let lastOpenAiAudioTs = 0;
   let bargeInSequenceStartTs = null;
   let lastBargeInMediaTs = 0;
+  let finalFullName = null;
+  let finalPhoneIL = null;
+  let leadConfirmed = false;
+  let awaitingLeadConfirmation = false;
+  let leadConfirmationAttempts = 0;
 
   // When the bot says the closing line, we want to hang up automatically (so Twilio doesn't keep the line open)
   let goodbyePendingHangup = false;
@@ -1939,17 +1992,22 @@ wss.on("connection", async (twilioWs, req) => {
 
     const callerILLocal = toIsraeliLocalFromAny(callerRaw) || null;
 
-    let coercedPhone =
-      normalizePhoneNumber(parsedLead?.phone_number, callerRaw) ||
-      normalizePhoneNumber(capturedPhoneIL, callerRaw) ||
-      normalizePhoneNumber(callerILLocal, callerRaw) ||
-      null;
+    const effectiveFullName = safeStr(finalFullName) || safeStr(parsedLead?.full_name) || "";
 
-    if (prefersCallerId) {
-      coercedPhone = null;
+    let coercedPhone = null;
+    if (prefersCallerId && callerILLocal) {
+      coercedPhone = normalizePhoneNumber(callerILLocal, callerRaw) || null;
+    } else {
+      coercedPhone =
+        normalizePhoneNumber(finalPhoneIL, callerRaw) ||
+        normalizePhoneNumber(parsedLead?.phone_number, callerRaw) ||
+        normalizePhoneNumber(capturedPhoneIL, callerRaw) ||
+        normalizePhoneNumber(callerILLocal, callerRaw) ||
+        null;
     }
 
     if (parsedLead && typeof parsedLead === "object") {
+      parsedLead.full_name = effectiveFullName || null;
       parsedLead.phone_number = coercedPhone;
       if (prefersCallerId) parsedLead.prefers_caller_id = true;
 
@@ -1975,14 +2033,16 @@ wss.on("connection", async (twilioWs, req) => {
     // behavior in other flows.
     const isCallerBlocked = isCallerIdBlockedValue(callerRaw);
 
-    const hasName = safeStr(parsedLead?.full_name).length >= 2;
+    const hasName = safeStr(effectiveFullName).length >= 2;
     const hasContent = safeStr(parsedLead?.reason || parsedLead?.notes).length > 0;
     const hasPhone = !!coercedPhone && digitsOnly(coercedPhone).length >= 9;
     const intent = String(parsedLead?.intent || "").toLowerCase();
     const hasMessageFor = safeStr(parsedLead?.message_for).length > 0;
-    const phoneRequired = isCallerBlocked;
+    const phoneRequired = !prefersCallerId && isCallerBlocked;
 
     const isFullLead = !!(
+      plannedEnd &&
+      leadConfirmed &&
       hasName &&
       hasContent &&
       (!phoneRequired || hasPhone) &&
@@ -2180,6 +2240,14 @@ wss.on("connection", async (twilioWs, req) => {
             goodbyePendingHangup = true;
             goodbyePendingText = text;
           }
+
+          if (isLeadConfirmationPrompt(text)) {
+            leadConfirmationAttempts += 1;
+            if (leadConfirmationAttempts <= 2) {
+              awaitingLeadConfirmation = true;
+              leadConfirmed = false;
+            }
+          }
         }
         currentBotText = "";
         break;
@@ -2251,6 +2319,30 @@ wss.on("connection", async (twilioWs, req) => {
         conversationLog.push({ from: "user", text: t });
         logAlways(`[CALLER][${connId}] ${t}`);
 
+        if (awaitingLeadConfirmation) {
+          if (isAffirmativeReply(t)) {
+            leadConfirmed = true;
+            awaitingLeadConfirmation = false;
+          } else if (isNegativeReply(t)) {
+            leadConfirmed = false;
+            awaitingLeadConfirmation = false;
+          }
+        }
+
+        const nameCorrection = extractNameCorrection(t);
+        if (nameCorrection && nameCorrection !== finalFullName) {
+          finalFullName = nameCorrection;
+          leadConfirmed = false;
+        }
+
+        if (needsPhoneCapture) {
+          const phoneCorrection = extractBestPhoneFromText(t);
+          if (phoneCorrection && phoneCorrection !== finalPhoneIL) {
+            finalPhoneIL = phoneCorrection;
+            leadConfirmed = false;
+          }
+        }
+
         const gPref = detectGenderPreference(t);
         if (gPref && gPref !== preferredGrammar) {
           preferredGrammar = gPref;
@@ -2282,7 +2374,6 @@ wss.on("connection", async (twilioWs, req) => {
 
         // If the Realtime session hit max duration, end the call cleanly.
         if (msg && msg.error && msg.error.code === "session_expired") {
-          plannedEnd = true;
           // Avoid trying to keep streaming into an expired session
           hasActiveResponse = false;
           botSpeaking = false;
