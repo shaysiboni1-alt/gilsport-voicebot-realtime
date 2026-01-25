@@ -327,6 +327,9 @@ const MB_HANGUP_AFTER_GOODBYE = envBool("MB_HANGUP_AFTER_GOODBYE", true);
 const MB_TTS_SPEED = envNumber("MB_TTS_SPEED", 1.0);
 const MB_TTS_SPEED_CLAMPED = Math.max(0.9, Math.min(MB_TTS_SPEED, 1.2));
 
+const MB_LLM_PROVIDER = String(process.env.MB_LLM_PROVIDER || "openai").toLowerCase();
+const MB_GEMINI_TEXT_MODEL = process.env.MB_GEMINI_TEXT_MODEL || "gemini-1.5-pro";
+
 // Gemini Live POC (no effect unless explicitly enabled)
 const MB_GEMINI_POC_ENABLED = envBool("MB_GEMINI_POC_ENABLED", false);
 const MB_GEMINI_LIVE_MODEL = process.env.MB_GEMINI_LIVE_MODEL || "gemini-live-2.5-flash-native-audio";
@@ -408,7 +411,73 @@ async function getGeminiAccessToken() {
   return "";
 }
 
-if (MB_GEMINI_POC_ENABLED && GCP_SA_JSON_B64) {
+async function callLeadParsingLlm(systemPrompt, userPrompt, connId, tag) {
+  if (MB_LLM_PROVIDER === "gemini") {
+    if (!GCP_PROJECT_ID) {
+      logError(connId, `${tag} missing GCP_PROJECT_ID`);
+      return null;
+    }
+    const token = await getGeminiAccessToken();
+    if (!token) {
+      logError(connId, `${tag} missing GCP access token`);
+      return null;
+    }
+
+    const url = `https://${GCP_LOCATION}-aiplatform.googleapis.com/v1beta1/projects/${GCP_PROJECT_ID}/locations/${GCP_LOCATION}/publishers/google/models/${MB_GEMINI_TEXT_MODEL}:generateContent`;
+    const payload = {
+      systemInstruction: { role: "system", parts: [{ text: systemPrompt }] },
+      contents: [{ role: "user", parts: [{ text: userPrompt }] }],
+      generationConfig: {
+        responseMimeType: "application/json",
+      },
+    };
+
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
+
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      logError(connId, `${tag} HTTP ${response.status}`, text);
+      return null;
+    }
+
+    const data = await response.json();
+    const parts = data?.candidates?.[0]?.content?.parts || [];
+    const text = parts.map((part) => part?.text).filter(Boolean).join(" ").trim();
+    return text || null;
+  }
+
+  if (!OPENAI_API_KEY) return null;
+  const response = await fetchWithTimeout(
+    "https://api.openai.com/v1/chat/completions",
+    {
+      method: "POST",
+      headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: MB_LEAD_PARSING_MODEL,
+        response_format: { type: "json_object" },
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userPrompt },
+        ],
+      }),
+    },
+    6000
+  );
+
+  if (!response.ok) return null;
+  const data = await response.json();
+  const raw = data.choices?.[0]?.message?.content;
+  return raw || null;
+}
+
+if (GCP_SA_JSON_B64 && (MB_GEMINI_POC_ENABLED || MB_LLM_PROVIDER === "gemini")) {
   const loaded = loadGcpCredentialsFromB64(GCP_SA_JSON_B64);
   geminiPocState.credentialsLoaded = loaded.loaded;
   geminiPocState.credentialsPath = loaded.path;
@@ -926,7 +995,8 @@ function mostlyLatin(s) {
 async function ensureHebrewLeadFields(lead, conversationText, connId, botName, businessName) {
   // Goal: keep webhook human-friendly in Hebrew, even if the caller spoke some English.
   // We do NOT force Hebrew for phone numbers; only narrative fields.
-  if (!OPENAI_API_KEY) return lead;
+  if (MB_LLM_PROVIDER === "openai" && !OPENAI_API_KEY) return lead;
+  if (MB_LLM_PROVIDER === "gemini" && !GCP_PROJECT_ID) return lead;
   if (!lead || typeof lead !== "object") return lead;
 
   const needs = mostlyLatin(lead.full_name) || mostlyLatin(lead.reason) || mostlyLatin(lead.notes);
@@ -958,26 +1028,7 @@ Current lead object:
 ${JSON.stringify(lead)}
 `.trim();
 
-    const response = await fetchWithTimeout(
-      "https://api.openai.com/v1/chat/completions",
-      {
-        method: "POST",
-        headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: MB_LEAD_PARSING_MODEL,
-          response_format: { type: "json_object" },
-          messages: [
-            { role: "system", content: systemPrompt },
-            { role: "user", content: userPrompt },
-          ],
-        }),
-      },
-      6000
-    );
-
-    if (!response.ok) return lead;
-    const data = await response.json();
-    const raw = data.choices?.[0]?.message?.content;
+    const raw = await callLeadParsingLlm(systemPrompt, userPrompt, connId, "LeadHebrew");
     if (!raw) return lead;
     let parsed;
     try {
@@ -1000,7 +1051,8 @@ ${JSON.stringify(lead)}
 
 async function extractLeadFromConversation(conversationLog, connId, botName, businessName) {
   const tag = "LeadParse";
-  if (!OPENAI_API_KEY) return null;
+  if (MB_LLM_PROVIDER === "openai" && !OPENAI_API_KEY) return null;
+  if (MB_LLM_PROVIDER === "gemini" && !GCP_PROJECT_ID) return null;
   if (!Array.isArray(conversationLog) || conversationLog.length === 0) return null;
 
   try {
@@ -1023,30 +1075,12 @@ async function extractLeadFromConversation(conversationLog, connId, botName, bus
 	חובה: אם intent הוא "sales" או "support" — מלאו brand ו-model גם אם הלקוח אמר שאין/לא יודע; במקרה כזה כתבו את ניסוח הלקוח כפי שנאמר (לדוגמה: "אין מותג" / "לא יודע דגם"), ואל תשאירו null.
 `.trim();
 
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: MB_LEAD_PARSING_MODEL,
-        response_format: { type: "json_object" },
-        messages: [
-          { role: "system", content: `${systemPrompt}\n\n${systemAddon}` },
-          {
-            role: "user",
-            content: `תמלול שיחה בין מתקשר לבין בוט קולי בשם "${botName}" עבור "${businessName}". החזירו אובייקט JSON בלבד.\nתמלול:\n${conversationText}`,
-          },
-        ],
-      }),
-    });
-
-    if (!response.ok) {
-      const text = await response.text().catch(() => "");
-      logError(connId, `${tag} HTTP ${response.status}`, text);
-      return null;
-    }
-
-    const data = await response.json();
-    const raw = data.choices?.[0]?.message?.content;
+    const raw = await callLeadParsingLlm(
+      `${systemPrompt}\n\n${systemAddon}`,
+      `תמלול שיחה בין מתקשר לבין בוט קולי בשם "${botName}" עבור "${businessName}". החזירו אובייקט JSON בלבד.\nתמלול:\n${conversationText}`,
+      connId,
+      tag
+    );
     if (!raw) return null;
 
     let parsed;
