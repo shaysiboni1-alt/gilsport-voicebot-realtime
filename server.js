@@ -1144,6 +1144,7 @@ app.post("/poc/gemini/live-test", async (req, res) => {
   const startAt = Date.now();
   let firstAudioAt = null;
   let audioBytes = 0;
+  let audioFrames = 0;
   let textParts = [];
   let streamError = "";
 
@@ -1153,102 +1154,113 @@ app.post("/poc/gemini/live-test", async (req, res) => {
       return res.status(500).json({ ok: false, error: "Failed to obtain GCP access token" });
     }
 
-    const url = `https://${GCP_LOCATION}-aiplatform.googleapis.com/v1beta1/projects/${GCP_PROJECT_ID}/locations/${GCP_LOCATION}/publishers/google/models/${MB_GEMINI_LIVE_MODEL}:streamGenerateContent`;
-    const payload = {
-      contents: [
-        {
-          role: "user",
-          parts: [
-            {
-              text: `Please respond in ${expectLanguage} with natural, fluent Hebrew speech. Speak this text: ${speakText}`,
-            },
-          ],
-        },
-      ],
-      generationConfig: {
-        responseModalities: ["AUDIO"],
-        audioConfig: {
-          audioEncoding: "MULAW",
-          sampleRateHertz: 8000,
+    const url = `wss://${GCP_LOCATION}-aiplatform.googleapis.com/v1beta1/projects/${GCP_PROJECT_ID}/locations/${GCP_LOCATION}/publishers/google/models/${MB_GEMINI_LIVE_MODEL}:streamGenerateContent`;
+    const setupMessage = {
+      setup: {
+        model: MB_GEMINI_LIVE_MODEL,
+        generation_config: {
+          response_modalities: ["AUDIO"],
+          audio_config: {
+            audio_encoding: "MULAW",
+            sample_rate_hertz: 8000,
+          },
         },
       },
     };
-
-    const response = await fetch(url, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-        Accept: "text/event-stream",
+    const contentMessage = {
+      client_content: {
+        turns: [
+          {
+            role: "user",
+            parts: [
+              {
+                text: `Please respond in ${expectLanguage} with natural, fluent Hebrew speech. Speak this text: ${speakText}`,
+              },
+            ],
+          },
+        ],
+        turn_complete: true,
       },
-      body: JSON.stringify(payload),
-    });
+    };
 
-    if (!response.ok || !response.body) {
-      const errText = await response.text().catch(() => "");
-      return res.status(response.status || 500).json({
-        ok: false,
-        error: errText || "Gemini Live request failed",
-        status: response.status,
+    await new Promise((resolve) => {
+      let resolved = false;
+      const ws = new WebSocket(url, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
       });
-    }
 
-    const contentType = response.headers.get("content-type") || "";
-    if (!contentType.includes("text/event-stream")) {
-      const bodyText = await response.text();
-      return res.status(500).json({
-        ok: false,
-        error: "Unexpected response content type",
-        details: bodyText.slice(0, 500),
+      const finish = () => {
+        if (resolved) return;
+        resolved = true;
+        try {
+          ws.close();
+        } catch (_) {
+          // ignore
+        }
+        resolve();
+      };
+
+      const timeout = setTimeout(() => {
+        streamError = streamError || "Gemini Live timeout";
+        finish();
+      }, 20000);
+
+      ws.on("open", () => {
+        ws.send(JSON.stringify(setupMessage));
+        ws.send(JSON.stringify(contentMessage));
       });
-    }
 
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
+      ws.on("message", (data) => {
+        let message;
+        try {
+          const raw = typeof data === "string" ? data : data.toString("utf8");
+          message = JSON.parse(raw);
+        } catch (_) {
+          return;
+        }
 
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-
-      const events = buffer.split("\n\n");
-      buffer = events.pop() || "";
-
-      for (const evt of events) {
-        const lines = evt.split("\n");
-        for (const line of lines) {
-          if (!line.startsWith("data:")) continue;
-          const data = line.slice(5).trim();
-          if (!data || data === "[DONE]") continue;
-
-          let parsed;
-          try {
-            parsed = JSON.parse(data);
-          } catch (err) {
-            continue;
+        const serverContent = message?.serverContent || message?.server_content;
+        const modelTurn = serverContent?.modelTurn || serverContent?.model_turn;
+        const parts = modelTurn?.parts || [];
+        for (const part of parts) {
+          if (part?.text) {
+            textParts.push(part.text);
           }
-
-          const candidates = parsed.candidates || [];
-          for (const candidate of candidates) {
-            const parts = candidate?.content?.parts || [];
-            for (const part of parts) {
-              if (part?.text) {
-                textParts.push(part.text);
-              }
-              const inlineData = part?.inlineData;
-              const audioData = inlineData?.data;
-              const mimeType = inlineData?.mimeType || "";
-              if (audioData && mimeType.startsWith("audio/")) {
-                if (!firstAudioAt) firstAudioAt = Date.now();
-                const buf = Buffer.from(audioData, "base64");
-                audioBytes += buf.length;
-              }
-            }
+          const inlineData = part?.inlineData || part?.inline_data;
+          const audioData = inlineData?.data;
+          if (audioData) {
+            if (!firstAudioAt) firstAudioAt = Date.now();
+            const buf = Buffer.from(audioData, "base64");
+            audioBytes += buf.length;
+            audioFrames += 1;
           }
         }
-      }
-    }
+
+        const turnComplete =
+          serverContent?.turnComplete ||
+          serverContent?.turn_complete ||
+          message?.turnComplete ||
+          message?.turn_complete;
+
+        if (turnComplete) {
+          clearTimeout(timeout);
+          finish();
+        }
+      });
+
+      ws.on("error", (err) => {
+        streamError = String(err?.message || err);
+        clearTimeout(timeout);
+        finish();
+      });
+
+      ws.on("close", () => {
+        clearTimeout(timeout);
+        finish();
+      });
+    });
   } catch (err) {
     streamError = String(err?.message || err);
   }
@@ -1263,7 +1275,7 @@ app.post("/poc/gemini/live-test", async (req, res) => {
     model: MB_GEMINI_LIVE_MODEL,
     latency_ms: latencyMs,
     total_duration_ms: finishedAt - startAt,
-    audio_received: audioReceived,
+    audio_received: audioReceived || audioFrames > 0,
     audio_bytes: audioBytes,
     text: textParts.join(" ").trim(),
     error: streamError || undefined,
