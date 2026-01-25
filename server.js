@@ -225,9 +225,71 @@ function isTranscriptGarbage(t, hasRealUserYet) {
   return true;
 }
 
+function isLatinOnlyShortNoise(raw) {
+  const trimmed = String(raw || "").trim();
+  if (!trimmed) return true;
+  const latinOnly = /^[A-Za-z\s]+$/.test(trimmed);
+  if (!latinOnly) return false;
+
+  const compact = trimmed.replace(/\s+/g, " ").trim();
+  if (compact.length >= 12) return false;
+
+  const lower = compact.toLowerCase();
+  if (lower.includes("english") || lower.includes("speak english") || lower.includes("in english")) return false;
+
+  return true;
+}
+
+function getLastBotUtterance(log) {
+  if (!Array.isArray(log)) return "";
+  for (let i = log.length - 1; i >= 0; i -= 1) {
+    const item = log[i];
+    if (item && item.from === "bot" && String(item.text || "").trim()) {
+      return String(item.text || "").trim();
+    }
+  }
+  return "";
+}
+
+function isDirectYesNoQuestion(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return false;
+  const norm = normalizeTextLoose(raw);
+  if (!norm) return false;
+
+  const yesNoTriggers = [
+    "האם",
+    "זה נכון",
+    "נכון",
+    "כן או לא",
+    "מאשר",
+    "מאשרים",
+    "אישור",
+    "תרצו",
+    "רוצים",
+    "רוצה",
+    "מעוניין",
+    "מעוניינים",
+    "מעונינת",
+    "אפשר",
+    "לחזור למספר",
+    "נחזור למספר",
+    "להמשיך",
+  ];
+
+  if (yesNoTriggers.some((t) => norm.includes(normalizeTextLoose(t)))) return true;
+
+  if (/\?$/.test(raw)) {
+    const openQuestion = /(מה|מי|מתי|למה|איפה|איך|כיצד|כמה)/;
+    return !openQuestion.test(norm);
+  }
+
+  return false;
+}
+
 // Additional speech validity gate to prevent background noise / fillers from triggering turns.
 // Returns true when the transcript is too short / low-signal to be treated as a real user turn.
-function isLowValueUtterance(raw) {
+function isLowValueUtterance(raw, allowShortYesNo) {
   const t = String(raw || "").trim();
   if (!t) return true;
 
@@ -262,7 +324,12 @@ function isLowValueUtterance(raw) {
     "no",
   ]);
 
-  if (words.length <= 1 && fillers.has(norm)) return true;
+  if (words.length <= 1 && fillers.has(norm)) {
+    if (allowShortYesNo && (norm === "כן" || norm === "לא" || norm === "אוקיי" || norm === "אוקי" || norm === "yes" || norm === "no")) {
+      return false;
+    }
+    return true;
+  }
 
   // Latin-only short utterances without digits are noise for our flow.
   if (hasLatin && !hasHebrew && !hasDigits) return true;
@@ -790,6 +857,8 @@ function buildSystemInstructionsFromSheets() {
 כללי Runtime קשיחים:
 - קופון: מותר למסור קוד קופון אך ורק מתוך SETTINGS (SALES_COUPON_CODE). איסור מוחלט להמציא קוד. אם הערך חסר/ריק—להשתמש ב-NO_DATA_MESSAGE.
 - טענת מחיר/השוואה: מותר להגיב אך ורק במשפט מתוך SETTINGS (PRICE_CLAIM_SENTENCE). איסור מוחלט להמציא משפט חלופי. אם הערך חסר/ריק—להשתמש ב-NO_DATA_MESSAGE.
+- כתובת/מיקום/סניפים: מותר למסור אך ורק אם מופיע ב-SETTINGS תחת BUSINESS_ADDRESS (או המפתח הקיים אצלנו). אם חסר/ריק—חובה לומר שאין מידע ולא לנחש.
+- טלפונים: לעולם לא למסור/להקריא מספרים שאינם קיימים במפורש ב-SETTINGS.
 `.trim();
 
   const finalWithHardPolicy = [final, hardPolicy].filter(Boolean).join("\n\n");
@@ -1590,6 +1659,9 @@ wss.on("connection", async (twilioWs, req) => {
   let botSpeaking = false;
   let botTurnActive = false;
   let noListenUntilTs = 0;
+  let lastBotAudioAt = 0;
+  let lastBargeCancelAt = 0;
+  let callerIdConfirmAsked = false;
 
   let plannedEnd = false;
   let callStartTs = Date.now();
@@ -1610,8 +1682,6 @@ wss.on("connection", async (twilioWs, req) => {
   let phoneCorrectionSent = false;
   let phoneHallucinationCorrectionSent = false;
 
-  let preferredGender = null;
-  let genderInstructionSent = false;
   let baseInstructions = null;
 
   let conversationLog = [];
@@ -1790,14 +1860,8 @@ wss.on("connection", async (twilioWs, req) => {
     openAiWs.send(JSON.stringify({ type: "response.create" }));
     hasActiveResponse = true;
     botTurnActive = true;
+    botSpeaking = true;
     logDebug(connId, `response.create SPEAK purpose=${purpose || "no-tag"} text=${text}`);
-  }
-
-  function detectGenderPreference(text) {
-    const t = String(text || "").toLowerCase();
-    if (/(אני\s*(?:גבר|בן)|פנה\s*אלי\s*בלשון\s*זכר|בלשון\s*זכר|תדבר\s*אלי\s*בלשון\s*זכר)/.test(t)) return "male";
-    if (/(אני\s*(?:אישה|בת)|פני\s*אלי\s*בלשון\s*נקבה|בלשון\s*נקבה|תדברי\s*אלי\s*בלשון\s*נקבה)/.test(t)) return "female";
-    return null;
   }
 
   function updateSessionInstructions(openAiWs, addon, label) {
@@ -2068,7 +2132,7 @@ wss.on("connection", async (twilioWs, req) => {
       case "response.created":
         hasActiveResponse = true;
         botTurnActive = true;
-        botSpeaking = false;
+        botSpeaking = true;
         noListenUntilTs = Date.now() + (MB_ALLOW_BARGE_IN ? MB_BARGE_IN_COOLDOWN_MS : MB_NO_BARGE_TAIL_MS);
         currentBotText = "";
         break;
@@ -2126,6 +2190,7 @@ wss.on("connection", async (twilioWs, req) => {
             goodbyePendingHangup = true;
             goodbyePendingText = text;
           }
+
         }
         currentBotText = "";
         break;
@@ -2141,11 +2206,13 @@ wss.on("connection", async (twilioWs, req) => {
 
         if (twilioWs.readyState === WebSocket.OPEN) {
           twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload: b64 } }));
+          lastBotAudioAt = now;
         }
         break;
       }
 
       case "response.audio.done":
+        hasActiveResponse = false;
         botSpeaking = false;
         botTurnActive = false;
 
@@ -2158,6 +2225,7 @@ wss.on("connection", async (twilioWs, req) => {
         }
         break;
 
+      case "response.done":
       case "response.completed":
         hasActiveResponse = false;
         botSpeaking = false;
@@ -2177,6 +2245,9 @@ wss.on("connection", async (twilioWs, req) => {
           isEnglishRequest(raw) ||
           conversationLog.some((m) => m.from === "user" && isEnglishRequest(m.text || ""));
 
+        if (isLatinOnlyShortNoise(raw) && !englishRequested) {
+          break;
+        }
         if (hasLatin && !hasHebrew && !englishRequested) {
           break;
         }
@@ -2186,7 +2257,9 @@ wss.on("connection", async (twilioWs, req) => {
         }
 
         // Additional gate: ignore low-signal utterances (breath/noise/fillers) so the bot does not respond "on its own".
-        if (isLowValueUtterance(raw)) {
+        const lastBotText = getLastBotUtterance(conversationLog);
+        const allowShortYesNo = isDirectYesNoQuestion(lastBotText);
+        if (isLowValueUtterance(raw, allowShortYesNo)) {
           logDebug(connId, `Filtered low-value utterance: "${raw}"`);
           break;
         }
@@ -2196,19 +2269,6 @@ wss.on("connection", async (twilioWs, req) => {
 
         conversationLog.push({ from: "user", text: t });
         logAlways(`[CALLER][${connId}] ${t}`);
-
-        const gPref = detectGenderPreference(t);
-        if (gPref && gPref !== preferredGender) {
-          preferredGender = gPref;
-          const addon =
-            gPref === "male"
-              ? 'הלקוח ביקש לפנות אליו בלשון זכר (אבל עדיין ברבים: "אתם"). אל תתנצלי ואל תדגישי את זה, פשוט התאימי ניסוח.'
-              : 'הלקוחה ביקשה לפנות אליה בלשון נקבה (אבל עדיין ברבים: "אתן"). אל תתנצלי ואל תדגישי את זה, פשוט התאימי ניסוח.';
-          if (!genderInstructionSent) {
-            genderInstructionSent = true;
-            updateSessionInstructions(openAiWs, addon, "gender_pref");
-          }
-        }
 
         const phoneFromSpeech = extractBestPhoneFromText(t);
         if (phoneFromSpeech) {
@@ -2286,10 +2346,13 @@ wss.on("connection", async (twilioWs, req) => {
         allowedPhonesDigits.add(digitsOnly(callerIL));
 
         const callerSpoken = formatLast4ForHebrewSpeech(callerIL);
-        queueSessionAddon(
-          `מספר הטלפון המזוהה של המתקשר (לשמירה פנימית) מסתיים ב-4 ספרות אחרונות: "${callerSpoken}". כשאת שואלת האם לחזור למספר המזוהה—חובה להקריא ללקוח אך ורק את 4 הספרות האחרונות (בפורמט הזה, ספרה-ספרה), ולבקש אישור ("זה נכון?"). לעולם אל תקריאי את המספר המלא, ולעולם אל תגידי שאינך רואה/יודעת את המספר.`,
-          "caller_id"
-        );
+        if (!callerIdConfirmAsked && !plannedEnd && !goodbyePendingHangup) {
+          queueSessionAddon(
+            `מספר הטלפון המזוהה של המתקשר (לשמירה פנימית) מסתיים ב-4 ספרות אחרונות: "${callerSpoken}". כשאת שואלת האם לחזור למספר המזוהה—חובה להקריא ללקוח אך ורק את 4 הספרות האחרונות (בפורמט הזה, ספרה-ספרה), ולבקש אישור ("זה נכון?"). לעולם אל תקריאי את המספר המלא, ולעולם אל תגידי שאינך רואה/יודעת את המספר.`,
+            "caller_id"
+          );
+          callerIdConfirmAsked = true;
+        }
       }
 
       callStartTs = Date.now();
@@ -2346,6 +2409,22 @@ wss.on("connection", async (twilioWs, req) => {
       if (!openAiReady || openAiWs.readyState !== WebSocket.OPEN) return;
 
       const now = Date.now();
+
+      if (
+        MB_ALLOW_BARGE_IN &&
+        (hasActiveResponse || botSpeaking) &&
+        now - lastBotAudioAt >= MB_BARGE_IN_COOLDOWN_MS &&
+        now - lastBargeCancelAt >= 200
+      ) {
+        try {
+          openAiWs.send(JSON.stringify({ type: "response.cancel" }));
+          logInfo(connId, "barge_in: response.cancel sent");
+        } catch (_) {}
+        hasActiveResponse = false;
+        botSpeaking = false;
+        botTurnActive = false;
+        lastBargeCancelAt = now;
+      }
 
       // Always respect a short post-TTS cooldown (even when barge-in is enabled) to avoid false turns from echo/noise.
       if (now < noListenUntilTs) return;
