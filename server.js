@@ -378,8 +378,10 @@ const MB_ALLOW_BARGE_IN = envBool("MB_ALLOW_BARGE_IN", false);
 const MB_HANGUP_AFTER_GOODBYE = envBool("MB_HANGUP_AFTER_GOODBYE", true);
 const MB_TTS_SPEED = envNumber("MB_TTS_SPEED", 1.0);
 const MB_TTS_SPEED_CLAMPED = Math.max(0.9, Math.min(MB_TTS_SPEED, 1.2));
+const MB_TTS_NIQQUD_MODE = safeStr(process.env.MB_TTS_NIQQUD_MODE || "off").toLowerCase() === "on";
 
 const MB_TRANSCRIPTION_LANGUAGE = process.env.MB_TRANSCRIPTION_LANGUAGE || "he";
+const MB_TRANSCRIPTION_MODEL = safeStr(process.env.MB_TRANSCRIPTION_MODEL || "");
 
 const MB_LLM_PROVIDER = String(process.env.MB_LLM_PROVIDER || "openai").toLowerCase();
 const MB_GEMINI_TEXT_MODEL = process.env.MB_GEMINI_TEXT_MODEL || "gemini-1.5-pro";
@@ -584,7 +586,9 @@ function logEnvStatus() {
     ["MB_ALLOW_BARGE_IN", MB_ALLOW_BARGE_IN],
     ["MB_HANGUP_AFTER_GOODBYE", MB_HANGUP_AFTER_GOODBYE],
     ["MB_TTS_SPEED", MB_TTS_SPEED],
+    ["MB_TTS_NIQQUD_MODE", MB_TTS_NIQQUD_MODE],
     ["MB_TRANSCRIPTION_LANGUAGE", MB_TRANSCRIPTION_LANGUAGE],
+    ["MB_TRANSCRIPTION_MODEL", MB_TRANSCRIPTION_MODEL],
     ["MB_LLM_PROVIDER", MB_LLM_PROVIDER],
     ["MB_GEMINI_TEXT_MODEL", MB_GEMINI_TEXT_MODEL],
     ["MB_GEMINI_POC_ENABLED", MB_GEMINI_POC_ENABLED],
@@ -611,6 +615,75 @@ function logEnvStatus() {
   for (const [name, fallback] of mbEnvFallbacks) {
     logEnvFallback(name, String(fallback));
   }
+}
+
+function getInputAudioTranscriptionConfig(connId) {
+  if (!MB_TRANSCRIPTION_MODEL) {
+    logAlways("[ENV] Missing MB_TRANSCRIPTION_MODEL; transcription disabled");
+    return null;
+  }
+  if (MB_TRANSCRIPTION_MODEL.toLowerCase().includes("whisper")) {
+    logError(connId, "[ENV] MB_TRANSCRIPTION_MODEL contains whisper; transcription disabled", MB_TRANSCRIPTION_MODEL);
+    return null;
+  }
+  return {
+    model: MB_TRANSCRIPTION_MODEL,
+    language: MB_TRANSCRIPTION_LANGUAGE,
+  };
+}
+
+function isSttInvalidModelError(msg) {
+  const err = msg && msg.error ? msg.error : {};
+  const code = String(err.code || "").toLowerCase();
+  const message = String(err.message || "").toLowerCase();
+  const param = String(err.param || "").toLowerCase();
+  const invalid = code.includes("invalid_model") || message.includes("invalid_model");
+  const sttField = param.includes("input_audio_transcription") || message.includes("input_audio_transcription");
+  return invalid && sttField;
+}
+
+// G.711 μ-law helpers for bot audio gain (output_audio_format is g711_ulaw).
+const BOT_AUDIO_GAIN = 1.25;
+const ULAW_BIAS = 0x84;
+const ULAW_CLIP = 32635;
+
+function ulawToLinear(sample) {
+  const u = (~sample) & 0xff;
+  const sign = u & 0x80;
+  const exponent = (u >> 4) & 0x07;
+  const mantissa = u & 0x0f;
+  const magnitude = ((mantissa << 3) + ULAW_BIAS) << exponent;
+  const pcm = magnitude - ULAW_BIAS;
+  return sign ? -pcm : pcm;
+}
+
+function linearToUlaw(sample) {
+  let s = sample;
+  let sign = 0;
+  if (s < 0) {
+    sign = 0x80;
+    s = -s;
+  }
+  if (s > ULAW_CLIP) s = ULAW_CLIP;
+  s += ULAW_BIAS;
+  let exponent = 7;
+  for (let expMask = 0x4000; (s & expMask) === 0 && exponent > 0; expMask >>= 1) {
+    exponent -= 1;
+  }
+  const mantissa = (s >> (exponent + 3)) & 0x0f;
+  const ulaw = ~(sign | (exponent << 4) | mantissa);
+  return ulaw & 0xff;
+}
+
+function applyGainToUlawBase64(b64, gain) {
+  const buf = Buffer.from(b64, "base64");
+  const out = Buffer.allocUnsafe(buf.length);
+  for (let i = 0; i < buf.length; i += 1) {
+    const pcm = ulawToLinear(buf[i]);
+    const scaled = Math.max(-32768, Math.min(32767, Math.round(pcm * gain)));
+    out[i] = linearToUlaw(scaled);
+  }
+  return out.toString("base64");
 }
 
 // -----------------------------
@@ -2068,10 +2141,20 @@ wss.on("connection", async (twilioWs, req) => {
     }
   );
 
+  let sttEnabled = false;
+  let sttDisabledByError = false;
+
   openAiWs.on("open", () => {
     openAiReady = true;
     const { opening, instructions } = buildSystemInstructionsFromSheets();
-    baseInstructions = instructions;
+    const niqqudAddon =
+      "יש להוציא את כל הדיבור בעברית מנוקדת (ניקוד מלא) לשיפור ההגייה.\nאין לשנות תוכן, אין להוסיף מילים, אין להסיר מילים.";
+    const instructionsWithNiqqud = MB_TTS_NIQQUD_MODE
+      ? [instructions, niqqudAddon].filter(Boolean).join("\n\n")
+      : instructions;
+    baseInstructions = instructionsWithNiqqud;
+    const inputAudioTranscription = getInputAudioTranscriptionConfig(connId);
+    sttEnabled = !!inputAudioTranscription;
 
     const effectiveSilenceMs = MB_VAD_SILENCE_MS + MB_VAD_SUFFIX_MS;
 
@@ -2085,7 +2168,7 @@ wss.on("connection", async (twilioWs, req) => {
           speed: MB_TTS_SPEED_CLAMPED,
           input_audio_format: "g711_ulaw",
           output_audio_format: "g711_ulaw",
-          input_audio_transcription: { model: "whisper-1", language: MB_TRANSCRIPTION_LANGUAGE },
+          ...(inputAudioTranscription ? { input_audio_transcription: inputAudioTranscription } : {}),
           turn_detection: {
             type: "server_vad",
             threshold: MB_VAD_THRESHOLD,
@@ -2093,7 +2176,7 @@ wss.on("connection", async (twilioWs, req) => {
             prefix_padding_ms: MB_VAD_PREFIX_MS,
           },
           max_response_output_tokens: "inf",
-          instructions,
+          instructions: instructionsWithNiqqud,
         },
       })
     );
@@ -2168,7 +2251,8 @@ wss.on("connection", async (twilioWs, req) => {
         noListenUntilTs = now + (MB_ALLOW_BARGE_IN ? MB_BARGE_IN_COOLDOWN_MS : MB_NO_BARGE_TAIL_MS);
 
         if (twilioWs.readyState === WebSocket.OPEN) {
-          twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload: b64 } }));
+          const boosted = applyGainToUlawBase64(b64, BOT_AUDIO_GAIN);
+          twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload: boosted } }));
         }
         break;
       }
@@ -2253,6 +2337,20 @@ wss.on("connection", async (twilioWs, req) => {
 
       case "error":
         logError(connId, "OpenAI error event", msg);
+
+        if (sttEnabled && !sttDisabledByError && isSttInvalidModelError(msg)) {
+          sttDisabledByError = true;
+          sttEnabled = false;
+          logError(connId, "transcription model not supported, continuing without STT");
+          if (openAiWs.readyState === WebSocket.OPEN) {
+            openAiWs.send(
+              JSON.stringify({
+                type: "session.update",
+                session: { input_audio_transcription: null },
+              })
+            );
+          }
+        }
 
         // If the Realtime session hit max duration, end the call cleanly.
         if (msg && msg.error && msg.error.code === "session_expired") {
