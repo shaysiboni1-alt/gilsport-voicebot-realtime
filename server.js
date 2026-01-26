@@ -378,6 +378,7 @@ const MB_ALLOW_BARGE_IN = envBool("MB_ALLOW_BARGE_IN", false);
 const MB_HANGUP_AFTER_GOODBYE = envBool("MB_HANGUP_AFTER_GOODBYE", true);
 const MB_TTS_SPEED = envNumber("MB_TTS_SPEED", 1.0);
 const MB_TTS_SPEED_CLAMPED = Math.max(0.9, Math.min(MB_TTS_SPEED, 1.2));
+const MB_TTS_NIQQUD_MODE = safeStr(process.env.MB_TTS_NIQQUD_MODE || "off").toLowerCase() === "on";
 
 const MB_TRANSCRIPTION_LANGUAGE = process.env.MB_TRANSCRIPTION_LANGUAGE || "he";
 const MB_TRANSCRIPTION_MODEL = safeStr(process.env.MB_TRANSCRIPTION_MODEL || "");
@@ -585,6 +586,7 @@ function logEnvStatus() {
     ["MB_ALLOW_BARGE_IN", MB_ALLOW_BARGE_IN],
     ["MB_HANGUP_AFTER_GOODBYE", MB_HANGUP_AFTER_GOODBYE],
     ["MB_TTS_SPEED", MB_TTS_SPEED],
+    ["MB_TTS_NIQQUD_MODE", MB_TTS_NIQQUD_MODE],
     ["MB_TRANSCRIPTION_LANGUAGE", MB_TRANSCRIPTION_LANGUAGE],
     ["MB_TRANSCRIPTION_MODEL", MB_TRANSCRIPTION_MODEL],
     ["MB_LLM_PROVIDER", MB_LLM_PROVIDER],
@@ -2145,9 +2147,15 @@ wss.on("connection", async (twilioWs, req) => {
   openAiWs.on("open", () => {
     openAiReady = true;
     const { opening, instructions } = buildSystemInstructionsFromSheets();
-    baseInstructions = instructions;
-    const inputAudioTranscription = getInputAudioTranscriptionConfig(connId);
-    sttEnabled = !!inputAudioTranscription;
+    const niqqudAddon =
+      "יש להוציא את כל הדיבור בעברית מנוקדת (ניקוד מלא) לשיפור ההגייה.\nאין לשנות תוכן, אין להוסיף מילים, אין להסיר מילים.";
+
+    const instructionsWithNiqqud = MB_TTS_NIQQUD_MODE
+      ? [instructions, niqqudAddon].filter(Boolean).join("\n\n")
+      : instructions;
+
+    baseInstructions = instructionsWithNiqqud;
+
 
     const effectiveSilenceMs = MB_VAD_SILENCE_MS + MB_VAD_SUFFIX_MS;
 
@@ -2169,7 +2177,7 @@ wss.on("connection", async (twilioWs, req) => {
             prefix_padding_ms: MB_VAD_PREFIX_MS,
           },
           max_response_output_tokens: "inf",
-          instructions,
+          instructions: instructionsWithNiqqud,
         },
       })
     );
