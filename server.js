@@ -2149,12 +2149,13 @@ wss.on("connection", async (twilioWs, req) => {
     const { opening, instructions } = buildSystemInstructionsFromSheets();
     const niqqudAddon =
       "יש להוציא את כל הדיבור בעברית מנוקדת (ניקוד מלא) לשיפור ההגייה.\nאין לשנות תוכן, אין להוסיף מילים, אין להסיר מילים.";
+
     const instructionsWithNiqqud = MB_TTS_NIQQUD_MODE
       ? [instructions, niqqudAddon].filter(Boolean).join("\n\n")
       : instructions;
+
     baseInstructions = instructionsWithNiqqud;
-    const inputAudioTranscription = getInputAudioTranscriptionConfig(connId);
-    sttEnabled = !!inputAudioTranscription;
+
 
     const effectiveSilenceMs = MB_VAD_SILENCE_MS + MB_VAD_SUFFIX_MS;
 
