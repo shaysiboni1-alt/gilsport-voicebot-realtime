@@ -48,16 +48,9 @@ function safeStr(v) {
   return (v === undefined || v === null) ? "" : String(v).trim();
 }
 
-function resolveTurnTimeoutMs(fallbackMs) {
-  if (TURN_TIMEOUT_MS_SET) return TURN_TIMEOUT_MS;
-  return fallbackMs;
-}
-
-async function fetchWithTimeout(url, options = {}, timeoutMs) {
-  const effectiveTimeoutMs = resolveTurnTimeoutMs(timeoutMs ?? 4500);
-  if (effectiveTimeoutMs <= 0) return fetch(url, options);
+async function fetchWithTimeout(url, options = {}, timeoutMs = 4500) {
   const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), effectiveTimeoutMs);
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
     const res = await fetch(url, { ...options, signal: ctrl.signal });
     return res;
@@ -376,23 +369,17 @@ const TIME_ZONE = process.env.TIME_ZONE || "Asia/Jerusalem";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const OPENAI_REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview-2024-12-17";
 const OPENAI_VOICE = process.env.OPENAI_VOICE || "alloy";
-const OPENAI_SUMMARY_MODEL = process.env.OPENAI_SUMMARY_MODEL || "";
 
 const MB_DEBUG = envBool("MB_DEBUG", true);
 const MB_LOG_TRANSCRIPTS = envBool("MB_LOG_TRANSCRIPTS", true);
 const MB_NO_BARGE_TAIL_MS = envNumber("MB_NO_BARGE_TAIL_MS", 1600);
 const MB_BARGE_IN_COOLDOWN_MS = envNumber("MB_BARGE_IN_COOLDOWN_MS", 500);
-const MB_BARGE_IN_DEBOUNCE_MS = envNumber("MB_BARGE_IN_DEBOUNCE_MS", 0);
-const MB_BARGE_IN_MIN_MS = envNumber("MB_BARGE_IN_MIN_MS", 0);
 const MB_ALLOW_BARGE_IN = envBool("MB_ALLOW_BARGE_IN", false);
 const MB_HANGUP_AFTER_GOODBYE = envBool("MB_HANGUP_AFTER_GOODBYE", true);
 const MB_TTS_SPEED = envNumber("MB_TTS_SPEED", 1.0);
 const MB_TTS_SPEED_CLAMPED = Math.max(0.9, Math.min(MB_TTS_SPEED, 1.2));
-const OPENAI_SPEAKING_RATE = envNumber("OPENAI_SPEAKING_RATE", MB_TTS_SPEED);
-const OPENAI_SPEAKING_RATE_CLAMPED = Math.max(0.9, Math.min(OPENAI_SPEAKING_RATE, 1.2));
 
 const MB_TRANSCRIPTION_LANGUAGE = process.env.MB_TRANSCRIPTION_LANGUAGE || "he";
-const MB_TRANSCRIPTION_MODEL = process.env.MB_TRANSCRIPTION_MODEL || "whisper-1";
 
 const MB_LLM_PROVIDER = String(process.env.MB_LLM_PROVIDER || "openai").toLowerCase();
 const MB_GEMINI_TEXT_MODEL = process.env.MB_GEMINI_TEXT_MODEL || "gemini-1.5-pro";
@@ -412,10 +399,6 @@ const MB_VAD_SUFFIX_MS = envNumber("MB_VAD_SUFFIX_MS", 200);
 // Idle / Duration
 const MB_IDLE_WARNING_MS = envNumber("MB_IDLE_WARNING_MS", 40000);
 const MB_IDLE_HANGUP_MS = envNumber("MB_IDLE_HANGUP_MS", 90000);
-
-const TURN_TIMEOUT_MS = envNumber("TURN_TIMEOUT_MS", 0);
-const TURN_TIMEOUT_MS_SET = process.env.TURN_TIMEOUT_MS !== undefined
-  && String(process.env.TURN_TIMEOUT_MS).trim() !== "";
 
 // Max call
 const MB_MAX_CALL_MS = envNumber("MB_MAX_CALL_MS", 5 * 60 * 1000);
@@ -589,9 +572,6 @@ function logEnvStatus() {
   logEnvFallback("TIME_ZONE", TIME_ZONE);
   logEnvFallback("OPENAI_REALTIME_MODEL", OPENAI_REALTIME_MODEL);
   logEnvFallback("OPENAI_VOICE", OPENAI_VOICE);
-  logEnvFallback("OPENAI_SUMMARY_MODEL", OPENAI_SUMMARY_MODEL);
-  logEnvFallback("OPENAI_SPEAKING_RATE", OPENAI_SPEAKING_RATE);
-  logEnvFallback("TURN_TIMEOUT_MS", TURN_TIMEOUT_MS);
   logEnvPresence("GSHEET_ID");
   logEnvPresence("GOOGLE_SERVICE_ACCOUNT_JSON_B64");
   logEnvPresence("PUBLIC_BASE_URL");
@@ -601,12 +581,9 @@ function logEnvStatus() {
     ["MB_LOG_TRANSCRIPTS", MB_LOG_TRANSCRIPTS],
     ["MB_NO_BARGE_TAIL_MS", MB_NO_BARGE_TAIL_MS],
     ["MB_BARGE_IN_COOLDOWN_MS", MB_BARGE_IN_COOLDOWN_MS],
-    ["MB_BARGE_IN_DEBOUNCE_MS", MB_BARGE_IN_DEBOUNCE_MS],
-    ["MB_BARGE_IN_MIN_MS", MB_BARGE_IN_MIN_MS],
     ["MB_ALLOW_BARGE_IN", MB_ALLOW_BARGE_IN],
     ["MB_HANGUP_AFTER_GOODBYE", MB_HANGUP_AFTER_GOODBYE],
     ["MB_TTS_SPEED", MB_TTS_SPEED],
-    ["MB_TRANSCRIPTION_MODEL", MB_TRANSCRIPTION_MODEL],
     ["MB_TRANSCRIPTION_LANGUAGE", MB_TRANSCRIPTION_LANGUAGE],
     ["MB_LLM_PROVIDER", MB_LLM_PROVIDER],
     ["MB_GEMINI_TEXT_MODEL", MB_GEMINI_TEXT_MODEL],
@@ -1733,9 +1710,6 @@ wss.on("connection", async (twilioWs, req) => {
   let maxCallWarningTimeout = null;
 
   let callEnded = false;
-  let lastOpenAiAudioTs = 0;
-  let bargeInSequenceStartTs = null;
-  let lastBargeInMediaTs = 0;
 
   // When the bot says the closing line, we want to hang up automatically (so Twilio doesn't keep the line open)
   let goodbyePendingHangup = false;
@@ -2108,10 +2082,10 @@ wss.on("connection", async (twilioWs, req) => {
           model: OPENAI_REALTIME_MODEL,
           modalities: ["audio", "text"],
           voice: OPENAI_VOICE,
-          speed: OPENAI_SPEAKING_RATE_CLAMPED,
+          speed: MB_TTS_SPEED_CLAMPED,
           input_audio_format: "g711_ulaw",
           output_audio_format: "g711_ulaw",
-          input_audio_transcription: { model: MB_TRANSCRIPTION_MODEL, language: MB_TRANSCRIPTION_LANGUAGE },
+          input_audio_transcription: { model: "whisper-1", language: MB_TRANSCRIPTION_LANGUAGE },
           turn_detection: {
             type: "server_vad",
             threshold: MB_VAD_THRESHOLD,
@@ -2124,7 +2098,7 @@ wss.on("connection", async (twilioWs, req) => {
       })
     );
 
-    if (MB_DEBUG) logInfo(connId, "TTS speed set", { speed: OPENAI_SPEAKING_RATE_CLAMPED });
+    if (MB_DEBUG) logInfo(connId, "TTS speed set", { speed: MB_TTS_SPEED_CLAMPED });
 
     flushSessionAddons();
 
@@ -2414,24 +2388,7 @@ wss.on("connection", async (twilioWs, req) => {
         if (botTurnActive || botSpeaking) return;
       }
 
-      const inBargeInWindow = MB_ALLOW_BARGE_IN && (botTurnActive || botSpeaking);
-      if (MB_BARGE_IN_MIN_MS > 0 && inBargeInWindow) {
-        if (!bargeInSequenceStartTs || (lastBargeInMediaTs && now - lastBargeInMediaTs > MB_BARGE_IN_MIN_MS)) {
-          bargeInSequenceStartTs = now;
-        }
-        lastBargeInMediaTs = now;
-        if (now - bargeInSequenceStartTs < MB_BARGE_IN_MIN_MS) return;
-      } else {
-        bargeInSequenceStartTs = null;
-        lastBargeInMediaTs = 0;
-      }
-
-      if (MB_BARGE_IN_DEBOUNCE_MS > 0 && lastOpenAiAudioTs && now - lastOpenAiAudioTs < MB_BARGE_IN_DEBOUNCE_MS) {
-        return;
-      }
-
       openAiWs.send(JSON.stringify({ type: "input_audio_buffer.append", audio: payload }));
-      lastOpenAiAudioTs = now;
     } else if (event === "stop") {
       logAlways(`[TWILIO_STOP][${connId}] stream stopped`);
       if (!plannedEnd && !callEnded) {
