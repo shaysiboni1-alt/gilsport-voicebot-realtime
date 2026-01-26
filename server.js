@@ -925,27 +925,30 @@ function buildSystemInstructionsFromSheets() {
   const kb = getPrompt("KB_PROMPT", "");
 
   const vars = {
+    ...(sheetsCache.settings || {}),
+
+    // Canonical runtime values (override SETTINGS if edited accidentally)
     BUSINESS_NAME: businessName,
     BOT_NAME: botName,
+    GREETING: greeting,
     OPENING_SCRIPT: opening,
     CLOSING_SCRIPT: closing,
-    GREETING: greeting,
 
+    // Explicit aliases (optional but clearer)
     WEBSITE_URL: getSetting("WEBSITE_URL", ""),
     MAIN_PHONE: getSetting("MAIN_PHONE", ""),
     WORKING_HOURS: getSetting("WORKING_HOURS", ""),
+    BUSINESS_ADDRESS: getSetting("BUSINESS_ADDRESS", ""),
     AFTER_HOURS_DELIVERY_RULE: getSetting("AFTER_HOURS_DELIVERY_RULE", ""),
-
-    // Commercial policy (must come from SETTINGS; never invented)
     SALES_COUPON_CODE: getSetting("SALES_COUPON_CODE", ""),
     PRICE_CLAIM_SENTENCE: getSetting("PRICE_CLAIM_SENTENCE", ""),
     NO_DATA_MESSAGE: getSetting("NO_DATA_MESSAGE", ""),
 
-    // Dynamic lists derived from SETTINGS (no code changes needed when adding more entries)
+    // Dynamic lists derived from SETTINGS
     DELIVERY_PHONES_LIST: buildDeliveryPhonesList(sheetsCache.settings),
     IMPORTERS_LIST: buildImportersList(sheetsCache.settings),
 
-    // Backward-compatible placeholders (still supported)
+    // Backward-compatible placeholders
     DELIVERY_PHONE_1: getSetting("DELIVERY_PHONE_1", ""),
     DELIVERY_PHONE_2: getSetting("DELIVERY_PHONE_2", ""),
     DELIVERY_PHONE_3: getSetting("DELIVERY_PHONE_3", ""),
