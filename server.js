@@ -2465,7 +2465,7 @@ wss.on("connection", async (twilioWs, req) => {
       }
 
       if (MB_HALF_DUPLEX) {
-        if (botSpeaking || botTurnActive || hasActiveResponse) {
+        if (botSpeaking || botTurnActive) {
           if (MB_DEBUG) logDebug(connId, "Dropped inbound: half-duplex (bot active)");
           return;
         }
