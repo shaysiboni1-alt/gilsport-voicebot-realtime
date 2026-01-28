@@ -372,6 +372,8 @@ const OPENAI_VOICE = process.env.OPENAI_VOICE || "alloy";
 
 const MB_DEBUG = envBool("MB_DEBUG", true);
 const MB_LOG_TRANSCRIPTS = envBool("MB_LOG_TRANSCRIPTS", true);
+const MB_HALF_DUPLEX = envBool("MB_HALF_DUPLEX", true);
+const MB_POST_TTS_COOLDOWN_MS = envNumber("MB_POST_TTS_COOLDOWN_MS", 600);
 const MB_NO_BARGE_TAIL_MS = envNumber("MB_NO_BARGE_TAIL_MS", 1600);
 const MB_BARGE_IN_COOLDOWN_MS = envNumber("MB_BARGE_IN_COOLDOWN_MS", 500);
 const MB_ALLOW_BARGE_IN = envBool("MB_ALLOW_BARGE_IN", false);
@@ -580,6 +582,8 @@ function logEnvStatus() {
   const mbEnvFallbacks = [
     ["MB_DEBUG", MB_DEBUG],
     ["MB_LOG_TRANSCRIPTS", MB_LOG_TRANSCRIPTS],
+    ["MB_HALF_DUPLEX", MB_HALF_DUPLEX],
+    ["MB_POST_TTS_COOLDOWN_MS", MB_POST_TTS_COOLDOWN_MS],
     ["MB_NO_BARGE_TAIL_MS", MB_NO_BARGE_TAIL_MS],
     ["MB_BARGE_IN_COOLDOWN_MS", MB_BARGE_IN_COOLDOWN_MS],
     ["MB_ALLOW_BARGE_IN", MB_ALLOW_BARGE_IN],
@@ -1212,7 +1216,7 @@ Rules:
 - Expand notes to be explicit (what happened, what was requested, any number given such as importer/delivery).
 - Keep phone_number exactly as-is.
 - Keep full_name as spoken; if it is Latin and a Hebrew equivalent is clear from transcript, prefer Hebrew.
-- If unknown, keep null.
+- If unknown, keep null. Do NOT add statements about missing info (e.g., "לא נמסר...").
 JSON only.
 `.trim();
 
@@ -1268,9 +1272,9 @@ async function extractLeadFromConversation(conversationLog, connId, botName, bus
 
     const systemAddon = `
 חובה: להחזיר JSON תקין בלבד (ללא טקסט נוסף).
-חובה: השדות reason ו-notes בעברית (אפשר לתרגם מתוכן השיחה), כולל ציון מפורש אם נמסר מספר יבואן/מוביל.
+חובה: השדות reason ו-notes בעברית (אפשר לתרגם מתוכן השיחה). אם נמסר מספר יבואן/מוביל, לציין זאת במפורש.
 	חובה: phone_number (אם קיים) חייב להיות מספר ישראלי מלא (0XXXXXXXXX/0XXXXXXXXXX לאחר normalize) — 4 ספרות אחרונות בלבד אינן טלפון תקין ואסור להחזיר אותן כשדה phone_number.
-	חובה: אם intent="message" — מלאו message_for (עבור מי ההודעה) במפורש.
+	חובה: אם מידע לא נמסר בשיחה — להשאיר null ולהימנע מהערות על חוסר מידע.
 `.trim();
 
     const raw = await callLeadParsingLlm(
@@ -1316,12 +1320,10 @@ function isAbandonedReason(reason) {
   );
 }
 
-function mapCallStatus(reason, plannedEnd) {
+function mapCallStatus(reason, isFullLead) {
   const r = String(reason || "").toLowerCase();
   if (r.includes("error")) return "error";
-  if (plannedEnd) return "completed";
-  if (isAbandonedReason(reason)) return "abandoned";
-  return "completed";
+  return isFullLead ? "completed" : "abandoned";
 }
 
 function mapEventHe(intent) {
@@ -1993,10 +1995,6 @@ wss.on("connection", async (twilioWs, req) => {
       normalizePhoneNumber(callerILLocal, callerRaw) ||
       null;
 
-    if (prefersCallerId) {
-      coercedPhone = null;
-    }
-
     if (parsedLead && typeof parsedLead === "object") {
       parsedLead.phone_number = coercedPhone;
       if (prefersCallerId) parsedLead.prefers_caller_id = true;
@@ -2017,30 +2015,20 @@ wss.on("connection", async (twilioWs, req) => {
 	  }
     }
 
-    // If the model forgot to set is_lead=true on a completed "message" flow,
-    // we still want the webhook to go to the FINAL webhook (not ABANDONED).
-    // Keep this override narrowly scoped to intent="message" to avoid changing
-    // behavior in other flows.
     const isCallerBlocked = isCallerIdBlockedValue(callerRaw);
+    const callerIdExists = !!callerILLocal && !isCallerBlocked;
+    const collectedPhoneExists =
+      !!normalizePhoneNumber(parsedLead?.phone_number, callerRaw) || !!normalizePhoneNumber(capturedPhoneIL, callerRaw);
+    const phoneExists = callerIdExists || collectedPhoneExists;
 
     const hasName = safeStr(parsedLead?.full_name).length >= 2;
-    const hasContent = safeStr(parsedLead?.reason || parsedLead?.notes).length > 0;
-    const hasPhone = !!coercedPhone && digitsOnly(coercedPhone).length >= 9;
-    const intent = String(parsedLead?.intent || "").toLowerCase();
-    const hasMessageFor = safeStr(parsedLead?.message_for).length > 0;
-    const phoneRequired = isCallerBlocked;
-
-    const isFullLead = !!(
-      hasName &&
-      hasContent &&
-      (!phoneRequired || hasPhone) &&
-      (intent !== "message" || hasMessageFor)
-    );
+    const hasContent = safeStr(parsedLead?.reason).length >= 3 || safeStr(parsedLead?.notes).length >= 3;
+    const isFullLead = !!(hasName && hasContent && phoneExists);
 
     if (parsedLead && parsedLead.is_lead !== true && isFullLead) {
       parsedLead.is_lead = true;
     }
-    const call_status = mapCallStatus(reason, plannedEnd);
+    const call_status = mapCallStatus(reason, isFullLead);
 
     // Wait (briefly) for Twilio recording callback to arrive, so webhooks can include a recording link.
     if (MB_ENABLE_RECORDING && callSid) {
@@ -2204,7 +2192,6 @@ wss.on("connection", async (twilioWs, req) => {
         hasActiveResponse = true;
         botTurnActive = true;
         botSpeaking = false;
-        noListenUntilTs = Date.now() + (MB_ALLOW_BARGE_IN ? MB_BARGE_IN_COOLDOWN_MS : MB_NO_BARGE_TAIL_MS);
         currentBotText = "";
         break;
 
@@ -2243,9 +2230,6 @@ wss.on("connection", async (twilioWs, req) => {
         if (!b64 || !streamSid) break;
         botSpeaking = true;
 
-        const now = Date.now();
-        noListenUntilTs = now + (MB_ALLOW_BARGE_IN ? MB_BARGE_IN_COOLDOWN_MS : MB_NO_BARGE_TAIL_MS);
-
         if (twilioWs.readyState === WebSocket.OPEN) {
           const boosted = applyGainToUlawBase64(b64, BOT_AUDIO_GAIN);
           twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload: boosted } }));
@@ -2257,8 +2241,8 @@ wss.on("connection", async (twilioWs, req) => {
         botSpeaking = false;
         botTurnActive = false;
 
-        // Always apply a small post-TTS cooldown to avoid echo / background noise false turns.
-        noListenUntilTs = Date.now() + (MB_ALLOW_BARGE_IN ? MB_BARGE_IN_COOLDOWN_MS : MB_NO_BARGE_TAIL_MS);
+        // Always apply a post-TTS cooldown to avoid echo / background noise false turns.
+        noListenUntilTs = Date.now() + MB_POST_TTS_COOLDOWN_MS;
 
         if (goodbyePendingHangup && MB_HANGUP_AFTER_GOODBYE && !callEnded) {
           plannedEnd = true;
@@ -2474,11 +2458,18 @@ wss.on("connection", async (twilioWs, req) => {
 
       const now = Date.now();
 
-      // Always respect a short post-TTS cooldown (even when barge-in is enabled) to avoid false turns from echo/noise.
-      if (now < noListenUntilTs) return;
+      // Always respect a short post-TTS cooldown to avoid false turns from echo/noise.
+      if (now < noListenUntilTs) {
+        if (MB_DEBUG) logDebug(connId, "Dropped inbound: post-tts cooldown");
+        return;
+      }
 
-      // If barge-in is disabled, block user audio while the bot is speaking or has an active turn.
-      if (!MB_ALLOW_BARGE_IN) {
+      if (MB_HALF_DUPLEX) {
+        if (botSpeaking || botTurnActive) {
+          if (MB_DEBUG) logDebug(connId, "Dropped inbound: half-duplex (bot active)");
+          return;
+        }
+      } else if (!MB_ALLOW_BARGE_IN) {
         if (botTurnActive || botSpeaking) return;
       }
 
