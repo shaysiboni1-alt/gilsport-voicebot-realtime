@@ -1216,7 +1216,7 @@ Rules:
 - Expand notes to be explicit (what happened, what was requested, any number given such as importer/delivery).
 - Keep phone_number exactly as-is.
 - Keep full_name as spoken; if it is Latin and a Hebrew equivalent is clear from transcript, prefer Hebrew.
-- If unknown, keep null.
+- If unknown, keep null. Do NOT add statements about missing info (e.g., "לא נמסר...").
 JSON only.
 `.trim();
 
@@ -1272,9 +1272,9 @@ async function extractLeadFromConversation(conversationLog, connId, botName, bus
 
     const systemAddon = `
 חובה: להחזיר JSON תקין בלבד (ללא טקסט נוסף).
-חובה: השדות reason ו-notes בעברית (אפשר לתרגם מתוכן השיחה), כולל ציון מפורש אם נמסר מספר יבואן/מוביל.
+חובה: השדות reason ו-notes בעברית (אפשר לתרגם מתוכן השיחה). אם נמסר מספר יבואן/מוביל, לציין זאת במפורש.
 	חובה: phone_number (אם קיים) חייב להיות מספר ישראלי מלא (0XXXXXXXXX/0XXXXXXXXXX לאחר normalize) — 4 ספרות אחרונות בלבד אינן טלפון תקין ואסור להחזיר אותן כשדה phone_number.
-	חובה: אם intent="message" — מלאו message_for (עבור מי ההודעה) במפורש.
+	חובה: אם מידע לא נמסר בשיחה — להשאיר null ולהימנע מהערות על חוסר מידע.
 `.trim();
 
     const raw = await callLeadParsingLlm(
@@ -1320,12 +1320,10 @@ function isAbandonedReason(reason) {
   );
 }
 
-function mapCallStatus(reason, plannedEnd) {
+function mapCallStatus(reason, isFullLead) {
   const r = String(reason || "").toLowerCase();
   if (r.includes("error")) return "error";
-  if (plannedEnd) return "completed";
-  if (isAbandonedReason(reason)) return "abandoned";
-  return "completed";
+  return isFullLead ? "completed" : "abandoned";
 }
 
 function mapEventHe(intent) {
@@ -1997,10 +1995,6 @@ wss.on("connection", async (twilioWs, req) => {
       normalizePhoneNumber(callerILLocal, callerRaw) ||
       null;
 
-    if (prefersCallerId) {
-      coercedPhone = null;
-    }
-
     if (parsedLead && typeof parsedLead === "object") {
       parsedLead.phone_number = coercedPhone;
       if (prefersCallerId) parsedLead.prefers_caller_id = true;
@@ -2021,30 +2015,20 @@ wss.on("connection", async (twilioWs, req) => {
 	  }
     }
 
-    // If the model forgot to set is_lead=true on a completed "message" flow,
-    // we still want the webhook to go to the FINAL webhook (not ABANDONED).
-    // Keep this override narrowly scoped to intent="message" to avoid changing
-    // behavior in other flows.
     const isCallerBlocked = isCallerIdBlockedValue(callerRaw);
+    const callerIdExists = !!callerILLocal && !isCallerBlocked;
+    const collectedPhoneExists =
+      !!normalizePhoneNumber(parsedLead?.phone_number, callerRaw) || !!normalizePhoneNumber(capturedPhoneIL, callerRaw);
+    const phoneExists = callerIdExists || collectedPhoneExists;
 
     const hasName = safeStr(parsedLead?.full_name).length >= 2;
-    const hasContent = safeStr(parsedLead?.reason || parsedLead?.notes).length > 0;
-    const hasPhone = !!coercedPhone && digitsOnly(coercedPhone).length >= 9;
-    const intent = String(parsedLead?.intent || "").toLowerCase();
-    const hasMessageFor = safeStr(parsedLead?.message_for).length > 0;
-    const phoneRequired = isCallerBlocked;
-
-    const isFullLead = !!(
-      hasName &&
-      hasContent &&
-      (!phoneRequired || hasPhone) &&
-      (intent !== "message" || hasMessageFor)
-    );
+    const hasContent = safeStr(parsedLead?.reason).length >= 3 || safeStr(parsedLead?.notes).length >= 3;
+    const isFullLead = !!(hasName && hasContent && phoneExists);
 
     if (parsedLead && parsedLead.is_lead !== true && isFullLead) {
       parsedLead.is_lead = true;
     }
-    const call_status = mapCallStatus(reason, plannedEnd);
+    const call_status = mapCallStatus(reason, isFullLead);
 
     // Wait (briefly) for Twilio recording callback to arrive, so webhooks can include a recording link.
     if (MB_ENABLE_RECORDING && callSid) {
