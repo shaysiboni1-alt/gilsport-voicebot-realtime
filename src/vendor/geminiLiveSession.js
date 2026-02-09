@@ -21,10 +21,16 @@ try {
 // Helpers (baseline-safe)
 // -----------------------------------------------------------------------------
 
+// Default to a currently supported Live API native-audio model (Gemini API).
+// See Google AI for Developers: "Gemini 2.5 Flash Live" supports Live API.
+// Model code example: gemini-2.5-flash-native-audio-preview-12-2025
+// (Callers may override via GEMINI_LIVE_MODEL.)
+const DEFAULT_LIVE_MODEL = "gemini-2.5-flash-native-audio-preview-12-2025";
+
 function normalizeModelName(m) {
-  if (!m) return "";
-  if (m.startsWith("models/")) return m;
-  return `models/${m}`;
+  const mm = (m || "").trim() || DEFAULT_LIVE_MODEL;
+  if (mm.startsWith("models/")) return mm;
+  return `models/${mm}`;
 }
 
 function liveWsUrl() {
@@ -245,6 +251,11 @@ class GeminiLiveSession {
     this.closed = false;
     this._greetingSent = false;
 
+    // If the configured model is not available for BidiGenerateContent, we retry once
+    // with a known Live-API-capable native-audio model.
+    this._modelOverride = "";
+    this._retriedWithFallbackModel = false;
+
     // Transcript aggregation
     this._trBuf = { user: "", bot: "" };
     this._trLastChunk = { user: "", bot: "" };
@@ -301,7 +312,7 @@ class GeminiLiveSession {
 
       const setup = {
         setup: {
-          model: normalizeModelName(env.GEMINI_LIVE_MODEL),
+          model: normalizeModelName(this._modelOverride || env.GEMINI_LIVE_MODEL),
           systemInstruction: systemText ? { parts: [{ text: systemText }] } : undefined,
 
           generationConfig: {
@@ -404,6 +415,37 @@ class GeminiLiveSession {
       this._flushTranscript("bot");
 
       logger.info("Gemini Live WS closed", { ...this.meta, code, reason });
+
+      // If the model name is wrong / not supported for BidiGenerateContent, Gemini closes with
+      // a policy/validation close (often 1008) and a "model is not found" style reason.
+      // In that specific case (and only once), retry with a known Live-API-capable model.
+      const r = String(reason || "");
+      const looksLikeModelNotFound =
+        code === 1008 &&
+        (r.includes("is not found") ||
+          r.includes("not supported") ||
+          r.toLowerCase().includes("listmodels") ||
+          r.toLowerCase().includes("bidi") ||
+          r.toLowerCase().includes("generatecontent"));
+
+      const earlyInSession = !this._greetingSent;
+
+      if (earlyInSession && looksLikeModelNotFound && !this._retriedWithFallbackModel) {
+        this._retriedWithFallbackModel = true;
+        this._modelOverride = DEFAULT_LIVE_MODEL;
+        logger.warn("Retrying Gemini Live with fallback model", {
+          ...this.meta,
+          fallback_model: DEFAULT_LIVE_MODEL
+        });
+
+        // Reset WS handle and try again.
+        this.ws = null;
+        this.closed = false;
+        this.ready = false;
+        this._greetingSent = false;
+        this.start();
+        return;
+      }
 
       // Finalize: always best-effort, never throws outward
       await this._finalizeOnce("gemini_ws_close");

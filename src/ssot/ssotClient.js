@@ -110,20 +110,37 @@ async function loadSSOT(force = false) {
   const startedAt = Date.now();
   const { sheets, sheetId } = await getSheetsClient();
 
-  // IMPORTANT: rely on returned order, not vr.range string
-  const ranges = ["SETTINGS!A:B", "PROMPTS!A:B", "INTENTS!A:F"];
+  // IMPORTANT:
+  // GilSport SSOT may not have an INTENTS tab (and Google Sheets batchGet fails hard
+  // if *any* range is invalid). We treat INTENTS as optional and fall back safely.
+  let vrs = [];
+  let settingsVals = [];
+  let promptsVals = [];
+  let intentsVals = [];
 
-  const resp = await sheets.spreadsheets.values.batchGet({
-    spreadsheetId: sheetId,
-    ranges
-  });
+  try {
+    const resp = await sheets.spreadsheets.values.batchGet({
+      spreadsheetId: sheetId,
+      ranges: ["SETTINGS!A:B", "PROMPTS!A:B", "INTENTS!A:F"]
+    });
+    vrs = resp?.data?.valueRanges || [];
+    settingsVals = vrs?.[0]?.values || [];
+    promptsVals = vrs?.[1]?.values || [];
+    intentsVals = vrs?.[2]?.values || [];
+  } catch (e) {
+    const msg = String(e?.message || e);
+    logger.warn("SSOT batchGet failed; retry without INTENTS", { error: msg });
 
-  const vrs = resp?.data?.valueRanges || [];
-
-  // Google may return range strings like SETTINGS!A1:B200 - don't key by it.
-  const settingsVals = vrs?.[0]?.values || [];
-  const promptsVals = vrs?.[1]?.values || [];
-  const intentsVals = vrs?.[2]?.values || [];
+    // Retry without INTENTS. This preserves SETTINGS+PROMPTS, and leaves intents empty.
+    const resp2 = await sheets.spreadsheets.values.batchGet({
+      spreadsheetId: sheetId,
+      ranges: ["SETTINGS!A:B", "PROMPTS!A:B"]
+    });
+    vrs = resp2?.data?.valueRanges || [];
+    settingsVals = vrs?.[0]?.values || [];
+    promptsVals = vrs?.[1]?.values || [];
+    intentsVals = [];
+  }
 
   const settingsRows = dropHeader(settingsVals);
   const promptsRows = dropHeader(promptsVals);
