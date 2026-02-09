@@ -1346,6 +1346,21 @@ function mapEventHe(intent) {
   return "לא ידוע";
 }
 
+
+function hasSubject(parsedLead, EVENT) {
+  // Subject-of-inquiry rule:
+  // We treat a valid subject as either:
+  // - intent is not "unknown" (preferred), OR
+  // - EVENT is not "לא ידוע"
+  // This keeps behavior deterministic and avoids relying on free-text.
+  const intent = String(parsedLead?.intent || "").toLowerCase().trim();
+  if (intent && intent !== "unknown") return true;
+  const ev = String(EVENT || "").trim();
+  if (ev && ev !== "לא ידוע") return true;
+  return false;
+}
+
+
 // -----------------------------
 // Express & HTTP
 // -----------------------------
@@ -2092,6 +2107,8 @@ wss.on("connection", async (twilioWs, req) => {
       parsedLeadCollection: {
         ...(parsedLead || {}),
         isFullLead: !!isFullLead,
+        hasSubject: !!hasSubj,
+        isAbandonedLead: !!isAbandonedLead,
       },
     };
 
@@ -2101,7 +2118,7 @@ wss.on("connection", async (twilioWs, req) => {
 
     if (MB_ENABLE_LEAD_CAPTURE && MB_WEBHOOK_URL && isFullLead) {
       await sendWebhook(MB_WEBHOOK_URL, payloadBase, connId, "FINAL Lead");
-    } else if (MB_ENABLE_ABANDONED_WEBHOOK && MB_ABANDONED_WEBHOOK_URL && !isFullLead) {
+    } else if (MB_ENABLE_ABANDONED_WEBHOOK && MB_ABANDONED_WEBHOOK_URL && isAbandonedLead) {
       await sendWebhook(MB_ABANDONED_WEBHOOK_URL, payloadBase, connId, "ABANDONED");
     }
 
@@ -2109,6 +2126,11 @@ wss.on("connection", async (twilioWs, req) => {
 
     // IMPORTANT: Close OpenAI WS when the call ends (prevents later session_expired noise)
     try {
+      // Also close Gemini WS if active
+      try {
+        if (geminiWs && geminiWs.readyState === WebSocket.OPEN) geminiWs.close(1000, "call_end");
+      } catch (_) {}
+
       if (openAiWs) {
         if (openAiWs.readyState === WebSocket.OPEN) {
           openAiWs.close(1000, "call_end");
@@ -2130,6 +2152,8 @@ wss.on("connection", async (twilioWs, req) => {
 
   // -----------------------------
   // OpenAI Realtime WS
+  if (PROVIDER_MODE !== "gemini") {
+
   // -----------------------------
   const openAiWs = new WebSocket(
     `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_REALTIME_MODEL)}`,
@@ -2373,8 +2397,135 @@ wss.on("connection", async (twilioWs, req) => {
     logError(connId, "OpenAI WS error", err);
     if (!callEnded) endCall("openai_ws_error", null).catch(() => {});
   });
+  }
 
   // -----------------------------
+  // Gemini Live WS (speech only, inline)
+  // -----------------------------
+  let geminiWs = null;
+  let geminiReady = false;
+  let geminiGreetingSent = false;
+
+  function geminiConnect(metaForLog) {
+    const url = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
+    geminiWs = new WebSocket(url);
+
+    geminiWs.on("open", () => {
+      geminiReady = true;
+      const { opening, instructions } = buildSystemInstructionsFromSheets();
+      baseInstructions = instructions;
+
+      const setup = {
+        setup: {
+          model: `models/${String(GEMINI_LIVE_MODEL || "").replace(/^models\//, "")}`,
+          systemInstruction: baseInstructions ? { parts: [{ text: baseInstructions }] } : undefined,
+          generationConfig: {
+            responseModalities: ["AUDIO"],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: {
+                  voiceName: (process.env.VOICE_NAME_OVERRIDE || "Kore")
+                }
+              }
+            }
+          },
+          realtimeInputConfig: {
+            automaticActivityDetection: {
+              prefixPaddingMs: Number(MB_VAD_PREFIX_MS ?? 200),
+              silenceDurationMs: Number(MB_VAD_SILENCE_MS ?? 900)
+            }
+          },
+          ...(MB_LOG_TRANSCRIPTS ? { inputAudioTranscription: {}, outputAudioTranscription: {} } : {})
+        }
+      };
+
+      try {
+        geminiWs.send(JSON.stringify(setup));
+        logInfo(connId, "Gemini Live WS connected.", { model: setup.setup.model });
+      } catch (e) {
+        logError(connId, "Failed to send Gemini setup", e);
+      }
+    });
+
+    let currentBotTextGemini = "";
+
+    geminiWs.on("message", (data) => {
+      let msg;
+      try { msg = JSON.parse(data.toString("utf8")); } catch { return; }
+
+      if (msg?.setupComplete && !geminiGreetingSent) {
+        geminiGreetingSent = true;
+        const { opening } = buildSystemInstructionsFromSheets();
+        const kickoff = `התחילי שיחה עכשיו. אמרי בדיוק את טקסט הפתיחה הבא בעברית (ללא תוספות וללא שינויים), ואז עצרי להקשבה:\n${opening}`;
+        const m = { clientContent: { turns: [{ role: "user", parts: [{ text: kickoff }] }], turnComplete: true } };
+        try { geminiWs.send(JSON.stringify(m)); } catch (_) {}
+        return;
+      }
+
+      // AUDIO parts -> Twilio
+      try {
+        const parts =
+          msg?.serverContent?.modelTurn?.parts ||
+          msg?.serverContent?.turn?.parts ||
+          msg?.serverContent?.parts ||
+          [];
+        for (const p of parts) {
+          const inline = p?.inlineData;
+          if (inline?.data && inline?.mimeType && String(inline.mimeType).startsWith("audio/pcm")) {
+            const ulawB64 = pcm24kB64ToUlaw8kB64(inline.data);
+            if (ulawB64 && streamSid && twilioWs.readyState === WebSocket.OPEN) {
+              twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload: ulawB64 } }));
+            }
+          }
+          if (p?.text) currentBotTextGemini += String(p.text);
+        }
+      } catch (_) {}
+
+      // Transcriptions -> conversationLog
+      try {
+        const inTr = msg?.serverContent?.inputTranscription?.text;
+        if (inTr) {
+          const t = String(inTr || "").trim();
+          if (t) {
+            conversationLog.push({ from: "user", text: t });
+            logAlways(`[CALLER][${connId}] ${t}`);
+          }
+        }
+        const outTr = msg?.serverContent?.outputTranscription?.text;
+        if (outTr) {
+          const t = String(outTr || "").trim();
+          if (t) {
+            conversationLog.push({ from: "bot", text: t });
+            logAlways(`[BOT][${connId}] ${t}`);
+          }
+        }
+      } catch (_) {}
+    });
+
+    geminiWs.on("close", (code, reasonBuf) => {
+      const reason = reasonBuf ? reasonBuf.toString("utf8") : "";
+      geminiReady = false;
+      logInfo(connId, "Gemini Live WS closed", { code, reason });
+      if (!callEnded) endCall("gemini_ws_closed", null).catch(() => {});
+    });
+
+    geminiWs.on("error", (err) => {
+      geminiReady = false;
+      logError(connId, "Gemini Live WS error", err);
+      if (!callEnded) endCall("gemini_ws_error", null).catch(() => {});
+    });
+  }
+
+  if (PROVIDER_MODE === "gemini") {
+    if (!GEMINI_API_KEY) {
+      logError(connId, "Missing GEMINI_API_KEY – closing.");
+      twilioWs.close();
+      return;
+    }
+    geminiConnect();
+  }
+
+// -----------------------------
   // Twilio stream handlers
   // -----------------------------
   twilioWs.on("message", async (data) => {
@@ -2418,6 +2569,8 @@ wss.on("connection", async (twilioWs, req) => {
       lastMediaTs = Date.now();
 
       logAlways(`[TWILIO_START][${connId}] ${JSON.stringify(msg.start || {})}`);
+
+      logAlways(`[SpeechEngine][${connId}] provider=${PROVIDER_MODE} openai_model=${OPENAI_REALTIME_MODEL} gemini_model=${GEMINI_LIVE_MODEL}`);
 
       // Start Twilio recording (optional). Recording callbacks arrive asynchronously to /twilio-recording-callback.
       if (MB_ENABLE_RECORDING && callSid) {
@@ -2484,8 +2637,16 @@ wss.on("connection", async (twilioWs, req) => {
         if (botTurnActive || botSpeaking) return;
       }
 
+      if (PROVIDER_MODE === "gemini") {
+        if (!geminiWs || geminiWs.readyState !== WebSocket.OPEN || !geminiReady) return;
+        const pcm16kB64 = ulaw8kB64ToPcm16kB64(payload);
+        const gm = { realtimeInput: { mediaChunks: [{ mimeType: GEMINI_AUDIO_IN_FORMAT, data: pcm16kB64 }] } };
+        try { geminiWs.send(JSON.stringify(gm)); } catch (_) {}
+        return;
+      }
+
       openAiWs.send(JSON.stringify({ type: "input_audio_buffer.append", audio: payload }));
-    } else if (event === "stop") {
+} else if (event === "stop") {
       logAlways(`[TWILIO_STOP][${connId}] stream stopped`);
       if (!plannedEnd && !callEnded) {
         endCall("twilio_stop", null).catch(() => {});
