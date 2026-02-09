@@ -2662,8 +2662,6 @@ geminiGreetingSent = true;
       const payload = msg.media?.payload;
       if (!payload) return;
 
-      if (!openAiReady || openAiWs.readyState !== WebSocket.OPEN) return;
-
       const now = Date.now();
 
       // Always respect a short post-TTS cooldown to avoid false turns from echo/noise.
@@ -2672,24 +2670,34 @@ geminiGreetingSent = true;
         return;
       }
 
+      // Duplex policy: obey ENV only (no hidden hard gates)
       if (MB_HALF_DUPLEX) {
         if (botSpeaking || botTurnActive) {
           if (MB_DEBUG) logDebug(connId, "Dropped inbound: half-duplex (bot active)");
           return;
         }
       } else if (!MB_ALLOW_BARGE_IN) {
-        if (botTurnActive || botSpeaking) return;
+        if (botTurnActive || botSpeaking) {
+          if (MB_DEBUG) logDebug(connId, "Dropped inbound: barge-in disabled (bot active)");
+          return;
+        }
       }
 
+      // Provider routing MUST NOT depend on OpenAI readiness when provider=gemini.
       if (PROVIDER_MODE === "gemini") {
-        if (!geminiWs || geminiWs.readyState !== WebSocket.OPEN || !geminiSetupComplete) return;
+        if (!geminiWs || geminiWs.readyState !== WebSocket.OPEN || !geminiSetupComplete) {
+          if (MB_DEBUG) logDebug(connId, "Dropped inbound: gemini not ready");
+          return;
+        }
         const pcm16kB64 = ulaw8kB64ToPcm16kB64(payload);
         const gm = { realtimeInput: { mediaChunks: [{ mimeType: GEMINI_AUDIO_IN_FORMAT, data: pcm16kB64 }] } };
         try { geminiWs.send(JSON.stringify(gm)); } catch (_) {}
         return;
       }
 
+      if (!openAiReady || !openAiWs || openAiWs.readyState !== WebSocket.OPEN) return;
       openAiWs.send(JSON.stringify({ type: "input_audio_buffer.append", audio: payload }));
+
 } else if (event === "stop") {
       logAlways(`[TWILIO_STOP][${connId}] stream stopped`);
       if (!plannedEnd && !callEnded) {
