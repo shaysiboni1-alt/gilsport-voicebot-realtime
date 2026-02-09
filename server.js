@@ -1984,7 +1984,11 @@ wss.on("connection", async (twilioWs, req) => {
   }
 
   function sendModelPrompt(openAiWs, text, purpose) {
-    if (!openAiReady || openAiWs.readyState !== WebSocket.OPEN) return;
+    if (PROVIDER_MODE === "gemini") {
+  if (!geminiWs || geminiWs.readyState !== WebSocket.OPEN || !geminiSetupComplete) return;
+} else {
+  if (!openAiReady || openAiWs.readyState !== WebSocket.OPEN) return;
+}
     if (hasActiveResponse) return;
 
     openAiWs.send(
@@ -2209,8 +2213,8 @@ if (PROVIDER_MODE === "gemini") {
   geminiWs = new WebSocket(url);
 
   geminiWs.on("open", () => {
-    geminiReady = true;
-
+      geminiReady = true;
+      geminiSetupComplete = false;
     // Build system instructions from the SAME GilSport SSOT + policies (no changes)
     const { opening, instructions } = buildSystemInstructionsFromSheets();
     baseInstructions = instructions;
@@ -2252,7 +2256,9 @@ if (PROVIDER_MODE === "gemini") {
     try { msg = JSON.parse(data.toString("utf8")); } catch { return; }
 
     if (msg?.setupComplete && !geminiGreetingSent) {
-      geminiGreetingSent = true;
+        geminiSetupComplete = true;
+        logInfo(connId, "Gemini setupComplete.", {});
+        geminiGreetingSent = true;
       const { opening } = buildSystemInstructionsFromSheets();
       const kickoff = `התחילי שיחה עכשיו. אמרי בדיוק את טקסט הפתיחה הבא בעברית (ללא תוספות וללא שינויים), ואז עצרי להקשבה:\n${opening}`;
       const m = { clientContent: { turns: [{ role: "user", parts: [{ text: kickoff }] }], turnComplete: true } };
@@ -2670,7 +2676,7 @@ if (PROVIDER_MODE === "gemini") {
       }
 
       if (PROVIDER_MODE === "gemini") {
-        if (!geminiWs || geminiWs.readyState !== WebSocket.OPEN || !geminiReady) return;
+        if (!geminiWs || geminiWs.readyState !== WebSocket.OPEN || !geminiSetupComplete) return;
         const pcm16kB64 = ulaw8kB64ToPcm16kB64(payload);
         const gm = { realtimeInput: { mediaChunks: [{ mimeType: GEMINI_AUDIO_IN_FORMAT, data: pcm16kB64 }] } };
         try { geminiWs.send(JSON.stringify(gm)); } catch (_) {}
