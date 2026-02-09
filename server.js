@@ -32,6 +32,66 @@ function envBool(name, def = false) {
   return ["1", "true", "yes", "on"].includes(raw);
 }
 
+// -----------------------------
+// Gemini helpers (inline, no deps)
+// -----------------------------
+function normalizeGeminiModelName(m) {
+  if (!m) return "";
+  if (String(m).startsWith("models/")) return String(m);
+  return `models/${m}`;
+}
+
+function ulawByteToPcm16(sample) {
+  sample = ~sample & 0xff;
+  const sign = sample & 0x80;
+  const exponent = (sample >> 4) & 0x07;
+  const mantissa = sample & 0x0f;
+  let pcm = ((mantissa << 3) + 0x84) << exponent;
+  pcm -= 0x84;
+  return sign ? -pcm : pcm;
+}
+
+function pcm16ToUlawByte(pcm) {
+  const BIAS = 0x84;
+  const CLIP = 32635;
+  let sign = 0;
+  if (pcm < 0) { sign = 0x80; pcm = -pcm; }
+  if (pcm > CLIP) pcm = CLIP;
+  pcm += BIAS;
+  let exponent = 7;
+  for (let expMask = 0x4000; (pcm & expMask) === 0 && exponent > 0; expMask >>= 1) exponent--;
+  const mantissa = (pcm >> (exponent + 3)) & 0x0f;
+  return (~(sign | (exponent << 4) | mantissa)) & 0xff;
+}
+
+// ulaw8k -> pcm16k (simple 2x upsample by duplication)
+function ulaw8kB64ToPcm16kB64(ulawB64) {
+  const ulaw = Buffer.from(ulawB64, "base64");
+  const pcm16k = Buffer.alloc(ulaw.length * 4);
+  let o = 0;
+  for (let i = 0; i < ulaw.length; i++) {
+    const s = ulawByteToPcm16(ulaw[i]);
+    pcm16k.writeInt16LE(s, o); o += 2;
+    pcm16k.writeInt16LE(s, o); o += 2;
+  }
+  return pcm16k.toString("base64");
+}
+
+// pcm24k -> ulaw8k (downsample 3:1 + ulaw encode)
+function pcm24kB64ToUlaw8kB64(pcmB64) {
+  const pcm = Buffer.from(pcmB64, "base64");
+  const samples = Math.floor(pcm.length / 2);
+  const outLen = Math.floor(samples / 3);
+  const ulaw = Buffer.alloc(outLen);
+  let oi = 0;
+  for (let i = 0; i < samples; i += 3) {
+    const s = pcm.readInt16LE(i * 2);
+    ulaw[oi++] = pcm16ToUlawByte(s);
+  }
+  return ulaw.toString("base64");
+}
+
+
 function sanitizeWebhookUrl(url) {
   const u = (url || "").trim();
   if (!u) return "";
@@ -366,24 +426,19 @@ function levenshtein(a, b) {
 const PORT = envNumber("PORT", 10000);
 
 const TIME_ZONE = process.env.TIME_ZONE || "Asia/Jerusalem";
-
-// =============================
-// Provider switch: OpenAI | Gemini (speech only)
-// =============================
-const PROVIDER_MODE = String(process.env.PROVIDER_MODE || "openai").toLowerCase();
-
-// Gemini Live (speech)
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
-const GEMINI_LIVE_MODEL = process.env.GEMINI_LIVE_MODEL || "gemini-2.5-flash-native-audio-preview-12-2025";
-const GEMINI_AUDIO_IN_FORMAT = process.env.GEMINI_AUDIO_IN_FORMAT || "audio/pcm;rate=16000";
-const GEMINI_AUDIO_OUT_FORMAT = process.env.GEMINI_AUDIO_OUT_FORMAT || "audio/pcm;rate=24000";
-
-// Vertex AI mode (server-side OAuth). If true, we connect to Vertex Live API and authenticate via Application Default Credentials.
-const GEMINI_VERTEX_ENABLED = String(process.env.GEMINI_VERTEX_ENABLED || "false").toLowerCase() === "true";
-const GEMINI_PROJECT_ID = process.env.GEMINI_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT || "";
-const GEMINI_LOCATION = process.env.GEMINI_LOCATION || process.env.GOOGLE_CLOUD_LOCATION || "us-central1";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const OPENAI_REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview-2024-12-17";
+// -----------------------------
+// Speech Provider switch
+// -----------------------------
+const PROVIDER_MODE = String(process.env.PROVIDER_MODE || "openai").trim().toLowerCase();
+
+// Gemini Live (Developer API over WS)
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
+const GEMINI_LIVE_MODEL = process.env.GEMINI_LIVE_MODEL || "";
+const GEMINI_AUDIO_IN_FORMAT = process.env.GEMINI_AUDIO_IN_FORMAT || "audio/pcm;rate=16000";
+const GEMINI_AUDIO_OUT_FORMAT = process.env.GEMINI_AUDIO_OUT_FORMAT || "audio/pcm;rate=24000";
+const VOICE_NAME_OVERRIDE = process.env.VOICE_NAME_OVERRIDE || "";
 const OPENAI_VOICE = process.env.OPENAI_VOICE || "alloy";
 
 const MB_DEBUG = envBool("MB_DEBUG", true);
@@ -1351,21 +1406,6 @@ function mapEventHe(intent) {
   return "לא ידוע";
 }
 
-
-function hasSubject(parsedLead, EVENT) {
-  // Subject-of-inquiry rule:
-  // We treat a valid subject as either:
-  // - intent is not "unknown" (preferred), OR
-  // - EVENT is not "לא ידוע"
-  // This keeps behavior deterministic and avoids relying on free-text.
-  const intent = String(parsedLead?.intent || "").toLowerCase().trim();
-  if (intent && intent !== "unknown") return true;
-  const ev = String(EVENT || "").trim();
-  if (ev && ev !== "לא ידוע") return true;
-  return false;
-}
-
-
 // -----------------------------
 // Express & HTTP
 // -----------------------------
@@ -2112,8 +2152,6 @@ wss.on("connection", async (twilioWs, req) => {
       parsedLeadCollection: {
         ...(parsedLead || {}),
         isFullLead: !!isFullLead,
-        hasSubject: !!hasSubj,
-        isAbandonedLead: !!isAbandonedLead,
       },
     };
 
@@ -2123,7 +2161,7 @@ wss.on("connection", async (twilioWs, req) => {
 
     if (MB_ENABLE_LEAD_CAPTURE && MB_WEBHOOK_URL && isFullLead) {
       await sendWebhook(MB_WEBHOOK_URL, payloadBase, connId, "FINAL Lead");
-    } else if (MB_ENABLE_ABANDONED_WEBHOOK && MB_ABANDONED_WEBHOOK_URL && isAbandonedLead) {
+    } else if (MB_ENABLE_ABANDONED_WEBHOOK && MB_ABANDONED_WEBHOOK_URL && !isFullLead) {
       await sendWebhook(MB_ABANDONED_WEBHOOK_URL, payloadBase, connId, "ABANDONED");
     }
 
@@ -2131,11 +2169,6 @@ wss.on("connection", async (twilioWs, req) => {
 
     // IMPORTANT: Close OpenAI WS when the call ends (prevents later session_expired noise)
     try {
-      // Also close Gemini WS if active
-      try {
-        if (geminiWs && geminiWs.readyState === WebSocket.OPEN) geminiWs.close(1000, "call_end");
-      } catch (_) {}
-
       if (openAiWs) {
         if (openAiWs.readyState === WebSocket.OPEN) {
           openAiWs.close(1000, "call_end");
@@ -2156,9 +2189,129 @@ wss.on("connection", async (twilioWs, req) => {
     .catch(() => {});
 
   // -----------------------------
-  // OpenAI Realtime WS
-  if (PROVIDER_MODE !== "gemini") {
+  // -----------------------------
+// Speech engine WS (OpenAI Realtime OR Gemini Live)
+// -----------------------------
 
+let openAiWs = null;
+let geminiWs = null;
+let geminiReady = false;
+let geminiGreetingSent = false;
+
+if (PROVIDER_MODE === "gemini") {
+  if (!GEMINI_API_KEY) {
+    logError(connId, "Missing GEMINI_API_KEY – closing.");
+    twilioWs.close();
+    return;
+  }
+  const modelName = normalizeGeminiModelName(GEMINI_LIVE_MODEL || MB_GEMINI_LIVE_MODEL || "gemini-2.5-flash-native-audio-preview-12-2025");
+  const url = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
+  geminiWs = new WebSocket(url);
+
+  geminiWs.on("open", () => {
+    geminiReady = true;
+
+    // Build system instructions from the SAME GilSport SSOT + policies (no changes)
+    const { opening, instructions } = buildSystemInstructionsFromSheets();
+    baseInstructions = instructions;
+
+    const setup = {
+      setup: {
+        model: modelName,
+        systemInstruction: baseInstructions ? { parts: [{ text: baseInstructions }] } : undefined,
+        generationConfig: {
+          responseModalities: ["AUDIO"],
+          speechConfig: {
+            voiceConfig: {
+              prebuiltVoiceConfig: {
+                voiceName: VOICE_NAME_OVERRIDE || (SETTINGS?.VOICE_NAME || "Kore")
+              }
+            }
+          }
+        },
+        realtimeInputConfig: {
+          automaticActivityDetection: {
+            prefixPaddingMs: Number(MB_VAD_PREFIX_MS ?? 200),
+            silenceDurationMs: Number(MB_VAD_SILENCE_MS ?? 900)
+          }
+        },
+        ...(MB_LOG_TRANSCRIPTS ? { inputAudioTranscription: {}, outputAudioTranscription: {} } : {})
+      }
+    };
+
+    try {
+      geminiWs.send(JSON.stringify(setup));
+      logInfo(connId, "Gemini Live WS connected.", { model: modelName });
+    } catch (e) {
+      logError(connId, "Failed to send Gemini setup", e);
+    }
+  });
+
+  geminiWs.on("message", (data) => {
+    let msg;
+    try { msg = JSON.parse(data.toString("utf8")); } catch { return; }
+
+    if (msg?.setupComplete && !geminiGreetingSent) {
+      geminiGreetingSent = true;
+      const { opening } = buildSystemInstructionsFromSheets();
+      const kickoff = `התחילי שיחה עכשיו. אמרי בדיוק את טקסט הפתיחה הבא בעברית (ללא תוספות וללא שינויים), ואז עצרי להקשבה:\n${opening}`;
+      const m = { clientContent: { turns: [{ role: "user", parts: [{ text: kickoff }] }], turnComplete: true } };
+      try { geminiWs.send(JSON.stringify(m)); } catch (_) {}
+      return;
+    }
+
+    // AUDIO parts -> Twilio
+    try {
+      const parts =
+        msg?.serverContent?.modelTurn?.parts ||
+        msg?.serverContent?.turn?.parts ||
+        msg?.serverContent?.parts ||
+        [];
+      for (const p of parts) {
+        const inline = p?.inlineData;
+        if (inline?.data && inline?.mimeType && String(inline.mimeType).startsWith("audio/pcm")) {
+          const ulawB64 = pcm24kB64ToUlaw8kB64(inline.data);
+          if (ulawB64 && streamSid && twilioWs.readyState === WebSocket.OPEN) {
+            twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload: ulawB64 } }));
+          }
+        }
+      }
+    } catch (_) {}
+
+    // Transcriptions -> conversationLog (so lead rules remain identical)
+    try {
+      const inTr = msg?.serverContent?.inputTranscription?.text;
+      if (inTr) {
+        const t = String(inTr || "").trim();
+        if (t) {
+          conversationLog.push({ role: "user", text: t });
+          logAlways(`[CALLER][${connId}] ${t}`);
+        }
+      }
+      const outTr = msg?.serverContent?.outputTranscription?.text;
+      if (outTr) {
+        const t = String(outTr || "").trim();
+        if (t) {
+          conversationLog.push({ role: "assistant", text: t });
+          logAlways(`[BOT][${connId}] ${t}`);
+        }
+      }
+    } catch (_) {}
+  });
+
+  geminiWs.on("close", (code, reasonBuf) => {
+    const reason = reasonBuf ? reasonBuf.toString("utf8") : "";
+    geminiReady = false;
+    logInfo(connId, "Gemini Live WS closed", { code, reason });
+    // Do NOT force endCall here; let Twilio stop/idle logic decide (prevents "tzintuk" on transient closes)
+  });
+
+  geminiWs.on("error", (err) => {
+    geminiReady = false;
+    logError(connId, "Gemini Live WS error", err);
+  });
+} else {
+// OpenAI Realtime WS
   // -----------------------------
   const openAiWs = new WebSocket(
     `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_REALTIME_MODEL)}`,
@@ -2402,222 +2555,8 @@ wss.on("connection", async (twilioWs, req) => {
     logError(connId, "OpenAI WS error", err);
     if (!callEnded) endCall("openai_ws_error", null).catch(() => {});
   });
-  }
 
-  // -----------------------------
-  // Gemini Live WS (speech only, inline)
-  // -----------------------------
-  let geminiWs = null;
-  let geminiReady = false;
-  let geminiGreetingSent = false;
-
-    async function geminiConnect(metaForLog) {
-    // If GEMINI_VERTEX_ENABLED=true => connect to Vertex Live API with OAuth (ADC).
-    // Else => connect to Gemini Developer API Live endpoint with API key.
-    if (GEMINI_VERTEX_ENABLED) {
-      if (!GEMINI_PROJECT_ID) {
-        logError(connId, "GEMINI_VERTEX_ENABLED=true but GEMINI_PROJECT_ID is missing – closing.");
-        twilioWs.close();
-        return;
-      }
-      const token = await getVertexAccessToken();
-      if (!token) {
-        logError(connId, "Vertex access token is empty. Ensure GOOGLE_APPLICATION_CREDENTIALS is set and valid – closing.");
-        twilioWs.close();
-        return;
-      }
-
-      const modelName = String(GEMINI_LIVE_MODEL || "").replace(/^models\//, "");
-      const modelResource = `projects/${GEMINI_PROJECT_ID}/locations/${GEMINI_LOCATION}/publishers/google/models/${modelName}`;
-
-      // Vertex Live API is WebSockets; endpoints vary by region routing. Try common patterns.
-      const candidates = [
-        `wss://${GEMINI_LOCATION}-aiplatform.googleapis.com/v1beta1/${modelResource}:bidiGenerateContent`,
-        `wss://${GEMINI_LOCATION}-aiplatform.googleapis.com/v1beta1/${modelResource}:streamGenerateContent`,
-        `wss://aiplatform.googleapis.com/v1beta1/${modelResource}:bidiGenerateContent`,
-        `wss://aiplatform.googleapis.com/v1beta1/${modelResource}:streamGenerateContent`,
-      ];
-
-      let lastErr = null;
-      for (const url of candidates) {
-        try {
-          geminiWs = new WebSocket(url, {
-            headers: {
-              Authorization: `Bearer ${token}`,
-              "x-goog-user-project": GEMINI_PROJECT_ID,
-            },
-          });
-          logInfo(connId, "Gemini Vertex Live WS dialing...", { url, modelResource });
-          break;
-        } catch (e) {
-          lastErr = e;
-        }
-      }
-
-      if (!geminiWs) {
-        logError(connId, "Failed to create Vertex WebSocket", lastErr);
-        twilioWs.close();
-        return;
-      }
-
-      // Build the setup using Vertex model resource.
-      geminiWs.on("open", () => {
-        geminiReady = true;
-        const { opening, instructions } = buildSystemInstructionsFromSheets();
-        baseInstructions = instructions;
-
-        const setup = {
-          setup: {
-            model: modelResource,
-            systemInstruction: baseInstructions ? { parts: [{ text: baseInstructions }] } : undefined,
-            generationConfig: {
-              responseModalities: ["AUDIO"],
-              speechConfig: {
-                voiceConfig: {
-                  prebuiltVoiceConfig: {
-                    voiceName: (process.env.VOICE_NAME_OVERRIDE || "Kore"),
-                  },
-                },
-              },
-            },
-            realtimeInputConfig: {
-              automaticActivityDetection: {
-                prefixPaddingMs: Number(MB_VAD_PREFIX_MS ?? 200),
-                silenceDurationMs: Number(MB_VAD_SILENCE_MS ?? 900),
-              },
-            },
-            ...(MB_LOG_TRANSCRIPTS ? { inputAudioTranscription: {}, outputAudioTranscription: {} } : {}),
-          },
-        };
-
-        try {
-          geminiWs.send(JSON.stringify(setup));
-          logInfo(connId, "Gemini Vertex Live WS connected.", { model: setup.setup.model });
-        } catch (e) {
-          logError(connId, "Failed to send Gemini Vertex setup", e);
-        }
-      });
-
-      // The rest of handlers are already defined below (message/close/error) after geminiWs is created.
-      return;
-    }
-
-    // Developer API (API key)
-    const url = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
-    geminiWs = new WebSocket(url);
-    geminiWs.on("open", () => {
-      geminiReady = true;
-      const { opening, instructions } = buildSystemInstructionsFromSheets();
-      baseInstructions = instructions;
-
-      const setup = {
-        setup: {
-          model: `models/${String(GEMINI_LIVE_MODEL || "").replace(/^models\//, "")}`,
-          systemInstruction: baseInstructions ? { parts: [{ text: baseInstructions }] } : undefined,
-          generationConfig: {
-            responseModalities: ["AUDIO"],
-            speechConfig: {
-              voiceConfig: {
-                prebuiltVoiceConfig: {
-                  voiceName: (process.env.VOICE_NAME_OVERRIDE || "Kore")
-                }
-              }
-            }
-          },
-          realtimeInputConfig: {
-            automaticActivityDetection: {
-              prefixPaddingMs: Number(MB_VAD_PREFIX_MS ?? 200),
-              silenceDurationMs: Number(MB_VAD_SILENCE_MS ?? 900)
-            }
-          },
-          ...(MB_LOG_TRANSCRIPTS ? { inputAudioTranscription: {}, outputAudioTranscription: {} } : {})
-        }
-      };
-
-      try {
-        geminiWs.send(JSON.stringify(setup));
-        logInfo(connId, "Gemini Live WS connected.", { model: setup.setup.model });
-      } catch (e) {
-        logError(connId, "Failed to send Gemini setup", e);
-      }
-    });
-
-    let currentBotTextGemini = "";
-
-    geminiWs.on("message", (data) => {
-      let msg;
-      try { msg = JSON.parse(data.toString("utf8")); } catch { return; }
-
-      if (msg?.setupComplete && !geminiGreetingSent) {
-        geminiGreetingSent = true;
-        const { opening } = buildSystemInstructionsFromSheets();
-        const kickoff = `התחילי שיחה עכשיו. אמרי בדיוק את טקסט הפתיחה הבא בעברית (ללא תוספות וללא שינויים), ואז עצרי להקשבה:\n${opening}`;
-        const m = { clientContent: { turns: [{ role: "user", parts: [{ text: kickoff }] }], turnComplete: true } };
-        try { geminiWs.send(JSON.stringify(m)); } catch (_) {}
-        return;
-      }
-
-      // AUDIO parts -> Twilio
-      try {
-        const parts =
-          msg?.serverContent?.modelTurn?.parts ||
-          msg?.serverContent?.turn?.parts ||
-          msg?.serverContent?.parts ||
-          [];
-        for (const p of parts) {
-          const inline = p?.inlineData;
-          if (inline?.data && inline?.mimeType && String(inline.mimeType).startsWith("audio/pcm")) {
-            const ulawB64 = pcm24kB64ToUlaw8kB64(inline.data);
-            if (ulawB64 && streamSid && twilioWs.readyState === WebSocket.OPEN) {
-              twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload: ulawB64 } }));
-            }
-          }
-          if (p?.text) currentBotTextGemini += String(p.text);
-        }
-      } catch (_) {}
-
-      // Transcriptions -> conversationLog
-      try {
-        const inTr = msg?.serverContent?.inputTranscription?.text;
-        if (inTr) {
-          const t = String(inTr || "").trim();
-          if (t) {
-            conversationLog.push({ from: "user", text: t });
-            logAlways(`[CALLER][${connId}] ${t}`);
-          }
-        }
-        const outTr = msg?.serverContent?.outputTranscription?.text;
-        if (outTr) {
-          const t = String(outTr || "").trim();
-          if (t) {
-            conversationLog.push({ from: "bot", text: t });
-            logAlways(`[BOT][${connId}] ${t}`);
-          }
-        }
-      } catch (_) {}
-    });
-
-    geminiWs.on("close", (code, reasonBuf) => {
-      const reason = reasonBuf ? reasonBuf.toString("utf8") : "";
-      geminiReady = false;
-      logInfo(connId, "Gemini Live WS closed", { code, reason });
-      if (!callEnded) endCall("gemini_ws_closed", null).catch(() => {});
-    });
-
-    geminiWs.on("error", (err) => {
-      geminiReady = false;
-      logError(connId, "Gemini Live WS error", err);
-      if (!callEnded) endCall("gemini_ws_error", null).catch(() => {});
-    });
-  }
-
-  if (PROVIDER_MODE === "gemini") {
-    if (!GEMINI_API_KEY) {
-      logError(connId, "Missing GEMINI_API_KEY – closing.");
-      twilioWs.close();
-      return;
-    }
-    geminiConnect();
+  
   }
 
 // -----------------------------
@@ -2664,8 +2603,6 @@ wss.on("connection", async (twilioWs, req) => {
       lastMediaTs = Date.now();
 
       logAlways(`[TWILIO_START][${connId}] ${JSON.stringify(msg.start || {})}`);
-
-      logAlways(`[SpeechEngine][${connId}] provider=${PROVIDER_MODE} openai_model=${OPENAI_REALTIME_MODEL} gemini_model=${GEMINI_LIVE_MODEL}`);
 
       // Start Twilio recording (optional). Recording callbacks arrive asynchronously to /twilio-recording-callback.
       if (MB_ENABLE_RECORDING && callSid) {
@@ -2771,67 +2708,3 @@ server.listen(PORT, () => {
   logEnvStatus();
   loadSheetsCache("Startup").catch((err) => console.error("[ERROR] Startup sheets load failed", err));
 });
-
-
-// =============================
-// Gemini audio helpers (inline, no deps)
-// =============================
-function ulawByteToPcm16(sample) {
-  sample = ~sample & 0xff;
-  const sign = sample & 0x80;
-  const exponent = (sample >> 4) & 0x07;
-  const mantissa = sample & 0x0f;
-  let pcm = ((mantissa << 3) + 0x84) << exponent;
-  pcm -= 0x84;
-  return sign ? -pcm : pcm;
-}
-
-function pcm16ToUlawByte(pcm) {
-  const BIAS = 0x84;
-  const CLIP = 32635;
-  let sign = 0;
-  if (pcm < 0) { sign = 0x80; pcm = -pcm; }
-  if (pcm > CLIP) pcm = CLIP;
-  pcm += BIAS;
-  let exponent = 7;
-  for (let expMask = 0x4000; (pcm & expMask) === 0 && exponent > 0; expMask >>= 1) exponent--;
-  const mantissa = (pcm >> (exponent + 3)) & 0x0f;
-  return (~(sign | (exponent << 4) | mantissa)) & 0xff;
-}
-
-function ulaw8kB64ToPcm16kB64(ulawB64) {
-  const ulaw = Buffer.from(ulawB64, "base64");
-  const pcm16k = Buffer.alloc(ulaw.length * 4);
-  let o = 0;
-  for (let i = 0; i < ulaw.length; i++) {
-    const s = ulawByteToPcm16(ulaw[i]);
-    pcm16k.writeInt16LE(s, o); o += 2;
-    pcm16k.writeInt16LE(s, o); o += 2;
-  }
-  return pcm16k.toString("base64");
-}
-
-function pcm24kB64ToUlaw8kB64(pcmB64) {
-  const pcm = Buffer.from(pcmB64, "base64");
-  const samples = pcm.length // 2
-  const outLen = samples // 3
-  const ulaw = Buffer.alloc(outLen)
-  let oi = 0
-  for (let i = 0; i < samples; i += 3) {
-    const s = pcm.readInt16LE(i * 2)
-    ulaw[oi++] = pcm16ToUlawByte(s)
-  }
-  return ulaw.toString("base64")
-}
-
-
-async function getVertexAccessToken() {
-  // Uses Application Default Credentials (GOOGLE_APPLICATION_CREDENTIALS or metadata server in GCP)
-  const auth = new google.auth.GoogleAuth({
-    scopes: ["https://www.googleapis.com/auth/cloud-platform"],
-  });
-  const client = await auth.getClient();
-  const tokenResponse = await client.getAccessToken();
-  const token = typeof tokenResponse === "string" ? tokenResponse : tokenResponse?.token;
-  return token || "";
-}
