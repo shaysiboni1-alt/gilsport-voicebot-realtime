@@ -377,6 +377,11 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const GEMINI_LIVE_MODEL = process.env.GEMINI_LIVE_MODEL || "gemini-2.5-flash-native-audio-preview-12-2025";
 const GEMINI_AUDIO_IN_FORMAT = process.env.GEMINI_AUDIO_IN_FORMAT || "audio/pcm;rate=16000";
 const GEMINI_AUDIO_OUT_FORMAT = process.env.GEMINI_AUDIO_OUT_FORMAT || "audio/pcm;rate=24000";
+
+// Vertex AI mode (server-side OAuth). If true, we connect to Vertex Live API and authenticate via Application Default Credentials.
+const GEMINI_VERTEX_ENABLED = String(process.env.GEMINI_VERTEX_ENABLED || "false").toLowerCase() === "true";
+const GEMINI_PROJECT_ID = process.env.GEMINI_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT || "";
+const GEMINI_LOCATION = process.env.GEMINI_LOCATION || process.env.GOOGLE_CLOUD_LOCATION || "us-central1";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const OPENAI_REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview-2024-12-17";
 const OPENAI_VOICE = process.env.OPENAI_VOICE || "alloy";
@@ -2406,10 +2411,100 @@ wss.on("connection", async (twilioWs, req) => {
   let geminiReady = false;
   let geminiGreetingSent = false;
 
-  function geminiConnect(metaForLog) {
+    async function geminiConnect(metaForLog) {
+    // If GEMINI_VERTEX_ENABLED=true => connect to Vertex Live API with OAuth (ADC).
+    // Else => connect to Gemini Developer API Live endpoint with API key.
+    if (GEMINI_VERTEX_ENABLED) {
+      if (!GEMINI_PROJECT_ID) {
+        logError(connId, "GEMINI_VERTEX_ENABLED=true but GEMINI_PROJECT_ID is missing – closing.");
+        twilioWs.close();
+        return;
+      }
+      const token = await getVertexAccessToken();
+      if (!token) {
+        logError(connId, "Vertex access token is empty. Ensure GOOGLE_APPLICATION_CREDENTIALS is set and valid – closing.");
+        twilioWs.close();
+        return;
+      }
+
+      const modelName = String(GEMINI_LIVE_MODEL || "").replace(/^models\//, "");
+      const modelResource = `projects/${GEMINI_PROJECT_ID}/locations/${GEMINI_LOCATION}/publishers/google/models/${modelName}`;
+
+      // Vertex Live API is WebSockets; endpoints vary by region routing. Try common patterns.
+      const candidates = [
+        `wss://${GEMINI_LOCATION}-aiplatform.googleapis.com/v1beta1/${modelResource}:bidiGenerateContent`,
+        `wss://${GEMINI_LOCATION}-aiplatform.googleapis.com/v1beta1/${modelResource}:streamGenerateContent`,
+        `wss://aiplatform.googleapis.com/v1beta1/${modelResource}:bidiGenerateContent`,
+        `wss://aiplatform.googleapis.com/v1beta1/${modelResource}:streamGenerateContent`,
+      ];
+
+      let lastErr = null;
+      for (const url of candidates) {
+        try {
+          geminiWs = new WebSocket(url, {
+            headers: {
+              Authorization: `Bearer ${token}`,
+              "x-goog-user-project": GEMINI_PROJECT_ID,
+            },
+          });
+          logInfo(connId, "Gemini Vertex Live WS dialing...", { url, modelResource });
+          break;
+        } catch (e) {
+          lastErr = e;
+        }
+      }
+
+      if (!geminiWs) {
+        logError(connId, "Failed to create Vertex WebSocket", lastErr);
+        twilioWs.close();
+        return;
+      }
+
+      // Build the setup using Vertex model resource.
+      geminiWs.on("open", () => {
+        geminiReady = true;
+        const { opening, instructions } = buildSystemInstructionsFromSheets();
+        baseInstructions = instructions;
+
+        const setup = {
+          setup: {
+            model: modelResource,
+            systemInstruction: baseInstructions ? { parts: [{ text: baseInstructions }] } : undefined,
+            generationConfig: {
+              responseModalities: ["AUDIO"],
+              speechConfig: {
+                voiceConfig: {
+                  prebuiltVoiceConfig: {
+                    voiceName: (process.env.VOICE_NAME_OVERRIDE || "Kore"),
+                  },
+                },
+              },
+            },
+            realtimeInputConfig: {
+              automaticActivityDetection: {
+                prefixPaddingMs: Number(MB_VAD_PREFIX_MS ?? 200),
+                silenceDurationMs: Number(MB_VAD_SILENCE_MS ?? 900),
+              },
+            },
+            ...(MB_LOG_TRANSCRIPTS ? { inputAudioTranscription: {}, outputAudioTranscription: {} } : {}),
+          },
+        };
+
+        try {
+          geminiWs.send(JSON.stringify(setup));
+          logInfo(connId, "Gemini Vertex Live WS connected.", { model: setup.setup.model });
+        } catch (e) {
+          logError(connId, "Failed to send Gemini Vertex setup", e);
+        }
+      });
+
+      // The rest of handlers are already defined below (message/close/error) after geminiWs is created.
+      return;
+    }
+
+    // Developer API (API key)
     const url = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
     geminiWs = new WebSocket(url);
-
     geminiWs.on("open", () => {
       geminiReady = true;
       const { opening, instructions } = buildSystemInstructionsFromSheets();
@@ -2727,4 +2822,16 @@ function pcm24kB64ToUlaw8kB64(pcmB64) {
     ulaw[oi++] = pcm16ToUlawByte(s)
   }
   return ulaw.toString("base64")
+}
+
+
+async function getVertexAccessToken() {
+  // Uses Application Default Credentials (GOOGLE_APPLICATION_CREDENTIALS or metadata server in GCP)
+  const auth = new google.auth.GoogleAuth({
+    scopes: ["https://www.googleapis.com/auth/cloud-platform"],
+  });
+  const client = await auth.getClient();
+  const tokenResponse = await client.getAccessToken();
+  const token = typeof tokenResponse === "string" ? tokenResponse : tokenResponse?.token;
+  return token || "";
 }
