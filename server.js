@@ -1835,6 +1835,11 @@ wss.on("connection", async (twilioWs, req) => {
 
   let streamSid = null;
   let callSid = null;
+
+    // Debug counters
+    let twilioMediaPackets = 0;
+    let geminiAudioChunksSent = 0;
+    let lastMediaLogAt = 0;
   let callerRaw = null;
   let callerIL = null;
 
@@ -2213,7 +2218,7 @@ if (PROVIDER_MODE === "gemini") {
   geminiWs = new WebSocket(url);
 
   geminiWs.on("open", () => {
-      geminiReady = true;
+      geminiReady = false;
       geminiSetupComplete = false;
     // Build system instructions from the SAME GilSport SSOT + policies (no changes)
     const { opening, instructions } = buildSystemInstructionsFromSheets();
@@ -2258,7 +2263,8 @@ if (PROVIDER_MODE === "gemini") {
     if (msg?.setupComplete && !geminiGreetingSent) {
         geminiSetupComplete = true;
         logInfo(connId, "Gemini setupComplete.", {});
-        geminiGreetingSent = true;
+        geminiReady = true;
+geminiGreetingSent = true;
       const { opening } = buildSystemInstructionsFromSheets();
       const kickoff = `התחילי שיחה עכשיו. אמרי בדיוק את טקסט הפתיחה הבא בעברית (ללא תוספות וללא שינויים), ואז עצרי להקשבה:\n${opening}`;
       const m = { clientContent: { turns: [{ role: "user", parts: [{ text: kickoff }] }], turnComplete: true } };
