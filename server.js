@@ -17,6 +17,13 @@ const fetch = global.fetch || require("node-fetch");
 const { google } = require("googleapis");
 
 // -----------------------------
+// Gemini kickoff helpers (force immediate proactive opening)
+// -----------------------------
+// 100ms PCM16 silence @ 16kHz (mono). Used to "prime" some Gemini Live builds
+// that may delay first audio response until any audio input is observed.
+const GEMINI_SILENCE_PCM16_16K_B64 = Buffer.alloc(16000 * 0.1 * 2).toString("base64");
+
+// -----------------------------
 // ENV helpers
 // -----------------------------
 function envNumber(name, def) {
@@ -628,6 +635,60 @@ function logError(connId, msg, extra) {
 function logAlways(msg, extra) {
   if (extra !== undefined) console.log(`[ALWAYS] ${msg}`, extra);
   else console.log(`[ALWAYS] ${msg}`);
+}
+
+// -----------------------------
+// Pretty transcript logs (Render log UI friendliness)
+// Aggregates word-by-word partials into full lines.
+// -----------------------------
+function createTranscriptAggregator(kind, connId) {
+  let buf = "";
+  let lastAt = 0;
+  let timer = null;
+
+  function flush(reason = "") {
+    if (!buf.trim()) return;
+    const line = buf.trim();
+    buf = "";
+    // Keep the prefix consistent with existing log format
+    logAlways(`[${kind}][${connId}] ${line}${reason ? ` (${reason})` : ""}`);
+  }
+
+  function scheduleFlush(ms) {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => flush("timeout"), ms);
+  }
+
+  return {
+    push(fragment) {
+      const now = Date.now();
+
+      // If there is a long gap between fragments, flush previous line first.
+      if (buf && lastAt && now - lastAt > 1200) flush("gap");
+
+      lastAt = now;
+
+      const t = String(fragment || "").replace(/\s+/g, " ").trim();
+      if (!t) return;
+
+      // Append with spacing.
+      if (!buf) buf = t;
+      else buf = `${buf} ${t}`;
+
+      // Flush conditions: sentence end, or line too long.
+      if (/[.!?…:]$/.test(t) || buf.length >= 90) {
+        flush(/[.!?…:]$/.test(t) ? "eos" : "len");
+      } else {
+        // Otherwise wait briefly; caller often streams word-by-word.
+        scheduleFlush(450);
+      }
+    },
+    flush,
+    close() {
+      if (timer) clearTimeout(timer);
+      flush("close");
+    },
+  };
 }
 
 function logEnvFallback(name, fallback) {
@@ -1827,6 +1888,18 @@ wss.on("connection", async (twilioWs, req) => {
   const connId = `conn_${Date.now().toString(36)}_${Math.random().toString(16).slice(2, 6)}`;
   logAlways(`WS connection`, { at: nowIso(), ua: req.headers["user-agent"], url: req.url });
 
+  // Pretty logs: aggregate partial word-by-word transcripts into readable lines
+  const callerLog = createTranscriptAggregator("CALLER", connId);
+  const botLog = createTranscriptAggregator("BOT", connId);
+  const sysLog = createTranscriptAggregator("SYS", connId);
+
+  // Latency instrumentation + opening watchdog
+  let twilioStartAt = 0;
+  let geminiSetupAt = 0;
+  let firstBotAudioAt = 0;
+  let openingWatchdog = null;
+  let openingResendCount = 0;
+
   if (!OPENAI_API_KEY) {
     logError(connId, "Missing OPENAI_API_KEY – closing.");
     twilioWs.close();
@@ -2281,17 +2354,41 @@ if (PROVIDER_MODE === "gemini") {
 
   geminiWs.on("message", (data) => {
     let msg;
-    try { msg = JSON.parse(data.toString("utf8")); } catch { return; }
+    try {
+      msg = JSON.parse(data.toString("utf8"));
+    } catch {
+      return;
+    }
 
-    if (msg?.setupComplete && !geminiGreetingSent) {
-        geminiSetupComplete = true;
-        logInfo(connId, "Gemini setupComplete.", {});
-        geminiReady = true;
-geminiGreetingSent = true;
-      const { opening } = buildSystemInstructionsFromSheets();
-      const kickoff = `התחילי שיחה עכשיו. אמרי בדיוק את טקסט הפתיחה הבא בעברית (ללא תוספות וללא שינויים), ואז עצרי להקשבה:\n${opening}`;
-      const m = { clientContent: { turns: [{ role: "user", parts: [{ text: kickoff }] }], turnComplete: true } };
-      try { geminiWs.send(JSON.stringify(m)); } catch (_) {}
+    // Gemini is ready
+    if (msg?.setupComplete) {
+      geminiSetupComplete = true;
+      geminiReady = true;
+      logInfo(connId, "Gemini setupComplete.", {});
+
+      // Proactive opening: speak immediately after setupComplete, regardless of caller audio.
+      if (!geminiGreetingSent) {
+        geminiGreetingSent = true;
+        const { opening } = buildSystemInstructionsFromSheets();
+        const openingText = String(opening || "").trim();
+        const prompt = openingText
+          ? `פתחי את השיחה עכשיו במשפט הבא (אפשר לשנות מעט את הניסוח אבל לא להאריך): "${openingText}" ואז עצרי והמתיני לתשובת הלקוח.`
+          : "פתחי את השיחה עכשיו בעברית, ואז עצרי והמתיני לתשובת הלקוח.";
+
+        try {
+          sendModelPrompt(connId, geminiWs, prompt);
+        } catch (_) {}
+
+        // Safety: if no audio reached Twilio within ~1.5s, retry once.
+        setTimeout(() => {
+          if (callEnded) return;
+          if (firstBotAudioAt) return;
+          try {
+            sendModelPrompt(connId, geminiWs, prompt);
+          } catch (_) {}
+        }, 1500);
+      }
+
       return;
     }
 
@@ -2302,23 +2399,34 @@ geminiGreetingSent = true;
         msg?.serverContent?.turn?.parts ||
         msg?.serverContent?.parts ||
         [];
+
       for (const p of parts) {
         const inline = p?.inlineData;
-        if (inline?.data && inline?.mimeType && String(inline.mimeType).startsWith("audio/pcm")) {
+        if (
+          inline?.data &&
+          inline?.mimeType &&
+          String(inline.mimeType).startsWith("audio/pcm")
+        ) {
           const ulawB64 = pcm24kB64ToUlaw8kB64(inline.data);
           if (ulawB64 && streamSid && twilioWs.readyState === WebSocket.OPEN) {
-            twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload: ulawB64 } }));
-                      botSpeaking = true;
+            twilioWs.send(
+              JSON.stringify({
+                event: "media",
+                streamSid,
+                media: { payload: ulawB64 },
+              })
+            );
+            botSpeaking = true;
             geminiLastAudioAt = Date.now();
             setTimeout(() => {
               if (Date.now() - geminiLastAudioAt > 200) botSpeaking = false;
             }, 250);
-}
+          }
         }
       }
     } catch (_) {}
 
-    // Transcriptions -> conversationLog (so lead rules remain identical)
+    // Transcriptions -> conversationLog
     try {
       const inTr = msg?.serverContent?.inputTranscription?.text;
       if (inTr) {
@@ -2328,6 +2436,7 @@ geminiGreetingSent = true;
           logAlways(`[CALLER][${connId}] ${t}`);
         }
       }
+
       const outTr = msg?.serverContent?.outputTranscription?.text;
       if (outTr) {
         const t = String(outTr || "").trim();
@@ -2336,24 +2445,22 @@ geminiGreetingSent = true;
           logAlways(`[BOT][${connId}] ${t}`);
         }
       }
-    
 
-// Turn completion: release half-duplex gate and apply a short post-TTS cooldown (echo suppression)
-try {
-  const sc = msg?.serverContent || msg?.server_content || {};
-  const turnComplete =
-    sc?.turnComplete ||
-    sc?.turn_complete ||
-    msg?.turnComplete ||
-    msg?.turn_complete;
-  if (turnComplete) {
-    hasActiveResponse = false;
-    botTurnActive = false;
-    // Echo suppression after model speech (best-effort)
-    noListenUntilTs = Date.now() + MB_POST_TTS_COOLDOWN_MS;
-  }
-} catch (_) {}
-} catch (_) {}
+      // Turn completion: release half-duplex gate and apply a short post-TTS cooldown (echo suppression)
+      try {
+        const sc = msg?.serverContent || msg?.server_content || {};
+        const turnComplete =
+          sc?.turnComplete ||
+          sc?.turn_complete ||
+          msg?.turnComplete ||
+          msg?.turn_complete;
+        if (turnComplete) {
+          hasActiveResponse = false;
+          botTurnActive = false;
+          noListenUntilTs = Date.now() + MB_POST_TTS_COOLDOWN_MS;
+        }
+      } catch (_) {}
+    } catch (_) {}
   });
 
   geminiWs.on("close", (code, reasonBuf) => {
@@ -2755,6 +2862,9 @@ try {
 
   twilioWs.on("close", () => {
     logAlways(`[TWILIO_CLOSE][${connId}] socket closed`);
+    try { if (openingWatchdog) clearInterval(openingWatchdog); } catch (_) {}
+    try { callerLog.flush("ws_close"); } catch (_) {}
+    try { botLog.flush("ws_close"); } catch (_) {}
     if (!callEnded) endCall("twilio_ws_closed", null).catch(() => {});
   });
 
