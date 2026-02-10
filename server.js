@@ -17,13 +17,6 @@ const fetch = global.fetch || require("node-fetch");
 const { google } = require("googleapis");
 
 // -----------------------------
-// Gemini kickoff helpers (force immediate proactive opening)
-// -----------------------------
-// 100ms PCM16 silence @ 16kHz (mono). Used to "prime" some Gemini Live builds
-// that may delay first audio response until any audio input is observed.
-const GEMINI_SILENCE_PCM16_16K_B64 = Buffer.alloc(16000 * 0.1 * 2).toString("base64");
-
-// -----------------------------
 // ENV helpers
 // -----------------------------
 function envNumber(name, def) {
@@ -635,60 +628,6 @@ function logError(connId, msg, extra) {
 function logAlways(msg, extra) {
   if (extra !== undefined) console.log(`[ALWAYS] ${msg}`, extra);
   else console.log(`[ALWAYS] ${msg}`);
-}
-
-// -----------------------------
-// Pretty transcript logs (Render log UI friendliness)
-// Aggregates word-by-word partials into full lines.
-// -----------------------------
-function createTranscriptAggregator(kind, connId) {
-  let buf = "";
-  let lastAt = 0;
-  let timer = null;
-
-  function flush(reason = "") {
-    if (!buf.trim()) return;
-    const line = buf.trim();
-    buf = "";
-    // Keep the prefix consistent with existing log format
-    logAlways(`[${kind}][${connId}] ${line}${reason ? ` (${reason})` : ""}`);
-  }
-
-  function scheduleFlush(ms) {
-    if (timer) clearTimeout(timer);
-    timer = setTimeout(() => flush("timeout"), ms);
-  }
-
-  return {
-    push(fragment) {
-      const now = Date.now();
-
-      // If there is a long gap between fragments, flush previous line first.
-      if (buf && lastAt && now - lastAt > 1200) flush("gap");
-
-      lastAt = now;
-
-      const t = String(fragment || "").replace(/\s+/g, " ").trim();
-      if (!t) return;
-
-      // Append with spacing.
-      if (!buf) buf = t;
-      else buf = `${buf} ${t}`;
-
-      // Flush conditions: sentence end, or line too long.
-      if (/[.!?…:]$/.test(t) || buf.length >= 90) {
-        flush(/[.!?…:]$/.test(t) ? "eos" : "len");
-      } else {
-        // Otherwise wait briefly; caller often streams word-by-word.
-        scheduleFlush(450);
-      }
-    },
-    flush,
-    close() {
-      if (timer) clearTimeout(timer);
-      flush("close");
-    },
-  };
 }
 
 function logEnvFallback(name, fallback) {
@@ -1888,18 +1827,6 @@ wss.on("connection", async (twilioWs, req) => {
   const connId = `conn_${Date.now().toString(36)}_${Math.random().toString(16).slice(2, 6)}`;
   logAlways(`WS connection`, { at: nowIso(), ua: req.headers["user-agent"], url: req.url });
 
-  // Pretty logs: aggregate partial word-by-word transcripts into readable lines
-  const callerLog = createTranscriptAggregator("CALLER", connId);
-  const botLog = createTranscriptAggregator("BOT", connId);
-  const sysLog = createTranscriptAggregator("SYS", connId);
-
-  // Latency instrumentation + opening watchdog
-  let twilioStartAt = 0;
-  let geminiSetupAt = 0;
-  let firstBotAudioAt = 0;
-  let openingWatchdog = null;
-  let openingResendCount = 0;
-
   if (!OPENAI_API_KEY) {
     logError(connId, "Missing OPENAI_API_KEY – closing.");
     twilioWs.close();
@@ -2356,81 +2283,15 @@ if (PROVIDER_MODE === "gemini") {
     let msg;
     try { msg = JSON.parse(data.toString("utf8")); } catch { return; }
 
-    // -----------------------------
-    // Gemini ready -> send proactive opening immediately
-    // We deliberately send:
-    // (1) a short PCM16 silence chunk (priming)
-    // (2) kickoff text turn with BOTH key spellings (clientContent + client_content)
-    // (3) a watchdog re-kick if no bot audio within ~1.2s
-    // -----------------------------
-    if (msg?.setupComplete && !geminiSetupComplete) {
-      geminiSetupComplete = true;
-      geminiReady = true;
-      logInfo(connId, "Gemini setupComplete.", {});
-
-      // Build SSOT opening now (fast path; no additional network)
+    if (msg?.setupComplete && !geminiGreetingSent) {
+        geminiSetupComplete = true;
+        logInfo(connId, "Gemini setupComplete.", {});
+        geminiReady = true;
+geminiGreetingSent = true;
       const { opening } = buildSystemInstructionsFromSheets();
-      const openingText = String(opening || "").trim();
-      const kickoff = `התחילי שיחה עכשיו. אמרי בדיוק את טקסט הפתיחה הבא בעברית (ללא תוספות וללא שינויים), ואז עצרי להקשבה:\n${openingText}`;
-
-      const sendKickoff = () => {
-        if (!geminiWs || geminiWs.readyState !== WebSocket.OPEN) return;
-
-        // 1) Priming silence (some Gemini Live builds delay first audio until any audio input arrives)
-        const priming = {
-          realtimeInput: {
-            mediaChunks: [
-              {
-                inlineData: {
-                  mimeType: "audio/pcm;rate=16000",
-                  data: GEMINI_SILENCE_PCM16_16K_B64,
-                },
-              },
-            ],
-          },
-        };
-
-        // 2) Kickoff turn (dual key spelling for compatibility)
-        const turn = {
-          turns: [{ role: "user", parts: [{ text: kickoff }] }],
-          turnComplete: true,
-        };
-        const m1 = { clientContent: turn };
-        const m2 = { client_content: turn };
-
-        try {
-          geminiWs.send(JSON.stringify(priming));
-          geminiWs.send(JSON.stringify(m1));
-          geminiWs.send(JSON.stringify(m2));
-        } catch (_) {}
-      };
-
-      // Send immediately once per connection
-      if (!geminiGreetingSent) {
-        geminiGreetingSent = true;
-        sendKickoff();
-      }
-
-      // Watchdog: if we still haven't emitted any bot audio quickly, re-kick a few times.
-      if (!openingWatchdog) {
-        let tries = 0;
-        openingWatchdog = setInterval(() => {
-          tries += 1;
-          if (firstBotAudioAt) {
-            clearInterval(openingWatchdog);
-            openingWatchdog = null;
-            return;
-          }
-          if (tries <= 5) {
-            logDebug(connId, `Opening watchdog re-kick #${tries}`);
-            sendKickoff();
-            return;
-          }
-          clearInterval(openingWatchdog);
-          openingWatchdog = null;
-        }, 1200);
-      }
-
+      const kickoff = `התחילי שיחה עכשיו. אמרי בדיוק את טקסט הפתיחה הבא בעברית (ללא תוספות וללא שינויים), ואז עצרי להקשבה:\n${opening}`;
+      const m = { clientContent: { turns: [{ role: "user", parts: [{ text: kickoff }] }], turnComplete: true } };
+      try { geminiWs.send(JSON.stringify(m)); } catch (_) {}
       return;
     }
 
@@ -2447,22 +2308,12 @@ if (PROVIDER_MODE === "gemini") {
           const ulawB64 = pcm24kB64ToUlaw8kB64(inline.data);
           if (ulawB64 && streamSid && twilioWs.readyState === WebSocket.OPEN) {
             twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload: ulawB64 } }));
-            if (!firstBotAudioAt) {
-              firstBotAudioAt = Date.now();
-              if (openingWatchdog) {
-                try { clearInterval(openingWatchdog); } catch (_) {}
-                openingWatchdog = null;
-              }
-              const dt = callStartTs ? firstBotAudioAt - callStartTs : null;
-              logInfo(connId, "First BOT audio sent.", { ms_from_start: dt });
-            }
-
-            botSpeaking = true;
+                      botSpeaking = true;
             geminiLastAudioAt = Date.now();
             setTimeout(() => {
               if (Date.now() - geminiLastAudioAt > 200) botSpeaking = false;
             }, 250);
-          }
+}
         }
       }
     } catch (_) {}
@@ -2474,7 +2325,7 @@ if (PROVIDER_MODE === "gemini") {
         const t = String(inTr || "").trim();
         if (t) {
           conversationLog.push({ from: "user", text: t });
-          callerLog.push(t);
+          logAlways(`[CALLER][${connId}] ${t}`);
         }
       }
       const outTr = msg?.serverContent?.outputTranscription?.text;
@@ -2482,7 +2333,7 @@ if (PROVIDER_MODE === "gemini") {
         const t = String(outTr || "").trim();
         if (t) {
           conversationLog.push({ from: "bot", text: t });
-          botLog.push(t);
+          logAlways(`[BOT][${connId}] ${t}`);
         }
       }
     
@@ -2904,9 +2755,6 @@ try {
 
   twilioWs.on("close", () => {
     logAlways(`[TWILIO_CLOSE][${connId}] socket closed`);
-    try { if (openingWatchdog) clearInterval(openingWatchdog); } catch (_) {}
-    try { callerLog.flush("ws_close"); } catch (_) {}
-    try { botLog.flush("ws_close"); } catch (_) {}
     if (!callEnded) endCall("twilio_ws_closed", null).catch(() => {});
   });
 
