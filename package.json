@@ -1,5 +1,5 @@
 {
-  "name": "voicebot_blank",
+  "name": "gilsport-voicebot-realtime",
   "version": "1.0.0",
   "private": true,
   "main": "src/server.js",
