@@ -145,7 +145,8 @@ function buildSystemInstructionFromSSOT(ssot, runtimeMeta) {
         "CALLER MEMORY POLICY:",
         `- Known caller name: "${callerName}"`,
         "- Treat it as correct unless the caller explicitly corrects it.",
-        "- Do NOT ask the caller for their name again."
+        "- Do NOT ask the caller for their name again.",
+        "- Even if it looks like a first name only, do NOT ask for a full name unless the caller explicitly corrects the known name."
       ].join("\n")
     );
   } else {
@@ -394,7 +395,9 @@ class GeminiLiveSession {
             }
           },
 
-          ...(env.MB_LOG_TRANSCRIPTS ? { inputAudioTranscription: {}, outputAudioTranscription: {} } : {})
+          inputAudioTranscription: {},
+
+          ...(env.MB_LOG_TRANSCRIPTS ? { outputAudioTranscription: {} } : {})
         }
       };
 
@@ -489,7 +492,6 @@ class GeminiLiveSession {
   }
 
   _onTranscriptChunk(who, chunk) {
-    if (!env.MB_LOG_TRANSCRIPTS) return;
 
     const c = chunk || "";
     if (!c) return;
@@ -605,17 +607,81 @@ class GeminiLiveSession {
     }
 
     if (who === "user") {
-      const intent = detectIntent({
+      const detected = detectIntent({
         text: nlp.normalized || nlp.raw,
         intents: this.ssot?.intents || []
       });
+
+      // Sticky intent: once we have a real intent (score>0 and not "other"),
+      // do not allow later detections to downgrade to "other" unless the user explicitly changes topic.
+      const prev = this._call?.intent_locked ? this._call.intent_id : null;
+      const nextId = safeStr(detected?.intent_id) || safeStr(detected?.intent_type) || null;
+      const nextScore = Number(detected?.score ?? 0);
+
+      let effective = detected;
+
+      if (prev) {
+        // Downgrade protection
+        if (!nextId || nextId === "other" || nextScore <= 0) {
+          effective = { ...(detected || {}), intent_id: prev, intent_type: prev, score: this._call.intent_score ?? 0, locked: true };
+        } else if (nextId !== prev && nextScore < 3) {
+          // Weak change -> ignore
+          effective = { ...(detected || {}), intent_id: prev, intent_type: prev, score: this._call.intent_score ?? 0, locked: true };
+        } else if (nextId !== prev && nextScore >= 3) {
+          // Strong change -> allow update
+          this._call.intent_id = nextId;
+          this._call.intent_score = nextScore;
+        }
+      } else {
+        // Lock on first strong intent
+        if (nextId && nextId !== "other" && nextScore > 0) {
+          this._call.intent_locked = true;
+          this._call.intent_id = nextId;
+          this._call.intent_score = nextScore;
+
+          // Send a non-spoken "system nudge" to the model to keep the flow consistent.
+          // This is sent as an invisible user turn; systemInstruction already forbids repeating it to the caller.
+          try {
+            const nudge = {
+              clientContent: {
+                turns: [{
+                  role: "user",
+                  parts: [{ text: `הערה פנימית: כוונת הפנייה נקבעה כ-${nextId}. אל תשנה כוונה אלא אם המשתמש משנה נושא במפורש.` }]
+                }],
+                turnComplete: true
+              }
+            };
+            this.ws?.send(JSON.stringify(nudge));
+          } catch { /* ignore */ }
+        }
+      }
+
+      // Subject hint: capture once from the first meaningful user utterance to prevent re-asking.
+      if (!this._call.subject_hint) {
+        const subj = safeStr(nlp.normalized || nlp.raw);
+        if (subj && subj.length >= 2 && subj.length <= 160 && subj !== ".") {
+          this._call.subject_hint = subj;
+          try {
+            const subjNudge = {
+              clientContent: {
+                turns: [{
+                  role: "user",
+                  parts: [{ text: `הערה פנימית: נושא הפנייה הוא: "${subj}". אל תשאל שוב "במה אפשר לעזור/מה הנושא" אלא אם המשתמש משנה נושא.` }]
+                }],
+                turnComplete: true
+              }
+            };
+            this.ws?.send(JSON.stringify(subjNudge));
+          } catch { /* ignore */ }
+        }
+      }
 
       logger.info("INTENT_DETECTED", {
         ...this.meta,
         text: nlp.raw,
         normalized: nlp.normalized,
         lang: nlp.lang,
-        intent
+        intent: effective
       });
     }
 
@@ -659,9 +725,8 @@ class GeminiLiveSession {
       .trim();
 
     // Critical: keep kickoff ultra-short to avoid the model "thinking out loud".
-    const userKickoff =
-      `אמרי עכשיו בדיוק את המשפט הבא בלבד, מילה במילה, בלי שום תוספת, ואז עצרי להקשבה:\n` +
-      opening;
+    const userKickoff = `אמרי בקול את המשפט הבא בלבד ואז עצרי להקשבה:
+${opening}`;
 
     const msg = {
       clientContent: {
@@ -697,10 +762,9 @@ class GeminiLiveSession {
   }
 
   endInput() {
-    if (!this.ws || this.closed) return;
-    try {
-      this.ws.send(JSON.stringify({ realtimeInput: { audioStreamEnd: true } }));
-    } catch { /* ignore */ }
+    // Gemini Live may not support audioStreamEnd in all deployments.
+    // We keep this as a no-op to avoid server-side protocol errors (WS close 1008).
+    return;
   }
 
   async _finalizeOnce(reason) {
