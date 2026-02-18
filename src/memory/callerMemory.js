@@ -256,36 +256,91 @@ async function updateCallerDisplayName(callerId, displayName, metaPatch = null) 
   const p = getPool();
   if (!p) return false;
 
-  const cid = String(callerId || '').trim();
-  const dn = String(displayName || '').trim();
+  const cid = String(callerId || "").trim();
+  let dn = String(displayName || "").trim();
 
   if (!cid) return false;
   if (!dn) return false;
 
   // Hard guardrails (anti-hallucination / safety)
+  dn = dn.replace(/[\u200e\u200f\u202a-\u202e]/g, "").trim();
   if (dn.length < 2 || dn.length > 40) return false;
   if (/\d/.test(dn)) return false;
+  if (!/[\p{Script=Hebrew}\p{Script=Latin}]/u.test(dn)) return false;
+  if (!/^[\p{Script=Hebrew}\p{Script=Latin}\s'\-\.]{2,40}$/u.test(dn)) return false;
 
-  const sql = `
-    INSERT INTO caller_profiles (caller_id, display_name, total_calls, first_seen, last_seen, meta)
-    VALUES ($1, $2, 0, NOW(), NOW(), COALESCE($3::jsonb, '{}'::jsonb))
-    ON CONFLICT (caller_id) DO UPDATE SET
-      display_name = EXCLUDED.display_name,
-      last_seen = NOW(),
-      meta = CASE
-        WHEN $3::jsonb IS NULL THEN caller_profiles.meta
-        ELSE caller_profiles.meta || $3::jsonb
-      END
-  `;
+  const dnWords = dn.split(/\s+/).filter(Boolean);
+  const dnIsFull = dnWords.length >= 2;
 
   try {
-    await withTimeout(p.query(sql, [cid, dn, metaPatch ? JSON.stringify(metaPatch) : null]));
-    return true;
+    // Read current state (including meta flags)
+    const existingRes = await p.query(
+      "SELECT display_name, meta FROM caller_profiles WHERE caller_id = $1 LIMIT 1",
+      [cid]
+    );
+    const existing = existingRes.rows && existingRes.rows[0] ? existingRes.rows[0] : null;
+    const existingName = existing && existing.display_name ? String(existing.display_name).trim() : "";
+    const existingWords = existingName ? existingName.split(/\s+/).filter(Boolean) : [];
+    const existingIsFull = existingWords.length >= 2;
+
+    let existingMeta = {};
+    try {
+      if (existing && existing.meta && typeof existing.meta === "object") existingMeta = existing.meta;
+    } catch { /* ignore */ }
+
+    const nameLocked = existingMeta && (existingMeta.name_locked === true || String(existingMeta.name_locked).toLowerCase() === "true");
+
+    // Rule 1: If locked, never change the name (unless identical).
+    if (nameLocked) {
+      if (existingName && existingName === dn) return true;
+      return false;
+    }
+
+    // Rule 2: If we already have a full name stored, do not overwrite with anything else.
+    if (existingIsFull) {
+      if (existingName === dn) return true;
+      return false;
+    }
+
+    // Rule 3: If we have a partial name (single token), do not overwrite with a different partial.
+    // Only allow upgrading partial -> full (and lock it), preferably when it starts with the same token.
+    if (existingName && !existingIsFull) {
+      if (!dnIsFull) {
+        if (existingName === dn) return true;
+        return false;
+      }
+      const firstTokenMatches = existingWords[0] && dnWords[0] && existingWords[0] === dnWords[0];
+      if (!firstTokenMatches) {
+        // Allow upgrade only if the new full name contains the old token somewhere (still conservative)
+        const contains = existingWords[0] && dnWords.includes(existingWords[0]);
+        if (!contains) return false;
+      }
+      // Upgrade allowed -> lock
+      const mergedMeta = { ...(existingMeta || {}), ...(metaPatch || {}), name_locked: true, name_verified: true, name_partial: false };
+      await p.query(
+        "UPDATE caller_profiles SET display_name=$1, updated_at=now(), meta = COALESCE(meta, '{}'::jsonb) || $2::jsonb WHERE caller_id=$3",
+        [dn, JSON.stringify(mergedMeta), cid]
+      );
+      return true;
+    }
+
+    // Rule 4: No existing name. Save; if full -> lock, else keep partial flag.
+    const baseMeta = { ...(existingMeta || {}), ...(metaPatch || {}) };
+    baseMeta.name_locked = dnIsFull ? true : false;
+    baseMeta.name_verified = dnIsFull ? true : false;
+    baseMeta.name_partial = dnIsFull ? false : true;
+
+    const res = await p.query(
+      "UPDATE caller_profiles SET display_name=$1, updated_at=now(), meta = COALESCE(meta, '{}'::jsonb) || $2::jsonb WHERE caller_id=$3",
+      [dn, JSON.stringify(baseMeta), cid]
+    );
+    return res.rowCount > 0;
   } catch (e) {
-    logger.debug('Caller memory display_name update failed', { error: String(e?.message || e) });
+    logger.debug("updateCallerDisplayName failed", { callerId: cid, err: e?.message || e });
     return false;
   }
 }
+
 
 module.exports = {
   ensureCallerMemorySchema,
