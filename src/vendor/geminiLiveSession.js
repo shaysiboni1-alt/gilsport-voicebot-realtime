@@ -239,6 +239,11 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+// STAGE A: latency helper
+function nowMs() {
+  return Date.now();
+}
+
 function normalizeCallerId(caller) {
   const s = (caller || "").trim();
   const low = s.toLowerCase();
@@ -280,7 +285,11 @@ async function deliverWebhook(url, payload, label) {
 class GeminiLiveSession {
   constructor({ onGeminiAudioUlaw8kBase64, onGeminiText, onTranscript, meta, ssot }) {
     this.onGeminiAudioUlaw8kBase64 = onGeminiAudioUlaw8kBase64;
-    this.onGeminiText = onGeminiText;
+
+    // STAGE A: disable Gemini text (internal reasoning) in production by default.
+    // Allow only when MB_DEBUG=true and a handler was provided.
+    this.onGeminiText = (env.MB_DEBUG && typeof onGeminiText === "function") ? onGeminiText : null;
+
     this.onTranscript = onTranscript;
 
     this.meta = meta || {};
@@ -295,6 +304,10 @@ class GeminiLiveSession {
     this._trBuf = { user: "", bot: "" };
     this._trLastChunk = { user: "", bot: "" };
     this._trTimer = { user: null, bot: null };
+
+    // STAGE A: latency markers (measured from user UTTERANCE flush -> first audio chunk out)
+    this._latencyStartMs = 0;
+    this._latencyLogged = false;
 
     // Call state (conversation log + metadata). Lead extraction is POST-CALL via LLM.
     const callerInfo = normalizeCallerId(this.meta?.caller || "");
@@ -438,6 +451,13 @@ class GeminiLiveSession {
           if (!inline || !inline?.data || !inline?.mimeType) continue;
 
           if (String(inline.mimeType).startsWith("audio/pcm")) {
+            // STAGE A: latency measure at FIRST audio chunk after user utterance end
+            if (this._latencyStartMs && !this._latencyLogged) {
+              this._latencyLogged = true;
+              const delta = nowMs() - this._latencyStartMs;
+              logger.info("LATENCY first_audio_out", { ...this.meta, delta_ms: delta });
+            }
+
             const ulawB64 = pcm24kB64ToUlaw8kB64(inline.data);
             if (ulawB64 && this.onGeminiAudioUlaw8kBase64) {
               this.onGeminiAudioUlaw8kBase64(ulawB64);
@@ -448,17 +468,19 @@ class GeminiLiveSession {
         logger.debug("Gemini message parse error", { ...this.meta, error: e.message });
       }
 
-      // Optional text parts (debug only; should be empty with strict policy, but we keep it)
+      // Optional text parts (debug only; disabled by default in Stage A)
       try {
-        const parts =
-          msg?.serverContent?.modelTurn?.parts ||
-          msg?.serverContent?.turn?.parts ||
-          msg?.serverContent?.parts ||
-          [];
+        if (this.onGeminiText) {
+          const parts =
+            msg?.serverContent?.modelTurn?.parts ||
+            msg?.serverContent?.turn?.parts ||
+            msg?.serverContent?.parts ||
+            [];
 
-        for (const p of parts) {
-          const t = p?.text;
-          if (t && this.onGeminiText) this.onGeminiText(String(t));
+          for (const p of parts) {
+            const t = p?.text;
+            if (t) this.onGeminiText(String(t));
+          }
         }
       } catch { /* ignore */ }
 
@@ -543,6 +565,12 @@ class GeminiLiveSession {
       normalized: nlp.normalized,
       lang: nlp.lang
     });
+
+    // STAGE A: set latency start marker at END of user utterance (after flush)
+    if (who === "user") {
+      this._latencyStartMs = nowMs();
+      this._latencyLogged = false;
+    }
 
     // Deterministic caller name capture (runs on every user utterance).
     // Does NOT depend on the opening; only persists on high-confidence patterns.
