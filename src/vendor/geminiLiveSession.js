@@ -239,7 +239,6 @@ function nowIso() {
   return new Date().toISOString();
 }
 
-// STAGE A: latency helper
 function nowMs() {
   return Date.now();
 }
@@ -258,6 +257,48 @@ function normalizeCallerId(caller) {
 function isTruthyEnv(v) {
   const s = String(v ?? "").trim().toLowerCase();
   return s === "true" || s === "1" || s === "yes" || s === "y";
+}
+
+// -----------------------------------------------------------------------------
+// Name-capture hardening (fix: "שמר את הכל" => not a name)
+// -----------------------------------------------------------------------------
+
+const HEBREW_NOT_A_NAME_SINGLE_TOKENS = new Set([
+  "שמר", "שמור", "שמרי", "שמרו", "תשמור", "תשמרי", "תשמרו",
+  "שומר", "שומרים", "שומרת",
+  "שמורו", "שמרני", "שמרוּ",
+  "כן", "לא", "בסדר", "אוקיי", "אוקי", "אוקיי.", "אוקי.",
+  "הלו", "שלום", "תודה"
+]);
+
+function looksLikeImperativeSavePhrase(userTextRaw) {
+  const t = safeStr(userTextRaw);
+  if (!t) return false;
+  // common: "שמר את הכל", "שמור הכל", "תשמור את זה", etc.
+  if (/^(שמר|שמור|תשמור|שמרי|תשמרי|שמרו|תשמרו)\b/.test(t)) return true;
+  if (/\b(שמר|שמור|תשמור|שמרי|תשמרי|שמרו|תשמרו)\b\s*(את\b)?\s*(הכל|זה|אותו|אותה|אותם|אותן)\b/.test(t)) return true;
+  return false;
+}
+
+function isProbablyBadCallerNameCandidate(name, sourceUtterance) {
+  const n = safeStr(name);
+  if (!n) return true;
+
+  // Reject if contains digits or punctuation-heavy
+  if (/[0-9]/.test(n)) return true;
+  if (n.length > 24) return true;
+
+  // If it's a single token that is commonly a verb/ack, reject
+  const oneToken = !/\s/.test(n);
+  if (oneToken) {
+    const norm = n.replace(/[.,!?״"'`~(){}\[\]:;]+/g, "").trim();
+    if (HEBREW_NOT_A_NAME_SINGLE_TOKENS.has(norm)) return true;
+  }
+
+  // Reject known phrase pattern: "שמר את הכל" etc.
+  if (looksLikeImperativeSavePhrase(sourceUtterance)) return true;
+
+  return false;
 }
 
 // -----------------------------------------------------------------------------
@@ -286,7 +327,7 @@ class GeminiLiveSession {
   constructor({ onGeminiAudioUlaw8kBase64, onGeminiText, onTranscript, meta, ssot }) {
     this.onGeminiAudioUlaw8kBase64 = onGeminiAudioUlaw8kBase64;
 
-    // STAGE A: disable Gemini text (internal reasoning) in production by default.
+    // Disable Gemini text (internal reasoning) in production by default.
     // Allow only when MB_DEBUG=true and a handler was provided.
     this.onGeminiText = (env.MB_DEBUG && typeof onGeminiText === "function") ? onGeminiText : null;
 
@@ -305,7 +346,9 @@ class GeminiLiveSession {
     this._trLastChunk = { user: "", bot: "" };
     this._trTimer = { user: null, bot: null };
 
-    // STAGE A: latency markers (measured from user UTTERANCE flush -> first audio chunk out)
+    // Latency markers:
+    // - _latencyStartMs: set when we get any user transcript chunk (closer to real end-of-speech than "flush")
+    // - _latencyLogged: reset per user turn; log once when first audio chunk goes out
     this._latencyStartMs = 0;
     this._latencyLogged = false;
 
@@ -349,6 +392,10 @@ class GeminiLiveSession {
 
     // Canonical: after CLOSING is fully spoken, we initiate hangup from our side.
     this._hangupScheduled = false;
+
+    // Flush debounce: reduce artificial waiting while keeping transcript stability.
+    // (No new ENV names; just a safer default than 350ms.)
+    this._flushDebounceMs = 180;
   }
 
   start() {
@@ -380,8 +427,9 @@ class GeminiLiveSession {
       });
 
       // VAD tuning (keep ENV names locked; clamp to safe ranges)
-      const vadPrefix = clampNum(env.MB_VAD_PREFIX_MS ?? 120, 50, 600, 120);
-      const vadSilence = clampNum(env.MB_VAD_SILENCE_MS ?? 450, 200, 1500, 450);
+      // Updated defaults to reduce perceived latency without forcing ENV changes.
+      const vadPrefix = clampNum(env.MB_VAD_PREFIX_MS ?? 80, 50, 600, 80);
+      const vadSilence = clampNum(env.MB_VAD_SILENCE_MS ?? 250, 150, 1500, 250);
 
       const setup = {
         setup: {
@@ -390,7 +438,6 @@ class GeminiLiveSession {
 
           generationConfig: {
             responseModalities: ["AUDIO"],
-            // keep concise and fast
             temperature: 0.2,
             speechConfig: {
               voiceConfig: {
@@ -431,7 +478,6 @@ class GeminiLiveSession {
       }
 
       // Send proactive opening exactly once, as early as possible.
-      // We send it on setupComplete if present; otherwise we will send it once we see any serverContent.
       if ((msg?.setupComplete || msg?.serverContent) && !this._greetingSent) {
         this._greetingSent = true;
         this._sendProactiveOpening();
@@ -451,7 +497,7 @@ class GeminiLiveSession {
           if (!inline || !inline?.data || !inline?.mimeType) continue;
 
           if (String(inline.mimeType).startsWith("audio/pcm")) {
-            // STAGE A: latency measure at FIRST audio chunk after user utterance end
+            // latency measure at FIRST audio chunk after user transcript begins
             if (this._latencyStartMs && !this._latencyLogged) {
               this._latencyLogged = true;
               const delta = nowMs() - this._latencyStartMs;
@@ -468,7 +514,7 @@ class GeminiLiveSession {
         logger.debug("Gemini message parse error", { ...this.meta, error: e.message });
       }
 
-      // Optional text parts (debug only; disabled by default in Stage A)
+      // Optional text parts (debug only; disabled by default)
       try {
         if (this.onGeminiText) {
           const parts =
@@ -514,9 +560,15 @@ class GeminiLiveSession {
   }
 
   _onTranscriptChunk(who, chunk) {
-
     const c = chunk || "";
     if (!c) return;
+
+    // Start latency timer as soon as we get *any* user transcript activity for this turn.
+    // (Better proxy than waiting for our flush debounce.)
+    if (who === "user") {
+      if (!this._latencyStartMs) this._latencyStartMs = nowMs();
+      // If a new user turn begins later, we reset in _flushTranscript("user") to avoid cross-turn mixing.
+    }
 
     if (c === this._trLastChunk[who]) return;
     this._trLastChunk[who] = c;
@@ -524,7 +576,7 @@ class GeminiLiveSession {
     this._trBuf[who] = (this._trBuf[who] + c).slice(-800);
 
     if (this._trTimer[who]) clearTimeout(this._trTimer[who]);
-    this._trTimer[who] = setTimeout(() => this._flushTranscript(who), 350);
+    this._trTimer[who] = setTimeout(() => this._flushTranscript(who), this._flushDebounceMs);
   }
 
   _flushTranscript(who) {
@@ -566,9 +618,11 @@ class GeminiLiveSession {
       lang: nlp.lang
     });
 
-    // STAGE A: set latency start marker at END of user utterance (after flush)
+    // For each flushed user turn: reset "first audio out" logging for the upcoming model response.
     if (who === "user") {
-      this._latencyStartMs = nowMs();
+      // Keep the latency start as-is if already set by first transcript chunk.
+      // If it wasn't set (rare), set it here.
+      if (!this._latencyStartMs) this._latencyStartMs = nowMs();
       this._latencyLogged = false;
     }
 
@@ -594,21 +648,32 @@ class GeminiLiveSession {
             let normalizedName = String(found.name).trim();
             if (normalizedName === "שאי") normalizedName = "שי"; // fix known STT confusion
 
-            const existing = safeStr(this.meta?.caller_profile?.display_name) || "";
-            if (!existing || existing !== normalizedName) {
-              // Best-effort DB write, must never block call flow.
-              updateCallerDisplayName(callerId, normalizedName).catch(() => {});
-              // Update in-memory immediately for same-call usage.
-              if (!this.meta.caller_profile) this.meta.caller_profile = {};
-              this.meta.caller_profile.display_name = normalizedName;
-
-              logger.info("CALLER_NAME_CAPTURED", {
+            // HARDENING: block false positives like "שמר"
+            if (isProbablyBadCallerNameCandidate(normalizedName, nlp.raw)) {
+              logger.info("CALLER_NAME_REJECTED", {
                 ...this.meta,
                 caller: callerId,
-                name: normalizedName,
-                confidence_reason: found.reason,
+                candidate: normalizedName,
+                reason: "filtered_non_name_candidate",
                 source_utterance: nlp.raw
               });
+            } else {
+              const existing = safeStr(this.meta?.caller_profile?.display_name) || "";
+              if (!existing || existing !== normalizedName) {
+                // Best-effort DB write, must never block call flow.
+                updateCallerDisplayName(callerId, normalizedName).catch(() => {});
+                // Update in-memory immediately for same-call usage.
+                if (!this.meta.caller_profile) this.meta.caller_profile = {};
+                this.meta.caller_profile.display_name = normalizedName;
+
+                logger.info("CALLER_NAME_CAPTURED", {
+                  ...this.meta,
+                  caller: callerId,
+                  name: normalizedName,
+                  confidence_reason: found.reason,
+                  source_utterance: nlp.raw
+                });
+              }
             }
           }
         }
@@ -667,8 +732,7 @@ class GeminiLiveSession {
           this._call.intent_id = nextId;
           this._call.intent_score = nextScore;
 
-          // Send a non-spoken "system nudge" to the model to keep the flow consistent.
-          // This is sent as an invisible user turn; systemInstruction already forbids repeating it to the caller.
+          // Send a non-spoken "system nudge" to keep the flow consistent.
           try {
             const nudge = {
               clientContent: {
@@ -713,11 +777,22 @@ class GeminiLiveSession {
       });
     }
 
-    // NOTE: deterministic lead capture removed by design.
-    // Lead extraction happens post-call via SSOT LEAD_PARSER_PROMPT.
-
     if (this.onTranscript) {
       this.onTranscript({ who, text: nlp.raw, normalized: nlp.normalized, lang: nlp.lang });
+    }
+
+    // Reset latency start AFTER we flushed user (so next turn can start cleanly),
+    // but keep it until first audio out is observed.
+    if (who === "user") {
+      // do nothing here; keep until audio chunk logs it.
+      // However if the model never responds, we also reset on close/finalize.
+    }
+
+    if (who === "bot") {
+      // Once bot spoke, the "turn" is effectively done; prepare for next user turn:
+      // keep _latencyStartMs at 0 to avoid cross-turn logging.
+      this._latencyStartMs = 0;
+      this._latencyLogged = false;
     }
   }
 
@@ -752,7 +827,7 @@ class GeminiLiveSession {
       .replace(/,\s+,/g, ",")
       .trim();
 
-    // Critical: keep kickoff ultra-short to avoid the model "thinking out loud".
+    // Keep kickoff ultra-short to avoid the model "thinking out loud".
     const userKickoff = `אמרי בקול את המשפט הבא בלבד ואז עצרי להקשבה:
 ${opening}`;
 
@@ -791,13 +866,17 @@ ${opening}`;
 
   endInput() {
     // Gemini Live may not support audioStreamEnd in all deployments.
-    // We keep this as a no-op to avoid server-side protocol errors (WS close 1008).
+    // Keep this as a no-op to avoid server-side protocol errors (WS close 1008).
     return;
   }
 
   async _finalizeOnce(reason) {
     if (this._call.finalized) return;
     this._call.finalized = true;
+
+    // ensure latency markers don't leak across calls
+    this._latencyStartMs = 0;
+    this._latencyLogged = false;
 
     try {
       this._call.ended_at = nowIso();
