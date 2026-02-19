@@ -3,9 +3,12 @@
 /*
   Finalize Pipeline for VoiceBot_Blank
 
-  Resolves recording metadata, parses the conversation post‑call, normalizes and
-  validates lead fields (including name and phone number), decides if the lead is
-  FINAL or ABANDONED, sends webhooks, and updates the caller memory.
+  - Resolves recording metadata
+  - Parses conversation post-call
+  - Applies deterministic normalization (no hallucinated names)
+  - Decides FINAL vs ABANDONED
+  - Sends webhooks
+  - Updates caller memory
 */
 
 const { parseLeadPostcall } = require("./postcallLeadParser");
@@ -41,7 +44,37 @@ function buildTranscript(conversationLog) {
     .join("\n");
 }
 
-// Derive a fallback name from conversation if the LLM fails
+// Deterministic: accept name only if explicitly stated
+function explicitNameAppearsInTranscript(transcript) {
+  const t = String(transcript || "");
+  if (!t) return null;
+
+  const lines = t
+    .split("\n")
+    .filter((ln) => ln.startsWith("USER:"))
+    .map((ln) => ln.slice(5).trim())
+    .filter(Boolean);
+
+  const patterns = [
+    /\b(?:קוראים\s+לי)\s+([^\n\r]+)$/i,
+    /\b(?:שמי)\s+([^\n\r]+)$/i,
+    /\b(?:השם\s+שלי)\s+([^\n\r]+)$/i,
+  ];
+
+  for (const ln of lines) {
+    for (const re of patterns) {
+      const m = ln.match(re);
+      if (m && m[1]) {
+        const cand = String(m[1]).trim();
+        if (cand && cand.length >= 2 && cand.length <= 40) return cand;
+      }
+    }
+  }
+
+  return null;
+}
+
+// Derive a fallback name from conversation if everything else fails (VERY conservative)
 function deriveDisplayNameFromConversationLog(conversationLog) {
   const rows = Array.isArray(conversationLog) ? conversationLog : [];
   for (const r of rows) {
@@ -53,8 +86,13 @@ function deriveDisplayNameFromConversationLog(conversationLog) {
     if (!t) continue;
     if (/[0-9]/.test(t)) continue;
     if (t.length > 24) continue;
+
+    // Do NOT treat generic greetings as names
+    const bad = new Set(["שלום", "היי", "הלו", "כן", "לא", "אוקיי", "סבבה", "טוב", "בסדר"]);
+    if (bad.has(t)) continue;
+
     const words = t.split(/\s+/).filter(Boolean);
-    if (words.length === 0 || words.length > 3) continue;
+    if (words.length === 0 || words.length > 2) continue;
     if (t.length < 2) continue;
     if (!/\p{L}/u.test(t)) continue;
     return words[0];
@@ -62,7 +100,7 @@ function deriveDisplayNameFromConversationLog(conversationLog) {
   return null;
 }
 
-// Normalize lead fields and apply fallbacks
+// Normalize lead fields and apply fallbacks (deterministic)
 function normalizeLead(parsed, call, knownFullName, knownPhone, conversationLog, ssot) {
   const out = {
     intent: null,
@@ -73,6 +111,7 @@ function normalizeLead(parsed, call, knownFullName, knownPhone, conversationLog,
     brand: null,
     model: null,
   };
+
   if (parsed && typeof parsed === "object") {
     for (const k of Object.keys(out)) {
       const v = parsed[k];
@@ -82,18 +121,23 @@ function normalizeLead(parsed, call, knownFullName, knownPhone, conversationLog,
       }
     }
   }
-  // Fill missing name from known or heuristic; only accept Hebrew/Latin names
-  if (!out.full_name) {
-    let candidate = knownFullName ? safeStr(knownFullName) : null;
-    if (!candidate) {
-      const derived = deriveDisplayNameFromConversationLog(conversationLog);
-      candidate = derived ? safeStr(derived) : null;
-    }
-    if (candidate && /^[\p{Script=Hebrew}\p{Script=Latin}\s]{2,40}$/u.test(candidate)) {
-      out.full_name = candidate;
-    }
+
+  // Name policy:
+  // 1) If knownFullName exists -> FORCE it (never allow LLM overwrite)
+  // 2) Else accept only explicit transcript pattern
+  const transcript = buildTranscript(conversationLog);
+  const explicit = explicitNameAppearsInTranscript(transcript);
+
+  if (knownFullName) {
+    out.full_name = safeStr(knownFullName);
+  } else if (explicit) {
+    out.full_name = safeStr(explicit);
+  } else {
+    out.full_name = null;
   }
-  // Fill missing phone from known or caller ID (if not withheld)
+
+  // Phone policy:
+  // - Only fill from knownPhone; otherwise caller ID if not withheld
   if (!out.callback_to_number) {
     if (knownPhone) {
       out.callback_to_number = safeStr(knownPhone);
@@ -103,14 +147,15 @@ function normalizeLead(parsed, call, knownFullName, knownPhone, conversationLog,
       if (caller && !withheld) out.callback_to_number = caller;
     }
   }
+
   // Fallback intent detection if missing
   if (!out.intent) {
     try {
-      const transcript = buildTranscript(conversationLog);
       const fallback = detectIntent({ text: transcript, intents: ssot?.intents || [] });
       out.intent = fallback?.intent_id || null;
     } catch { /* ignore */ }
   }
+
   return out;
 }
 
@@ -121,7 +166,9 @@ function deriveSubjectFromConversationLog(conversationLog) {
     .filter((r) => String(r?.role || "").toLowerCase() === "user")
     .map((r) => String(r?.text || "").trim())
     .filter(Boolean);
+
   if (!userUtterances.length) return null;
+
   const last = userUtterances[userUtterances.length - 1];
   return last.length > 180 ? last.slice(0, 180) : last;
 }
@@ -129,6 +176,7 @@ function deriveSubjectFromConversationLog(conversationLog) {
 // Validate that a callback number appears in conversation
 function appearsInConversation(num, convLog) {
   const digits = (num || "").replace(/\D/g, "");
+  if (!digits) return false;
   return convLog.some(({ text }) => text && text.replace(/\D/g, "").includes(digits));
 }
 
@@ -137,29 +185,25 @@ function decideEvent(lead) {
   const nameVal = safeStr(lead?.full_name);
   const phoneVal = safeStr(lead?.callback_to_number);
   const subjVal = safeStr(lead?.subject);
+
   const hasName =
     nameVal &&
     nameVal.length >= 2 &&
     /^[\p{Script=Hebrew}\p{Script=Latin}\s]+$/u.test(nameVal);
+
   const hasPhone = !!phoneVal;
   const hasSubject = !!subjVal;
-  if (hasName && hasPhone && hasSubject) {
-    return { event: "FINAL", decision_reason: "ok" };
-  }
-  if (!hasName && hasPhone && hasSubject) {
-    return { event: "ABANDONED", decision_reason: "no_name" };
-  }
-  if (!hasPhone && hasSubject) {
-    return { event: "ABANDONED", decision_reason: "no_phone" };
-  }
-  if (hasPhone && !hasSubject) {
-    return { event: "ABANDONED", decision_reason: "no_subject" };
-  }
+
+  if (hasName && hasPhone && hasSubject) return { event: "FINAL", decision_reason: "ok" };
+  if (!hasName && hasPhone && hasSubject) return { event: "ABANDONED", decision_reason: "no_name" };
+  if (!hasPhone && hasSubject) return { event: "ABANDONED", decision_reason: "no_phone" };
+  if (hasPhone && !hasSubject) return { event: "ABANDONED", decision_reason: "no_subject" };
   return { event: "ABANDONED", decision_reason: "partial" };
 }
 
 async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
   const log = logger || console;
+
   try {
     // Build call metadata
     const call = {
@@ -171,26 +215,30 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
       source: snapshot?.call?.source || snapshot?.source || "VoiceBot_Blank",
       started_at: snapshot?.call?.started_at || snapshot?.started_at || null,
       ended_at: snapshot?.call?.ended_at || snapshot?.ended_at || null,
-      duration_ms:
-        snapshot?.call?.duration_ms ?? snapshot?.duration_ms ?? null,
+      duration_ms: snapshot?.call?.duration_ms ?? snapshot?.duration_ms ?? null,
       duration_sec:
         snapshot?.call?.duration_sec ??
         secondsFromMs(snapshot?.call?.duration_ms ?? snapshot?.duration_ms),
       finalize_reason: snapshot?.call?.finalize_reason || snapshot?.finalize_reason || null,
       passive_context: snapshot?.call?.passive_context || null,
+      // Keep optional caller_profile if snapshot includes it
+      caller_profile: snapshot?.call?.caller_profile || snapshot?.caller_profile || null,
     };
+
     // Extract conversation log
     const conversationLog = Array.isArray(snapshot?.conversationLog)
       ? snapshot.conversationLog
       : Array.isArray(snapshot?.call?.conversationLog)
         ? snapshot.call.conversationLog
         : [];
+
     // Resolve recording
     let recording = {
       recording_provider: null,
       recording_sid: null,
       recording_url_public: null,
     };
+
     try {
       if (env.MB_ENABLE_RECORDING && typeof senders?.resolveRecording === "function") {
         recording = await senders.resolveRecording();
@@ -198,21 +246,31 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
     } catch (e) {
       log.warn?.("Resolve recording failed", e?.message || e);
     }
-    // Download recording
+
+    // Download recording (optional)
     if (recording?.recording_sid) {
       try {
         const downloaded = await downloadRecording(recording.recording_sid, log);
-        if (downloaded?.publicUrl) {
-          recording.recording_url_public = downloaded.publicUrl;
-        }
+        if (downloaded?.publicUrl) recording.recording_url_public = downloaded.publicUrl;
       } catch (e) {
         log.warn?.("Local download of recording failed", e?.message || e);
       }
     }
-    // Build transcript and parse lead
+
+    // Build transcript
     const transcript = buildTranscript(conversationLog);
-    const knownFullName = safeStr(call?.passive_context?.name);
-    const knownPhone = safeStr(call?.passive_context?.callback_number);
+
+    // Get known values:
+    // Prefer caller_profile.display_name (matches your logs), then passive_context.name
+    const knownFullName =
+      safeStr(call?.caller_profile?.display_name) ||
+      safeStr(call?.passive_context?.caller_profile?.display_name) ||
+      safeStr(call?.passive_context?.name) ||
+      null;
+
+    const knownPhone = safeStr(call?.passive_context?.callback_number) || null;
+
+    // Parse lead post-call
     let parsed = null;
     if (isTrue(env.LEAD_PARSER_ENABLED) || env.LEAD_PARSER_ENABLED) {
       try {
@@ -226,14 +284,17 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
         log.warn?.("Postcall lead parsing failed", e?.message || e);
       }
     }
-    // Normalize and apply fallbacks
+
+    // Normalize and apply deterministic fallbacks
     const parsedLead = normalizeLead(parsed || {}, call, knownFullName, knownPhone, conversationLog, ssot);
-    // Derive subject if missing
+
+    // Subject: fallback if missing
     if (!parsedLead.subject) {
       const derived = deriveSubjectFromConversationLog(conversationLog);
       if (derived) parsedLead.subject = derived;
     }
-    // Validate callback number: ensure it appears in conversation; otherwise fallback
+
+    // Validate callback number: ensure it appears in conversation; otherwise fallback to caller
     if (
       parsedLead.callback_to_number &&
       parsedLead.callback_to_number !== call.caller &&
@@ -241,10 +302,12 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
     ) {
       parsedLead.callback_to_number = call.caller;
     }
+
     // Decide event
     const { event, decision_reason } = decideEvent(parsedLead);
     const call_status = event === "FINAL" ? "completed" : "abandoned";
-    // Build payload
+
+    // Payload
     const payloadBase = {
       call,
       call_status,
@@ -267,6 +330,7 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
         isFullLead: event === "FINAL",
       },
     };
+
     // Send CALL_LOG
     try {
       if (isTrue(env.CALL_LOG_AT_END)) {
@@ -277,6 +341,7 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
     } catch (e) {
       log.warn?.("CALL_LOG webhook failed", e?.message || e);
     }
+
     // Send FINAL/ABANDONED
     try {
       if (event === "FINAL") {
@@ -291,15 +356,18 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
     } catch (e) {
       log.warn?.("Lead webhook failed", e?.message || e);
     }
-    // Update caller memory
+
+    // Update caller memory (never overwrite known name with garbage)
     try {
-      const displayName =
+      const nameToStore =
+        safeStr(knownFullName) ||
         safeStr(parsedLead.full_name) ||
         deriveDisplayNameFromConversationLog(conversationLog) ||
         null;
+
       await upsertCallerProfile({
         caller: call?.caller,
-        full_name: displayName,
+        full_name: nameToStore,
         last_subject: safeStr(parsedLead.subject),
         last_notes: safeStr(parsedLead.notes),
         callSid: call?.callSid,
@@ -313,6 +381,7 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
         where: e?.where,
       });
     }
+
     return { status: "ok", event };
   } catch (e) {
     log.warn?.("finalizePipeline error", e?.message || e);
