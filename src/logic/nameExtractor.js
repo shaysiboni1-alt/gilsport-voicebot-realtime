@@ -7,15 +7,28 @@
  *
  * Supported: Hebrew / English / Russian (by script).
  * Does NOT guess names.
+ *
+ * Patch:
+ * - Harden against false positives like "שמר", "שמר את הכל", "שמור הכל" being captured as a name.
  */
 
 const HEBREW_RE = /[\u0590-\u05FF]/;
 const LATIN_RE = /[A-Za-z]/;
 const CYRILLIC_RE = /[\u0400-\u04FF]/;
 
+// Hebrew stopwords / fillers / common non-name tokens.
+// Keep conservative; reject only when it's clearly not a name.
 const STOPWORDS_HE = new Set([
-  "כן","לא","אוקיי","אוקי","טוב","בסדר","סבבה","אה","אממ","הממ","רגע","שלום","היי","הלו",
-  "מה","מי","אני","קוראים","לי","שמי","זה","כאן","מדבר","מדברת","איתך","איתך"
+  "כן", "לא", "אוקיי", "אוקי", "טוב", "בסדר", "סבבה", "אה", "אממ", "הממ", "רגע",
+  "שלום", "היי", "הלו",
+  "מה", "מי", "אני", "קוראים", "לי", "שמי", "זה", "כאן", "מדבר", "מדברת", "איתך",
+
+  // Hardening: imperative/verb-like tokens that frequently appear in calls and are not names
+  "שמר", "שמור", "שמרי", "שמרו", "תשמור", "תשמרי", "תשמרו",
+  "תבדוק", "בדוק", "תעזור", "עזור", "תשלח", "שלח", "תשלחי", "תשלחו",
+  "תקבע", "קבע", "תקבעי", "תקבעו",
+  "תעשה", "עשה", "תעשי", "תעשו",
+  "תן", "תני", "תנו",
 ]);
 
 function isSupportedScript(t) {
@@ -31,10 +44,29 @@ function stripPunct(s) {
     .trim();
 }
 
+// Reject obvious command phrases that are not names ("שמר את הכל", "שמור הכל", etc.)
+function looksLikeHebrewImperativeSavePhrase(raw) {
+  const t = stripPunct(raw);
+  if (!t) return false;
+
+  // Start-of-utterance imperative
+  if (/^(שמר|שמור|תשמור|שמרי|תשמרי|שמרו|תשמרו)\b/.test(t)) return true;
+
+  // Anywhere "save" + object (very common)
+  if (/\b(שמר|שמור|תשמור|שמרי|תשמרי|שמרו|תשמרו)\b\s*(את\b)?\s*(הכל|זה|אותו|אותה|אותם|אותן)\b/.test(t)) {
+    return true;
+  }
+
+  return false;
+}
+
 function sanitizeCandidate(raw) {
   const t = stripPunct(raw);
   if (!t) return null;
   if (/\d/.test(t)) return null;
+
+  // Hard reject common non-name phrases (prevents "שמר את הכל" => "שמר")
+  if (looksLikeHebrewImperativeSavePhrase(t)) return null;
 
   // allow 1-2 tokens only (e.g., "שי", "שי סיבוני")
   const parts = t.split(/\s+/).filter(Boolean);
@@ -43,11 +75,14 @@ function sanitizeCandidate(raw) {
   // length guardrails
   if (t.length < 2 || t.length > 30) return null;
 
-  // stopwords-only rejection
+  // stopwords-only rejection (single token)
   if (parts.length === 1 && STOPWORDS_HE.has(parts[0])) return null;
 
   // supported scripts only
   if (!isSupportedScript(t)) return null;
+
+  // If Hebrew candidate contains the direct object marker "את" (rare in names) -> reject
+  if (HEBREW_RE.test(t) && parts.includes("את")) return null;
 
   return parts.join(" ");
 }
@@ -68,6 +103,9 @@ function lastBotAskedForName(lastBotUtterance) {
 function extractCallerName({ userText, lastBotUtterance }) {
   const raw = String(userText || "").trim();
   if (!raw) return null;
+
+  // Hard reject obvious save/command phrases up-front (prevents regex capturing first token as "name")
+  if (looksLikeHebrewImperativeSavePhrase(raw)) return null;
 
   // explicit self-intro patterns
   const patterns = [
