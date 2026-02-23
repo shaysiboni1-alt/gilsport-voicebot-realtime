@@ -395,7 +395,7 @@ class GeminiLiveSession {
 
     // Flush debounce: reduce artificial waiting while keeping transcript stability.
     // (No new ENV names; just a safer default than 350ms.)
-    this._flushDebounceMs = 180;
+    this._flushDebounceMs = 520;
   }
 
   start() {
@@ -960,6 +960,41 @@ ${opening}`;
       this.ws.close();
     } catch { /* ignore */ }
   }
+}
+
+
+// -------------------------------
+// Lightweight transcript utilities
+// -------------------------------
+
+function isNoiseTranscript(t) {
+  const s = String(t || "").trim();
+
+  // Empty / too short
+  if (!s) return true;
+  if (s.length < 2) return true;
+
+  // Only punctuation / symbols
+  if (/^[\s\.,!?;:'"\-–—_()\[\]{}<>|\/\\]+$/.test(s)) return true;
+
+  // Common filler/noise tokens that should not drive intent or topic
+  // (Keep conservative; Hebrew "אממ" etc. can be extended later if needed.)
+  if (/^(אה+|אמ+|אממ+|המ+|אהמ+|אהה+|אוקי+\.?|אוקיי+\.?|mm+|uh+|um+)$/i.test(s)) return true;
+
+  return false;
+}
+
+function detectYesNo(t) {
+  const s = String(t || "").trim().toLowerCase();
+
+  // Normalize common Hebrew variants (keep minimal; do not over-normalize)
+  // Note: we keep this intentionally strict to avoid false positives.
+  const yes = /^(כן|כן בטח|בטח|נכון|בסדר|אוקיי|אוקי|סבבה|יאללה)$/;
+  const no = /^(לא|לא תודה|שלילי|לא מעוניין|לא מעוניינת|עזוב|עזבי)$/;
+
+  if (yes.test(s)) return "yes";
+  if (no.test(s)) return "no";
+  return null;
 }
 
 module.exports = { GeminiLiveSession };
