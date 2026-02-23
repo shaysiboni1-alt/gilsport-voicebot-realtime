@@ -39,6 +39,17 @@ function getPool() {
   return pool;
 }
 
+function normalizeDisplayName(name) {
+  if (!name) return null;
+  const s = String(name).trim();
+  if (!s) return null;
+  const bad = new Set(["לא", "אין", "אנונימי", "unknown", "null", "undefined"]);
+  if (bad.has(s) || bad.has(s.toLowerCase())) return null;
+  if (/\d/.test(s)) return null;
+  if (s.length < 2 || s.length > 40) return null;
+  return s;
+}
+
 async function withTimeout(promise, ms = DEFAULT_TIMEOUT_MS) {
   let t;
   const timeout = new Promise((_, reject) => {
@@ -175,7 +186,11 @@ async function getCallerProfile(callerId) {
     );
 
     if (!rows || rows.length === 0) return null;
-    return rows[0];
+    const row = rows[0];
+    return {
+      ...row,
+      display_name: normalizeDisplayName(row.display_name),
+    };
   } catch (err) {
     logger.debug('Caller memory read failed', { error: String(err?.message || err) });
     return null;
@@ -318,8 +333,14 @@ async function updateCallerDisplayName(callerId, displayName, metaPatch = null) 
       // Upgrade allowed -> lock
       const mergedMeta = { ...(existingMeta || {}), ...(metaPatch || {}), name_locked: true, name_verified: true, name_partial: false };
       await p.query(
-        "UPDATE caller_profiles SET display_name=$1, updated_at=now(), meta = COALESCE(meta, '{}'::jsonb) || $2::jsonb WHERE caller_id=$3",
-        [dn, JSON.stringify(mergedMeta), cid]
+        `INSERT INTO caller_profiles (caller_id, display_name, total_calls, first_seen, last_seen, meta)
+         VALUES ($1, $2, 0, now(), now(), $3::jsonb)
+         ON CONFLICT (caller_id)
+         DO UPDATE SET
+           display_name = EXCLUDED.display_name,
+           updated_at = now(),
+           meta = COALESCE(caller_profiles.meta, '{}'::jsonb) || EXCLUDED.meta`,
+        [cid, dn, JSON.stringify(mergedMeta)]
       );
       return true;
     }
@@ -330,11 +351,17 @@ async function updateCallerDisplayName(callerId, displayName, metaPatch = null) 
     baseMeta.name_verified = dnIsFull ? true : false;
     baseMeta.name_partial = dnIsFull ? false : true;
 
-    const res = await p.query(
-      "UPDATE caller_profiles SET display_name=$1, updated_at=now(), meta = COALESCE(meta, '{}'::jsonb) || $2::jsonb WHERE caller_id=$3",
-      [dn, JSON.stringify(baseMeta), cid]
+    await p.query(
+      `INSERT INTO caller_profiles (caller_id, display_name, total_calls, first_seen, last_seen, meta)
+       VALUES ($1, $2, 0, now(), now(), $3::jsonb)
+       ON CONFLICT (caller_id)
+       DO UPDATE SET
+         display_name = EXCLUDED.display_name,
+         updated_at = now(),
+         meta = COALESCE(caller_profiles.meta, '{}'::jsonb) || EXCLUDED.meta`,
+      [cid, dn, JSON.stringify(baseMeta)]
     );
-    return res.rowCount > 0;
+    return true;
   } catch (e) {
     logger.debug("updateCallerDisplayName failed", { callerId: cid, err: e?.message || e });
     return false;

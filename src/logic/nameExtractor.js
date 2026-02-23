@@ -3,230 +3,200 @@
 
 /**
  * Deterministic caller-name extractor.
+ * Goal: capture ONLY when high confidence it's the caller's name.
  *
- * Design goals:
- * - Capture a caller name ONLY when confidence is high.
- * - Never "guess" from context; rely only on explicit self-identification patterns
- *   or a direct, plausible answer immediately after a name question.
- * - Resist false-positives from product names, intents, verbs, and short filler.
+ * Supported: Hebrew / English / Russian (by script).
+ * Does NOT guess names.
  *
- * Output:
- *   { name: string, confidence: "high", reason: string, nameLocked: boolean } | null
+ * Patch:
+ * - Harden against false positives like "שמר", "שמר את הכל", "שמור הכל" being captured as a name.
  */
 
 const HEBREW_RE = /[\u0590-\u05FF]/;
 const LATIN_RE = /[A-Za-z]/;
 const CYRILLIC_RE = /[\u0400-\u04FF]/;
 
-const MAX_NAME_CHARS = 30;
-
-// Common Hebrew fillers / non-names.
+// Hebrew stopwords / fillers / common non-name tokens.
+// Keep conservative; reject only when it's clearly not a name.
 const STOPWORDS_HE = new Set([
-  "כן",
-  "לא",
-  "אוקיי",
-  "אוקי",
-  "בסדר",
-  "טוב",
-  "היי",
-  "שלום",
-  "תודה",
-  "תודה רבה",
-  "מה",
-  "מי",
-  "אני",
-  "אנחנו",
-  "אתם",
-  "את",
-  "אתה",
-  "כאן",
-  "זה",
-  "זאת",
-  "השם",
-  "שמי",
-  "קוראים",
-  "לי",
-  "שלי",
-  "מדבר",
-  "מדברת",
-  "מדברים",
-  "מדברות",
-  "רק",
-  "סתם",
-  "בסך הכל",
-  "בטח",
-  "ברור",
+  "כן", "לא", "אוקיי", "אוקי", "טוב", "בסדר", "סבבה", "אה", "אממ", "הממ", "רגע",
+  "שלום", "היי", "הלו",
+  "מה", "מי", "אני", "קוראים", "לי", "שמי", "זה", "כאן", "מדבר", "מדברת", "איתך",
+
+  // Hardening: imperative/verb-like tokens that frequently appear in calls and are not names
+  "שמר", "שמור", "שמרי", "שמרו", "תשמור", "תשמרי", "תשמרו",
+  "תבדוק", "בדוק", "תעזור", "עזור", "תשלח", "שלח", "תשלחי", "תשלחו",
+  "תקבע", "קבע", "תקבעי", "תקבעו",
+  "תעשה", "עשה", "תעשי", "תעשו",
+  "תן", "תני", "תנו",
+
+  // Common placeholders / non-names
+  "אין", "אנונימי",
 ]);
 
-// Product-ish / domain-ish tokens that should never be accepted as a person's name.
-// Keep small + high-signal. Add as needed.
-const NON_NAME_KEYWORDS_HE = new Set([
+// Domain stopwords: common product words that should never be captured as personal names.
+// Keep short + high-signal to avoid false rejections.
+const PRODUCT_STOPWORDS_HE = new Set([
   "הליכון",
+  "הליכונים",
   "אופניים",
+  "אופני",
+  "ספינינג",
   "אליפטיקל",
+  "טריינר",
   "קרוס",
+  "מכשיר",
+  "מכשירים",
   "משקולות",
   "דמבל",
   "דאמבל",
-  "מולטי",
-  "סמית",
-  "מכשיר",
-  "מוצר",
-  "דגם",
-  "סוג",
-  "מחיר",
-  "מבצע",
-  "מכירה",
-  "מלאי",
-  "תיקון",
-  "שירות",
-  "אחריות",
-  "משלוח",
-  "הובלה",
 ]);
 
-function _stripQuotes(s) {
-  return s.replace(/^["'“”׳״]+|["'“”׳״]+$/g, "");
+function isSupportedScript(t) {
+  return HEBREW_RE.test(t) || LATIN_RE.test(t) || CYRILLIC_RE.test(t);
 }
 
-function _normalizeWhitespace(s) {
-  return s.replace(/\s+/g, " ").trim();
+function stripPunct(s) {
+  return String(s || "")
+    .replace(/[\u200f\u200e]/g, "")
+    .replace(/[“”„״'"]/g, "")
+    .replace(/[.,!?;:()\[\]{}<>]/g, " ")
+    .replace(/\s{2,}/g, " ")
+    .trim();
 }
 
-function _cleanupName(raw) {
-  if (!raw) return "";
-  let s = String(raw);
-  s = s.replace(/[.,!?;:()\[\]{}<>]/g, " ");
-  s = _stripQuotes(s);
-  s = _normalizeWhitespace(s);
-  // remove leading "אני" if model/user repeats it
-  s = s.replace(/^(?:אני)\s+/u, "");
-  return s;
+function stripCommonHebrewPrefixForChecks(token) {
+  // Strip a single leading Hebrew prefix (ב/ל/מ/כ/ה/ש) ONLY for validation checks.
+  // Example: "בהליכון" => "הליכון" so we can block product words captured as names.
+  if (!token || token.length < 3) return token;
+  const first = token[0];
+  if (!"בלמכהש".includes(first)) return token;
+  const rest = token.slice(1);
+  if (!HEBREW_RE.test(rest)) return token;
+  return rest;
 }
 
-function _tokenize(s) {
-  return _normalizeWhitespace(s).split(" ").filter(Boolean);
-}
+// Reject obvious command phrases that are not names ("שמר את הכל", "שמור הכל", etc.)
+function looksLikeHebrewImperativeSavePhrase(raw) {
+  const t = stripPunct(raw);
+  if (!t) return false;
 
-function _scriptKind(s) {
-  if (HEBREW_RE.test(s)) return "he";
-  if (CYRILLIC_RE.test(s)) return "ru";
-  if (LATIN_RE.test(s)) return "en";
-  return "other";
-}
+  // Start-of-utterance imperative
+  if (/^(שמר|שמור|תשמור|שמרי|תשמרי|שמרו|תשמרו)\b/.test(t)) return true;
 
-function _containsDigit(s) {
-  return /\d/.test(s);
-}
-
-function _looksLikeSingleLetter(s) {
-  return s.length === 1 && (LATIN_RE.test(s) || CYRILLIC_RE.test(s) || HEBREW_RE.test(s));
-}
-
-function _isPlausibleNameCandidate(candidate) {
-  const s = _cleanupName(candidate);
-  if (!s) return false;
-  if (s.length > MAX_NAME_CHARS) return false;
-  if (_containsDigit(s)) return false;
-
-  const kind = _scriptKind(s);
-  if (kind === "other") return false;
-
-  // Allow: 1-3 tokens. (e.g., "שי", "שיר", "דוד לוי")
-  const tokens = _tokenize(s);
-  if (tokens.length < 1 || tokens.length > 3) return false;
-
-  // Reject if any token is clearly not a name.
-  for (const t of tokens) {
-    const tt = t.trim();
-    if (!tt) return false;
-    if (_looksLikeSingleLetter(tt)) return false;
-
-    // Heuristic: names rarely start with a prefix preposition like "ב" in Hebrew,
-    // and "בהליכון" is a common false positive in this domain.
-    if (kind === "he" && tt.length >= 2 && tt.startsWith("ב") && HEBREW_RE.test(tt)) {
-      // Allow common legitimate names that start with ב (e.g., "בר", "בן", "בני") by exception:
-      if (!["בר", "בן", "בני", "בלה", "ביאנה", "ברוך"].includes(tt)) return false;
-    }
-
-    if (kind === "he") {
-      if (STOPWORDS_HE.has(tt)) return false;
-      if (NON_NAME_KEYWORDS_HE.has(tt)) return false;
-      if (NON_NAME_KEYWORDS_HE.has(tt.replace(/^ב/, ""))) return false; // e.g., "בהליכון"
-    }
-
-    // Disallow tokens that contain punctuation after cleanup (shouldn't happen, but defensive)
-    if (/[^ \u0590-\u05FFA-Za-z\u0400-\u04FF\-']/u.test(tt)) return false;
+  // Anywhere "save" + object (very common)
+  if (/\b(שמר|שמור|תשמור|שמרי|תשמרי|שמרו|תשמרו)\b\s*(את\b)?\s*(הכל|זה|אותו|אותה|אותם|אותן)\b/.test(t)) {
+    return true;
   }
 
-  // Reject if full string equals a stopword phrase
-  if (kind === "he" && STOPWORDS_HE.has(s)) return false;
+  return false;
+}
 
-  return true;
+function sanitizeCandidate(raw) {
+  const t = stripPunct(raw);
+  if (!t) return null;
+  if (/\d/.test(t)) return null;
+
+  // Hard reject common non-name phrases (prevents "שמר את הכל" => "שמר")
+  if (looksLikeHebrewImperativeSavePhrase(t)) return null;
+
+  // allow 1-2 tokens only (e.g., "שי", "שי סיבוני")
+  const parts = t.split(/\s+/).filter(Boolean);
+  if (parts.length < 1 || parts.length > 2) return null;
+
+  // If we captured "<name> ואני/מתעניין/..." keep only the first token.
+  if (parts.length === 2) {
+    const second = parts[1];
+    const dropSecondIf = new Set([
+      "ואני",
+      "ואנחנו",
+      "ואנוכי",
+      "מתעניין",
+      "מתעניינת",
+      "מעוניין",
+      "מעוניינת",
+      "רוצה",
+      "צריך",
+      "צריכה",
+      "באתי",
+      "הגעתי",
+    ]);
+    if (dropSecondIf.has(second)) {
+      parts.pop();
+    }
+  }
+
+  // length guardrails (after token adjustment)
+  const joined = parts.join(" ");
+  if (joined.length < 2 || joined.length > 30) return null;
+
+  // stopwords-only rejection (single token)
+  if (parts.length === 1 && STOPWORDS_HE.has(parts[0])) return null;
+
+  // Block obvious domain/product words (including prefixed forms like "בהליכון")
+  for (const tok of parts) {
+    const base = stripCommonHebrewPrefixForChecks(tok);
+    if (PRODUCT_STOPWORDS_HE.has(tok) || PRODUCT_STOPWORDS_HE.has(base)) return null;
+  }
+
+  // supported scripts only
+  if (!isSupportedScript(joined)) return null;
+
+  // If Hebrew candidate contains the direct object marker "את" (rare in names) -> reject
+  if (HEBREW_RE.test(joined) && parts.includes("את")) return null;
+
+  return joined;
+}
+
+function lastBotAskedForName(lastBotUtterance) {
+  const t = stripPunct(lastBotUtterance || "");
+  if (!t) return false;
+  // very conservative: only explicit name questions
+  return /מה\s*השם|איך\s*קוראים|מי\s*מדבר|מי\s*מדברת|שמך|שמך\s*בבקשה/i.test(t);
 }
 
 /**
- * Extract name from text using explicit self-identification patterns.
- * Returns null when not confident.
+ * @param {object} params
+ * @param {string} params.userText Raw user utterance
+ * @param {string|null} params.lastBotUtterance Last assistant utterance (if any)
+ * @returns {{name:string, reason:string}|null}
  */
-function extractNameFromText(text) {
-  if (!text) return null;
-  const raw = _normalizeWhitespace(String(text));
+function extractCallerName({ userText, lastBotUtterance }) {
+  const raw = String(userText || "").trim();
   if (!raw) return null;
 
-  // Strong explicit patterns: "קוראים לי X", "שמי X", "השם שלי X", "השם שלי זה X"
-  // Keep patterns deterministic and conservative.
+  // Hard reject obvious save/command phrases up-front (prevents regex capturing first token as "name")
+  if (looksLikeHebrewImperativeSavePhrase(raw)) return null;
+
+  // explicit self-intro patterns
   const patterns = [
-    { re: /\b(?:קוראים לי|שמי|שמי הוא|שמי זה)\s+(.+)$/u, reason: "explicit_self_identification", locked: true },
-    { re: /\b(?:השם שלי)\s+(?:הוא|זה)?\s*(.+)$/u, reason: "explicit_self_identification", locked: true },
+    { re: /\bקוראים\s+לי\s+(.+)$/i, reason: "explicit_korim_li" },
+    { re: /\bשמי\s+(.+)$/i, reason: "explicit_shmi" },
+    // "אני <name>" only if it is a single short token (avoid capturing sentences like "אני מתעניין אצלכם")
+    { re: /(?:^|\s)אני\s+([\u0590-\u05FF]{2,15})\s*$/i, reason: "explicit_ani_single" },
+    { re: /\bהשם\s+שלי\s*(?:הוא|זה)?\s+(.+)$/i, reason: "explicit_hashem_sheli" },
+    { re: /\bזה\s+(.+)$/i, reason: "explicit_ze" },
   ];
 
   for (const p of patterns) {
     const m = raw.match(p.re);
-    if (!m || !m[1]) continue;
+    if (m && m[1]) {
+      const cand = sanitizeCandidate(m[1]);
+      if (cand) return { name: cand, reason: p.reason };
+    }
+  }
 
-    const candidate = _cleanupName(m[1]);
-    if (!_isPlausibleNameCandidate(candidate)) continue;
-
-    return {
-      name: candidate,
-      confidence: "high",
-      reason: p.reason,
-      nameLocked: p.locked,
-    };
+  // direct short answer to a name question (not tied to OPENING; any name question)
+  if (lastBotAskedForName(lastBotUtterance)) {
+    const cand = sanitizeCandidate(raw);
+    if (cand) return { name: cand, reason: "direct_answer_to_name_question" };
   }
 
   return null;
 }
 
-/**
- * Extract name from a direct answer after the bot asked for the caller's name.
- * This is allowed only when the entire utterance looks like a plausible name,
- * with no extra words that suggest a different intent.
- */
-function extractNameFromDirectAnswer(text) {
-  if (!text) return null;
-  const raw = _cleanupName(text);
-  if (!raw) return null;
-
-  // Must be short and name-like.
-  // Accept one or two tokens; three tokens allowed only if short (e.g., "דוד בן לוי")
-  const tokens = _tokenize(raw);
-  if (tokens.length < 1 || tokens.length > 3) return null;
-  if (raw.length > 24) return null;
-
-  if (!_isPlausibleNameCandidate(raw)) return null;
-
-  return {
-    name: raw,
-    confidence: "high",
-    reason: "direct_answer_to_name_question",
-    // Direct answers are considered locked IF they are plausible.
-    nameLocked: true,
-  };
-}
-
 module.exports = {
-  extractNameFromText,
-  extractNameFromDirectAnswer,
+  extractCallerName,
+  lastBotAskedForName,
+  sanitizeCandidate,
 };

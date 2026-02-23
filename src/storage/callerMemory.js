@@ -1,51 +1,47 @@
-// src/storage/callerMemory.js
 "use strict";
 
-/**
- * Compatibility wrapper for caller memory.
- *
- * The canonical implementation lives under src/memory/callerMemory.js.
- * This wrapper exposes the API expected by vendor/geminiLiveSession.js.
- *
- * Exports:
- *   { callerMemory: { ensureSchema, upsertAndGetProfile, getProfile, setDisplayName } }
- */
+// Backwards-compatible adapter.
+// Some modules historically imported "../storage/callerMemory".
+// The canonical implementation lives under src/memory/callerMemory.js.
 
-const {
-  initCallerMemory,
-  getCallerProfile,
-  upsertCallerProfile,
-  updateCallerDisplayName,
-} = require("../memory/callerMemory");
+const mem = require("../memory/callerMemory");
 
-async function ensureSchema() {
-  await initCallerMemory();
+async function initCallerMemory() {
+  return mem.initCallerMemory();
 }
 
-async function upsertAndGetProfile(caller_id, display_name = null) {
-  if (!caller_id) return null;
-  await upsertCallerProfile(caller_id, display_name);
-  return await getCallerProfile(caller_id);
+async function ensureCallerProfile(callerId) {
+  return mem.ensureCallerProfile(callerId);
 }
 
-async function getProfile(caller_id) {
-  if (!caller_id) return null;
-  return await getCallerProfile(caller_id);
+async function getCallerProfile(callerId) {
+  return mem.getCallerProfile(callerId);
 }
 
-async function setDisplayName(caller_id, display_name, opts = {}) {
-  const profile = await getCallerProfile(caller_id);
-  if (!profile) return null;
+async function upsertCallerProfile(callerId, patch = {}) {
+  return mem.upsertCallerProfile(callerId, patch);
+}
 
-  const nameLocked = opts && typeof opts.nameLocked === "boolean" ? opts.nameLocked : false;
-  return await updateCallerDisplayName(profile, display_name, nameLocked);
+async function updateCallerDisplayName(callerId, displayName, metaPatch = null) {
+  return mem.updateCallerDisplayName(callerId, displayName, metaPatch);
+}
+
+// Aliases used in older code
+async function getProfile(callerId) {
+  return getCallerProfile(callerId);
+}
+
+async function setDisplayName(callerId, displayName, metaPatch = null) {
+  return updateCallerDisplayName(callerId, displayName, metaPatch);
 }
 
 module.exports = {
-  callerMemory: {
-    ensureSchema,
-    upsertAndGetProfile,
-    getProfile,
-    setDisplayName,
-  },
+  initCallerMemory,
+  ensureCallerProfile,
+  getCallerProfile,
+  upsertCallerProfile,
+  updateCallerDisplayName,
+  // aliases
+  getProfile,
+  setDisplayName,
 };
