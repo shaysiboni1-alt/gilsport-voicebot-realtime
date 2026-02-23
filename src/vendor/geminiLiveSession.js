@@ -264,6 +264,19 @@ class GeminiLiveSession {
 
     // If bot asked for name last, attempt to capture caller name deterministically
     if (this.lastBotAskedForName) {
+      const isKnownName = (name) => {
+        const n = String(name || "").trim();
+        if (!n) return false;
+        const BAD = new Set(["לא", "כן", "אוקיי", "אוקי", "שלום", "היי", "הי", "תודה"]);
+        if (BAD.has(n)) return false;
+        if (n.length >= 4 && n[0] === "ב" && n[1] === "ה") return false;
+        return true;
+      };
+
+      // Never override a known, stable caller name.
+      if (isKnownName(this.callerProfile?.display_name)) {
+        this.lastBotAskedForName = false;
+      } else {
       const found = extractCallerName(normalized);
 
       if (found?.name) {
@@ -273,6 +286,7 @@ class GeminiLiveSession {
 
       // Reset after one attempt (avoid repeatedly classifying arbitrary utterances as name)
       this.lastBotAskedForName = false;
+      }
     }
 
     // Detect intent deterministically based on SSOT triggers/priority

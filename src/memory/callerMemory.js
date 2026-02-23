@@ -39,17 +39,6 @@ function getPool() {
   return pool;
 }
 
-function normalizeDisplayName(name) {
-  if (!name) return null;
-  const s = String(name).trim();
-  if (!s) return null;
-  const bad = new Set(["לא", "אין", "אנונימי", "unknown", "null", "undefined"]);
-  if (bad.has(s) || bad.has(s.toLowerCase())) return null;
-  if (/\d/.test(s)) return null;
-  if (s.length < 2 || s.length > 40) return null;
-  return s;
-}
-
 async function withTimeout(promise, ms = DEFAULT_TIMEOUT_MS) {
   let t;
   const timeout = new Promise((_, reject) => {
@@ -186,11 +175,7 @@ async function getCallerProfile(callerId) {
     );
 
     if (!rows || rows.length === 0) return null;
-    const row = rows[0];
-    return {
-      ...row,
-      display_name: normalizeDisplayName(row.display_name),
-    };
+    return rows[0];
   } catch (err) {
     logger.debug('Caller memory read failed', { error: String(err?.message || err) });
     return null;
@@ -287,6 +272,16 @@ async function updateCallerDisplayName(callerId, displayName, metaPatch = null) 
   const dnWords = dn.split(/\s+/).filter(Boolean);
   const dnIsFull = dnWords.length >= 2;
 
+  const isClearlyInvalidStoredName = (name) => {
+    const n = String(name || "").trim();
+    if (!n) return true;
+    const BAD = new Set(["לא", "כן", "אוקיי", "אוקי", "שלום", "היי", "הי", "תודה"]);
+    if (BAD.has(n)) return true;
+    // Common Hebrew preposition+"ה" prefix (e.g. "בהליכון")
+    if (n.length >= 4 && n[0] === "ב" && n[1] === "ה") return true;
+    return false;
+  };
+
   try {
     // Read current state (including meta flags)
     const existingRes = await p.query(
@@ -294,16 +289,25 @@ async function updateCallerDisplayName(callerId, displayName, metaPatch = null) 
       [cid]
     );
     const existing = existingRes.rows && existingRes.rows[0] ? existingRes.rows[0] : null;
-    const existingName = existing && existing.display_name ? String(existing.display_name).trim() : "";
-    const existingWords = existingName ? existingName.split(/\s+/).filter(Boolean) : [];
-    const existingIsFull = existingWords.length >= 2;
+    let existingName = existing && existing.display_name ? String(existing.display_name).trim() : "";
+    let existingWords = existingName ? existingName.split(/\s+/).filter(Boolean) : [];
+    let existingIsFull = existingWords.length >= 2;
+
+    // If stored display_name is clearly garbage (e.g. "לא"), treat as missing so we can recover.
+    const existingIsBad = isClearlyInvalidStoredName(existingName);
+    if (existingIsBad) {
+      existingName = "";
+      existingWords = [];
+      existingIsFull = false;
+    }
 
     let existingMeta = {};
     try {
       if (existing && existing.meta && typeof existing.meta === "object") existingMeta = existing.meta;
     } catch { /* ignore */ }
 
-    const nameLocked = existingMeta && (existingMeta.name_locked === true || String(existingMeta.name_locked).toLowerCase() === "true");
+    // If we had a bad name stored, we must ignore any existing lock flags.
+    const nameLocked = !existingIsBad && existingMeta && (existingMeta.name_locked === true || String(existingMeta.name_locked).toLowerCase() === "true");
 
     // Rule 1: If locked, never change the name (unless identical).
     if (nameLocked) {
@@ -333,14 +337,8 @@ async function updateCallerDisplayName(callerId, displayName, metaPatch = null) 
       // Upgrade allowed -> lock
       const mergedMeta = { ...(existingMeta || {}), ...(metaPatch || {}), name_locked: true, name_verified: true, name_partial: false };
       await p.query(
-        `INSERT INTO caller_profiles (caller_id, display_name, total_calls, first_seen, last_seen, meta)
-         VALUES ($1, $2, 0, now(), now(), $3::jsonb)
-         ON CONFLICT (caller_id)
-         DO UPDATE SET
-           display_name = EXCLUDED.display_name,
-           updated_at = now(),
-           meta = COALESCE(caller_profiles.meta, '{}'::jsonb) || EXCLUDED.meta`,
-        [cid, dn, JSON.stringify(mergedMeta)]
+        "UPDATE caller_profiles SET display_name=$1, updated_at=now(), meta = COALESCE(meta, '{}'::jsonb) || $2::jsonb WHERE caller_id=$3",
+        [dn, JSON.stringify(mergedMeta), cid]
       );
       return true;
     }
@@ -351,17 +349,11 @@ async function updateCallerDisplayName(callerId, displayName, metaPatch = null) 
     baseMeta.name_verified = dnIsFull ? true : false;
     baseMeta.name_partial = dnIsFull ? false : true;
 
-    await p.query(
-      `INSERT INTO caller_profiles (caller_id, display_name, total_calls, first_seen, last_seen, meta)
-       VALUES ($1, $2, 0, now(), now(), $3::jsonb)
-       ON CONFLICT (caller_id)
-       DO UPDATE SET
-         display_name = EXCLUDED.display_name,
-         updated_at = now(),
-         meta = COALESCE(caller_profiles.meta, '{}'::jsonb) || EXCLUDED.meta`,
-      [cid, dn, JSON.stringify(baseMeta)]
+    const res = await p.query(
+      "UPDATE caller_profiles SET display_name=$1, updated_at=now(), meta = COALESCE(meta, '{}'::jsonb) || $2::jsonb WHERE caller_id=$3",
+      [dn, JSON.stringify(baseMeta), cid]
     );
-    return true;
+    return res.rowCount > 0;
   } catch (e) {
     logger.debug("updateCallerDisplayName failed", { callerId: cid, err: e?.message || e });
     return false;

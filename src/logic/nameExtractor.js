@@ -29,27 +29,6 @@ const STOPWORDS_HE = new Set([
   "תקבע", "קבע", "תקבעי", "תקבעו",
   "תעשה", "עשה", "תעשי", "תעשו",
   "תן", "תני", "תנו",
-
-  // Common placeholders / non-names
-  "אין", "אנונימי",
-]);
-
-// Domain stopwords: common product words that should never be captured as personal names.
-// Keep short + high-signal to avoid false rejections.
-const PRODUCT_STOPWORDS_HE = new Set([
-  "הליכון",
-  "הליכונים",
-  "אופניים",
-  "אופני",
-  "ספינינג",
-  "אליפטיקל",
-  "טריינר",
-  "קרוס",
-  "מכשיר",
-  "מכשירים",
-  "משקולות",
-  "דמבל",
-  "דאמבל",
 ]);
 
 function isSupportedScript(t) {
@@ -63,17 +42,6 @@ function stripPunct(s) {
     .replace(/[.,!?;:()\[\]{}<>]/g, " ")
     .replace(/\s{2,}/g, " ")
     .trim();
-}
-
-function stripCommonHebrewPrefixForChecks(token) {
-  // Strip a single leading Hebrew prefix (ב/ל/מ/כ/ה/ש) ONLY for validation checks.
-  // Example: "בהליכון" => "הליכון" so we can block product words captured as names.
-  if (!token || token.length < 3) return token;
-  const first = token[0];
-  if (!"בלמכהש".includes(first)) return token;
-  const rest = token.slice(1);
-  if (!HEBREW_RE.test(rest)) return token;
-  return rest;
 }
 
 // Reject obvious command phrases that are not names ("שמר את הכל", "שמור הכל", etc.)
@@ -97,6 +65,10 @@ function sanitizeCandidate(raw) {
   if (!t) return null;
   if (/\d/.test(t)) return null;
 
+  // Reject common Hebrew preposition+"ה" prefix that often indicates a noun/phrase,
+  // e.g. "בהליכון" ("in the treadmill"). Keep narrow to avoid rejecting names like "ברק".
+  if (t.length >= 4 && t[0] === "ב" && t[1] === "ה") return null;
+
   // Hard reject common non-name phrases (prevents "שמר את הכל" => "שמר")
   if (looksLikeHebrewImperativeSavePhrase(t)) return null;
 
@@ -104,48 +76,19 @@ function sanitizeCandidate(raw) {
   const parts = t.split(/\s+/).filter(Boolean);
   if (parts.length < 1 || parts.length > 2) return null;
 
-  // If we captured "<name> ואני/מתעניין/..." keep only the first token.
-  if (parts.length === 2) {
-    const second = parts[1];
-    const dropSecondIf = new Set([
-      "ואני",
-      "ואנחנו",
-      "ואנוכי",
-      "מתעניין",
-      "מתעניינת",
-      "מעוניין",
-      "מעוניינת",
-      "רוצה",
-      "צריך",
-      "צריכה",
-      "באתי",
-      "הגעתי",
-    ]);
-    if (dropSecondIf.has(second)) {
-      parts.pop();
-    }
-  }
-
-  // length guardrails (after token adjustment)
-  const joined = parts.join(" ");
-  if (joined.length < 2 || joined.length > 30) return null;
+  // length guardrails
+  if (t.length < 2 || t.length > 30) return null;
 
   // stopwords-only rejection (single token)
   if (parts.length === 1 && STOPWORDS_HE.has(parts[0])) return null;
 
-  // Block obvious domain/product words (including prefixed forms like "בהליכון")
-  for (const tok of parts) {
-    const base = stripCommonHebrewPrefixForChecks(tok);
-    if (PRODUCT_STOPWORDS_HE.has(tok) || PRODUCT_STOPWORDS_HE.has(base)) return null;
-  }
-
   // supported scripts only
-  if (!isSupportedScript(joined)) return null;
+  if (!isSupportedScript(t)) return null;
 
   // If Hebrew candidate contains the direct object marker "את" (rare in names) -> reject
-  if (HEBREW_RE.test(joined) && parts.includes("את")) return null;
+  if (HEBREW_RE.test(t) && parts.includes("את")) return null;
 
-  return joined;
+  return parts.join(" ");
 }
 
 function lastBotAskedForName(lastBotUtterance) {
@@ -172,9 +115,7 @@ function extractCallerName({ userText, lastBotUtterance }) {
   const patterns = [
     { re: /\bקוראים\s+לי\s+(.+)$/i, reason: "explicit_korim_li" },
     { re: /\bשמי\s+(.+)$/i, reason: "explicit_shmi" },
-    // "אני <name>" only if it is a single short token (avoid capturing sentences like "אני מתעניין אצלכם")
-    { re: /(?:^|\s)אני\s+([\u0590-\u05FF]{2,15})\s*$/i, reason: "explicit_ani_single" },
-    { re: /\bהשם\s+שלי\s*(?:הוא|זה)?\s+(.+)$/i, reason: "explicit_hashem_sheli" },
+    { re: /\bאני\s+(.+)$/i, reason: "explicit_ani" },
     { re: /\bזה\s+(.+)$/i, reason: "explicit_ze" },
   ];
 
