@@ -600,12 +600,12 @@ class GeminiLiveSession {
     }
 
     // Canonical: after the closing is spoken, initiate a proactive hangup.
-    // We only do this once per call. Delay is ENV-controlled to avoid cutting the audio.
+    // We only do this once per call. Delay is small and ENV-controlled to avoid cutting the audio.
     if (who === "bot" && env.FORCE_HANGUP_AFTER_CLOSE && !this._hangupScheduled && isClosingUtterance(nlp.raw)) {
       const callSid = safeStr(this._call?.callSid) || safeStr(this.meta?.callSid);
       if (callSid) {
         this._hangupScheduled = true;
-        const graceMs = Math.max(15000, Number(env.HANGUP_AFTER_CLOSE_GRACE_MS || 15000));
+        const graceMs = Math.max(0, Number(env.HANGUP_AFTER_CLOSE_GRACE_MS || 500));
         setTimeout(() => {
           hangupCall(callSid, logger).catch(() => {});
         }, graceMs);

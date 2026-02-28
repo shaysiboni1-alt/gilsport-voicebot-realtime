@@ -22,6 +22,7 @@ const STOPWORDS_HE = new Set([
   "כן", "לא", "אוקיי", "אוקי", "טוב", "בסדר", "סבבה", "אה", "אממ", "הממ", "רגע",
   "שלום", "היי", "הלו",
   "מה", "מי", "אני", "קוראים", "לי", "שמי", "זה", "כאן", "מדבר", "מדברת", "איתך",
+  "מעוניין", "מתעניין", "רוצה", "צריך", "צריכה", "מעוניינת", "מתעניינת", "מתקשר", "מתקשרת",
 
   // Hardening: imperative/verb-like tokens that frequently appear in calls and are not names
   "שמר", "שמור", "שמרי", "שמרו", "תשמור", "תשמרי", "תשמרו",
@@ -78,6 +79,19 @@ function sanitizeCandidate(raw) {
 
   // length guardrails
   if (t.length < 2 || t.length > 30) return null;
+
+  // Cleanup: remove trailing conjunction artifacts commonly produced by STT,
+  // e.g. "שי ואני" -> "שי"
+  if (parts.length === 2) {
+    const p1 = parts[0];
+    const p2 = parts[1];
+
+    // Normalize common conjunction forms
+    const normP2 = p2.replace(/^ו/, ""); // remove leading "ו" (and)
+    if (normP2 === "אני" || normP2 === "אנחנו") {
+      return p1;
+    }
+  }
 
   // stopwords-only rejection (single token)
   if (parts.length === 1 && STOPWORDS_HE.has(parts[0])) return null;
@@ -141,3 +155,14 @@ module.exports = {
   lastBotAskedForName,
   sanitizeCandidate,
 };
+
+  // reject if candidate contains obvious non-name tokens (verbs/stopwords etc.)
+  // - If the candidate starts with "אני" (I) and we didn't explicitly capture a name after it, it's not a name.
+  if (parts.length >= 1) {
+    const p1 = normalizeToken(parts[0]);
+    if (["אני", "אנחנו"].includes(p1)) return null;
+  }
+  // If any token is a known stopword (e.g., "מתעניין", "מתקשר"), treat it as not-a-name.
+  // This prevents capturing phrases like "אני מתעניין" as a name.
+  if (parts.some((p) => STOPWORDS_HE.has(normalizeToken(p)))) return null;
+
