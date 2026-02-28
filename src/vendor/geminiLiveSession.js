@@ -385,14 +385,13 @@ class GeminiLiveSession {
             responseModalities: ["AUDIO"],
             // keep concise and fast
             temperature: 0.2,
-            ...(() => {
-              const voiceName = env.VOICE_NAME_OVERRIDE || safeStr(this.ssot?.settings?.VOICE_NAME);
-              return voiceName
-                ? { speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName } } } }
-                : {};
-            })(),
-            responseMimeType: "audio/pcm;rate=24000"
-            
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: {
+                  voiceName: env.VOICE_NAME_OVERRIDE || safeStr(this.ssot?.settings?.VOICE_NAME) || "Kore"
+                }
+              }
+            }
           },
 
           realtimeInputConfig: {
@@ -442,15 +441,6 @@ class GeminiLiveSession {
             const ulawB64 = pcm24kB64ToUlaw8kB64(inline.data);
             if (ulawB64 && this.onGeminiAudioUlaw8kBase64) {
               this.onGeminiAudioUlaw8kBase64(ulawB64);
-            }
-          } else if (
-            String(inline.mimeType).startsWith("audio/ulaw") ||
-            String(inline.mimeType).startsWith("audio/mulaw") ||
-            String(inline.mimeType).startsWith("audio/g711_ulaw")
-          ) {
-            // If Gemini returns μ-law directly, forward as-is (Twilio expects base64 μ-law 8k payload).
-            if (inline.data && this.onGeminiAudioUlaw8kBase64) {
-              this.onGeminiAudioUlaw8kBase64(inline.data);
             }
           }
         }
@@ -601,15 +591,6 @@ class GeminiLiveSession {
                 confidence_reason: found.reason,
                 source_utterance: nlp.raw
               });
-            }
-          } else if (
-            String(inline.mimeType).startsWith("audio/ulaw") ||
-            String(inline.mimeType).startsWith("audio/mulaw") ||
-            String(inline.mimeType).startsWith("audio/g711_ulaw")
-          ) {
-            // If Gemini returns μ-law directly, forward as-is (Twilio expects base64 μ-law 8k payload).
-            if (inline.data && this.onGeminiAudioUlaw8kBase64) {
-              this.onGeminiAudioUlaw8kBase64(inline.data);
             }
           }
         }

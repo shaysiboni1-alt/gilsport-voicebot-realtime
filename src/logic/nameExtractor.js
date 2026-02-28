@@ -45,11 +45,6 @@ function stripPunct(s) {
     .trim();
 }
 
-
-function normalizeToken(tok) {
-  const t = stripPunct(tok || "");
-  return t.replace(/^ו/, "").trim();
-}
 // Reject obvious command phrases that are not names ("שמר את הכל", "שמור הכל", etc.)
 function looksLikeHebrewImperativeSavePhrase(raw) {
   const t = stripPunct(raw);
@@ -81,14 +76,6 @@ function sanitizeCandidate(raw) {
   // allow 1-2 tokens only (e.g., "שי", "שי סיבוני")
   const parts = t.split(/\s+/).filter(Boolean);
   if (parts.length < 1 || parts.length > 2) return null;
-  // Reject phrases like "אני מתעניין" mistakenly captured as a name.
-  if (parts.length >= 1) {
-    const p1 = normalizeToken(parts[0]);
-    if (["אני", "אנחנו"].includes(p1)) return null;
-  }
-  // If any token is a known stopword (e.g., "מתעניין", "מתקשר"), treat as not-a-name.
-  if (parts.some((p) => STOPWORDS_HE.has(normalizeToken(p)))) return null;
-
 
   // length guardrails
   if (t.length < 2 || t.length > 30) return null;
