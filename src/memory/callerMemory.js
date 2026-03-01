@@ -214,7 +214,8 @@ async function upsertCallerProfile(callerId, patch = {}) {
   const cid = String(cidRaw || '').trim();
   if (!cid) return false;
 
-  const displayName = (patchObj.display_name ?? patchObj.full_name ?? patchObj.fullName ?? patchObj.name ?? null);
+  const displayNameRaw = (patchObj.display_name ?? patchObj.full_name ?? patchObj.fullName ?? patchObj.name ?? null);
+  const displayName = sanitizeDisplayName(displayNameRaw);
   const metaPatch = (patchObj.meta_patch && typeof patchObj.meta_patch === 'object') ? patchObj.meta_patch : null;
 
   // jsonb merge: meta = meta || metaPatch
