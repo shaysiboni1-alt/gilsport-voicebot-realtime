@@ -214,8 +214,7 @@ async function upsertCallerProfile(callerId, patch = {}) {
   const cid = String(cidRaw || '').trim();
   if (!cid) return false;
 
-  const displayNameRaw = (patchObj.display_name ?? patchObj.full_name ?? patchObj.fullName ?? patchObj.name ?? null);
-  const displayName = sanitizeDisplayName(displayNameRaw);
+  const displayName = (patchObj.display_name ?? patchObj.full_name ?? patchObj.fullName ?? patchObj.name ?? null);
   const metaPatch = (patchObj.meta_patch && typeof patchObj.meta_patch === 'object') ? patchObj.meta_patch : null;
 
   // jsonb merge: meta = meta || metaPatch
@@ -257,110 +256,36 @@ async function updateCallerDisplayName(callerId, displayName, metaPatch = null) 
   const p = getPool();
   if (!p) return false;
 
-  const cid = String(callerId || "").trim();
-  let dn = String(displayName || "").trim();
+  const cid = String(callerId || '').trim();
+  const dn = String(displayName || '').trim();
 
   if (!cid) return false;
   if (!dn) return false;
 
   // Hard guardrails (anti-hallucination / safety)
-  dn = dn.replace(/[\u200e\u200f\u202a-\u202e]/g, "").trim();
   if (dn.length < 2 || dn.length > 40) return false;
   if (/\d/.test(dn)) return false;
-  if (!/[\p{Script=Hebrew}\p{Script=Latin}]/u.test(dn)) return false;
-  if (!/^[\p{Script=Hebrew}\p{Script=Latin}\s'\-\.]{2,40}$/u.test(dn)) return false;
 
-  const dnWords = dn.split(/\s+/).filter(Boolean);
-  const dnIsFull = dnWords.length >= 2;
-
-  const isClearlyInvalidStoredName = (name) => {
-    const n = String(name || "").trim();
-    if (!n) return true;
-    const BAD = new Set(["לא", "כן", "אוקיי", "אוקי", "שלום", "היי", "הי", "תודה"]);
-    if (BAD.has(n)) return true;
-    // Common Hebrew preposition+"ה" prefix (e.g. "בהליכון")
-    if (n.length >= 4 && n[0] === "ב" && n[1] === "ה") return true;
-    return false;
-  };
+  const sql = `
+    INSERT INTO caller_profiles (caller_id, display_name, total_calls, first_seen, last_seen, meta)
+    VALUES ($1, $2, 0, NOW(), NOW(), COALESCE($3::jsonb, '{}'::jsonb))
+    ON CONFLICT (caller_id) DO UPDATE SET
+      display_name = EXCLUDED.display_name,
+      last_seen = NOW(),
+      meta = CASE
+        WHEN $3::jsonb IS NULL THEN caller_profiles.meta
+        ELSE caller_profiles.meta || $3::jsonb
+      END
+  `;
 
   try {
-    // Read current state (including meta flags)
-    const existingRes = await p.query(
-      "SELECT display_name, meta FROM caller_profiles WHERE caller_id = $1 LIMIT 1",
-      [cid]
-    );
-    const existing = existingRes.rows && existingRes.rows[0] ? existingRes.rows[0] : null;
-    let existingName = existing && existing.display_name ? String(existing.display_name).trim() : "";
-    let existingWords = existingName ? existingName.split(/\s+/).filter(Boolean) : [];
-    let existingIsFull = existingWords.length >= 2;
-
-    // If stored display_name is clearly garbage (e.g. "לא"), treat as missing so we can recover.
-    const existingIsBad = isClearlyInvalidStoredName(existingName);
-    if (existingIsBad) {
-      existingName = "";
-      existingWords = [];
-      existingIsFull = false;
-    }
-
-    let existingMeta = {};
-    try {
-      if (existing && existing.meta && typeof existing.meta === "object") existingMeta = existing.meta;
-    } catch { /* ignore */ }
-
-    // If we had a bad name stored, we must ignore any existing lock flags.
-    const nameLocked = !existingIsBad && existingMeta && (existingMeta.name_locked === true || String(existingMeta.name_locked).toLowerCase() === "true");
-
-    // Rule 1: If locked, never change the name (unless identical).
-    if (nameLocked) {
-      if (existingName && existingName === dn) return true;
-      return false;
-    }
-
-    // Rule 2: If we already have a full name stored, do not overwrite with anything else.
-    if (existingIsFull) {
-      if (existingName === dn) return true;
-      return false;
-    }
-
-    // Rule 3: If we have a partial name (single token), do not overwrite with a different partial.
-    // Only allow upgrading partial -> full (and lock it), preferably when it starts with the same token.
-    if (existingName && !existingIsFull) {
-      if (!dnIsFull) {
-        if (existingName === dn) return true;
-        return false;
-      }
-      const firstTokenMatches = existingWords[0] && dnWords[0] && existingWords[0] === dnWords[0];
-      if (!firstTokenMatches) {
-        // Allow upgrade only if the new full name contains the old token somewhere (still conservative)
-        const contains = existingWords[0] && dnWords.includes(existingWords[0]);
-        if (!contains) return false;
-      }
-      // Upgrade allowed -> lock
-      const mergedMeta = { ...(existingMeta || {}), ...(metaPatch || {}), name_locked: true, name_verified: true, name_partial: false };
-      await p.query(
-        "UPDATE caller_profiles SET display_name=$1, updated_at=now(), meta = COALESCE(meta, '{}'::jsonb) || $2::jsonb WHERE caller_id=$3",
-        [dn, JSON.stringify(mergedMeta), cid]
-      );
-      return true;
-    }
-
-    // Rule 4: No existing name. Save; if full -> lock, else keep partial flag.
-    const baseMeta = { ...(existingMeta || {}), ...(metaPatch || {}) };
-    baseMeta.name_locked = dnIsFull ? true : false;
-    baseMeta.name_verified = dnIsFull ? true : false;
-    baseMeta.name_partial = dnIsFull ? false : true;
-
-    const res = await p.query(
-      "UPDATE caller_profiles SET display_name=$1, updated_at=now(), meta = COALESCE(meta, '{}'::jsonb) || $2::jsonb WHERE caller_id=$3",
-      [dn, JSON.stringify(baseMeta), cid]
-    );
-    return res.rowCount > 0;
+    await withTimeout(p.query(sql, [cid, dn, metaPatch ? JSON.stringify(metaPatch) : null]));
+    return true;
   } catch (e) {
-    logger.debug("updateCallerDisplayName failed", { callerId: cid, err: e?.message || e });
+    logger.debug('Caller memory display_name update failed', { error: String(e?.message || e) });
     return false;
   }
 }
-
 
 module.exports = {
   ensureCallerMemorySchema,

@@ -1,8 +1,8 @@
 // src/stage4/postcallLeadParser.js
 "use strict";
 
-// Post-call lead parsing (LLM) - STRICT JSON.
-// Hardened to prevent hallucinated names (e.g. "אשמח") and to respect known caller name.
+// Post-call lead parsing (LLM) similar to GilSport style.
+// Uses Gemini generateContent (API key) and forces STRICT JSON output.
 
 const { env } = require("../config/env");
 const { logger } = require("../utils/logger");
@@ -17,17 +17,10 @@ function buildTranscript(turns) {
 
 function safeJsonExtract(text) {
   if (!text || typeof text !== "string") return null;
-
-  // remove ```json fences if present
-  const cleaned = text
-    .replace(/```json/gi, "```")
-    .replace(/```/g, "");
-
-  const first = cleaned.indexOf("{");
-  const last = cleaned.lastIndexOf("}");
+  const first = text.indexOf("{");
+  const last = text.lastIndexOf("}");
   if (first === -1 || last === -1 || last <= first) return null;
-
-  const slice = cleaned.slice(first, last + 1);
+  const slice = text.slice(first, last + 1);
   try {
     return JSON.parse(slice);
   } catch {
@@ -35,77 +28,62 @@ function safeJsonExtract(text) {
   }
 }
 
-function normalizeStringOrNull(v) {
-  if (typeof v !== "string") return null;
-  const s = v.trim();
-  return s ? s : null;
-}
-
-// Detect if SSOT prompt is the "4 fields only" deterministic schema you pasted
-function wantsFourFieldsOnly(promptText) {
-  const p = String(promptText || "");
-  return (
-    p.includes('{"full_name":string|null,"subject":string|null,"callback_to_number":string|null,"notes":string|null}')
-    && !p.includes('"intent"')
-    && !p.includes('"brand"')
-    && !p.includes('"model"')
-  );
-}
-
-// Allow name only if explicitly stated in the transcript in a deterministic way
-function extractExplicitNameFromTranscript(transcript) {
-  const t = String(transcript || "");
-  if (!t) return null;
-
-  // Look only at USER lines
-  const userLines = t
-    .split("\n")
-    .filter((ln) => ln.startsWith("USER:"))
-    .map((ln) => ln.slice(5).trim())
-    .filter(Boolean);
-
-  const patterns = [
-    /\b(?:קוראים\s+לי)\s+([^\n\r]+)$/i,
-    /\b(?:שמי)\s+([^\n\r]+)$/i,
-    /\b(?:השם\s+שלי)\s+([^\n\r]+)$/i,
-  ];
-
-  for (const line of userLines) {
-    for (const re of patterns) {
-      const m = line.match(re);
-      if (m && m[1]) {
-        const cand = String(m[1]).trim();
-        if (cand && cand.length >= 2 && cand.length <= 40) return cand;
-      }
-    }
-  }
-
-  return null;
-}
-
 function defaultPrompt(known = {}) {
-  const knownName = normalizeStringOrNull(known?.full_name);
-  const knownPhone = normalizeStringOrNull(known?.callback_to_number);
+  /*
+    Target payload fields requested (GilSport-style):
+    {
+      "intent": string|null,
+      "full_name": string|null,
+      "callback_to_number": string|null,
+      "subject": string|null,
+      "notes": string|null,
+      "brand": string|null,
+      "model": string|null,
+      "parsing_summary": string|null
+    }
 
+    - intent: כוונת הפונה כפי שנאמרה בשיחה (למשל "שאלת מידע", "תמיכה טכנית", "מכירה"). אם לא ברור – null.
+    - full_name: שם הפונה כפי שנאמר במפורש. אם לא נאמר או לא בטוח – null.
+    - callback_to_number: מספר טלפון מלא (בין 9–13 ספרות או בפורמט +972) שנאמר בשיחה ומיועד לחזרה. אם לא נאמר – null.
+    - subject: כותרת תמציתית אך עשירה שמכילה את פרטי המפתח שנאמרו בפועל, ללא המצאות.
+    - notes: הערות או פרטים נוספים שנאמרו ויכולים לעזור לטיפול (למשל דגם/מוצר/מועד) אך אינם חלק מהכותרת. אם אין – null.
+    - brand + model: אם נאמרו מותג או דגם, החזירו אותם בשדות אלו. אחרת – null.
+    - parsing_summary: משפט קצר (1–2) שמתאר את מהות השיחה ותמצית הצורך בפועל.
+  */
+  const knownName =
+    typeof known.full_name === "string" && known.full_name.trim()
+      ? known.full_name.trim()
+      : null;
+  const knownPhone =
+    typeof known.callback_to_number === "string" && known.callback_to_number.trim()
+      ? known.callback_to_number.trim()
+      : null;
   let pref = "";
-  if (knownName) pref += `שם ידוע מהמערכת (אם לא נאמר במפורש בשיחה – אל תמציא): "${knownName}". `;
-  if (knownPhone) pref += `מספר ידוע מהמערכת (מותר להחזיר רק אם אושר/נאמר במפורש או כחלק ממדיניות המערכת): "${knownPhone}". `;
-
+  if (knownName) {
+    pref += `שם ידוע מהמערכת (מועדף על פני השערות): "${knownName}". `;
+  }
+  if (knownPhone) {
+    pref += `מספר טלפון ידוע מהמערכת (מועדף על פני השערות): "${knownPhone}". `;
+  }
   return (
     'החזירו JSON תקין בלבד (ללא טקסט נוסף) לפי הסכמה ' +
-    '{"full_name":string|null,"subject":string|null,"callback_to_number":string|null,"notes":string|null} ' +
-    'על בסיס דברי המשתמש בלבד, ללא המצאות. ' +
+    '{"intent":string|null,"full_name":string|null,"callback_to_number":string|null,"subject":string|null,"notes":string|null,"brand":string|null,"model":string|null,"parsing_summary":string|null} ' +
+    'על בסיס השיחה בלבד, בעברית תקנית ומנורמלת וללא המצאות. ' +
     pref +
-    'full_name יוחזר רק אם המשתמש אמר במפורש "קוראים לי ___" או "שמי ___" או "השם שלי ___". אחרת null. ' +
-    'subject עד 6 מילים. ' +
-    'notes משפט אחד בעברית תקנית על מה שביקש. ' +
-    'callback_to_number יוחזר רק אם המשתמש מסר מספר מלא או אישר במפורש חזרה למספר שממנו התקשר לאחר שנשאל. אחרת null.'
+    'intent הוא כוונת הפונה (מה הוא רוצה לבצע או לקבל) כפי שנאמרה, ללא ניחושים. אם לא נאמר – null. ' +
+    'full_name הוא תמיד שם האדם שמדבר. אם נאמר מספר שמות, החזירו את השם האחרון שנאמר. אם לא נאמר או לא ברור – null. ' +
+    'callback_to_number יכיל רק אם נאמר במפורש מספר טלפון מלא (9–13 ספרות או בפורמט +972) בשיחה; אם יש מספר ידוע מהמערכת – החזירו אותו אם לא נאמר אחר. אחרת – null. ' +
+    'subject הוא כותרת תמציתית אך עשירה של מה שהפונה מבקש, ללא המצאות. ' +
+    'notes הם פרטים נוספים או הבהרות שאינם חלק מהכותרת (למשל דגם, שנה, מועד), אם נאמרו; אחרת – null. ' +
+    'brand ו-model ימולאו רק אם נאמרו במפורש מותג או דגם בשיחה. אם לא נאמר – null. ' +
+    'parsing_summary הוא משפט קצר (1–2) שמתאר את מהות הפנייה ומה צריך לעשות, ללא ציון חוסרים וללא המצאות. ' +
+    'כלל עקביות: אם נתון לא נאמר בשיחה – להחזיר null ולא לנחש.'
   );
 }
 
 async function callGeminiForJson({ prompt, transcript }) {
   const apiKey = env.GEMINI_API_KEY;
-  const model = env.LEAD_PARSER_MODEL || "gemini-2.0-flash";
+  const model = env.LEAD_PARSER_MODEL || "gemini-1.5-flash";
   if (!apiKey) throw new Error("GEMINI_API_KEY missing");
 
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
@@ -120,9 +98,9 @@ async function callGeminiForJson({ prompt, transcript }) {
       },
     ],
     generationConfig: {
-      temperature: 0.0,
+      temperature: 0.1,
       topP: 0.9,
-      maxOutputTokens: 384,
+      maxOutputTokens: 512,
     },
   };
 
@@ -142,18 +120,7 @@ async function callGeminiForJson({ prompt, transcript }) {
   return safeJsonExtract(text);
 }
 
-// Normalize to your minimal schema, and keep room for the caller to extend later
-function normalizeParsedLead4(raw) {
-  return {
-    full_name: normalizeStringOrNull(raw?.full_name),
-    subject: normalizeStringOrNull(raw?.subject),
-    callback_to_number: normalizeStringOrNull(raw?.callback_to_number),
-    notes: normalizeStringOrNull(raw?.notes),
-  };
-}
-
-// Normalize to the extended schema used by finalizePipeline
-function normalizeParsedLeadExtended(raw) {
+function normalizeParsedLead(raw) {
   const out = {
     intent: null,
     full_name: null,
@@ -164,62 +131,36 @@ function normalizeParsedLeadExtended(raw) {
     model: null,
     parsing_summary: null,
   };
-
   if (!raw || typeof raw !== "object") return out;
-
   for (const k of Object.keys(out)) {
-    out[k] = normalizeStringOrNull(raw[k]);
+    const v = raw[k];
+    if (v == null) continue;
+    if (typeof v === "string") {
+      const s = v.trim();
+      out[k] = s ? s : null;
+    }
   }
   return out;
 }
 
 async function parseLeadPostcall({ turns, transcriptText, ssot, known }) {
   if (!env.LEAD_PARSER_ENABLED) return null;
-
   const transcript =
     typeof transcriptText === "string" && transcriptText.trim()
       ? transcriptText.trim()
       : buildTranscript(turns);
-
   if (!transcript) return null;
 
-  const ssotPrompt = String(ssot?.prompts?.LEAD_PARSER_PROMPT || "").trim();
-  const prompt = ssotPrompt || defaultPrompt(known);
+  // IMPORTANT: Do NOT fall back to LEAD_CAPTURE_PROMPT here.
+  // LEAD_CAPTURE_PROMPT is for realtime dialogue and may not be JSON-only.
+  // Post-call parsing must be deterministic JSON.
+  // When using the SSOT prompt, ensure it requests the extended fields (intent, callback_to_number, notes, brand, model).
+  const prompt = (ssot?.prompts?.LEAD_PARSER_PROMPT || "").trim() || defaultPrompt(known);
 
   try {
     const raw = await callGeminiForJson({ prompt, transcript });
-
-    // If SSOT prompt is 4-fields-only → convert to extended shape (finalize expects it)
-    let parsed;
-    if (wantsFourFieldsOnly(prompt)) {
-      const four = normalizeParsedLead4(raw || {});
-      parsed = {
-        intent: null,
-        full_name: four.full_name,
-        callback_to_number: four.callback_to_number,
-        subject: four.subject,
-        notes: four.notes,
-        brand: null,
-        model: null,
-        parsing_summary: null,
-      };
-    } else {
-      parsed = normalizeParsedLeadExtended(raw || {});
-    }
-
-    // HARDEN: name is allowed only if explicitly stated in transcript
-    const knownName = normalizeStringOrNull(known?.full_name);
-    const explicit = extractExplicitNameFromTranscript(transcript);
-
-    if (knownName) {
-      // Prefer system-known name; never let the LLM overwrite it
-      parsed.full_name = knownName;
-    } else {
-      // No known name: accept only explicit transcript pattern
-      parsed.full_name = explicit ? explicit : null;
-    }
-
-    logger.info({ msg: "Postcall lead parsed", meta: { ok: !!raw, has_known_name: !!knownName } });
+    const parsed = normalizeParsedLead(raw);
+    logger.info({ msg: "Postcall lead parsed", meta: { ok: !!raw } });
     return parsed;
   } catch (e) {
     logger.warn({

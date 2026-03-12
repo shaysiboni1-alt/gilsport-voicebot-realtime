@@ -1,36 +1,53 @@
 "use strict";
 
-/*
-  Finalize Pipeline for VoiceBot_Blank
-
-  - Resolves recording metadata
-  - Parses conversation post-call
-  - Applies deterministic normalization (no hallucinated names)
-  - Decides FINAL vs ABANDONED
-  - Sends webhooks
-  - Updates caller memory
-*/
-
 const { parseLeadPostcall } = require("./postcallLeadParser");
 const { upsertCallerProfile } = require("../memory/callerMemory");
 const { detectIntent } = require("../logic/intentRouter");
 const { downloadRecording } = require("../utils/twilioRecordings");
+const { sanitizeCandidate } = require("../logic/nameExtractor");
 
-// Helpers
+const NON_LEAD_INTENT_IDS = new Set([
+  "other",
+  "meta_voice_question",
+  "caller_correction",
+  "ask_contact_info",
+]);
+
+const NON_LEAD_INTENT_TYPES = new Set(["info", "other"]);
+const INFO_ONLY_INTENT_IDS = new Set(["ask_contact_info", "meta_voice_question"]);
+
+const SUBJECT_STOPWORDS_HE = new Set([
+  "כן",
+  "לא",
+  "אוקיי",
+  "אוקי",
+  "טוב",
+  "בסדר",
+  "הבנתי",
+  "שלום",
+  "הלו",
+  "רגע",
+  "תודה",
+  "אישה",
+  "בת",
+  "אני",
+]);
+
 function isTrue(v) {
   return v === true || String(v).toLowerCase() === "true";
 }
+
 function safeStr(v) {
   const s = typeof v === "string" ? v.trim() : "";
   return s || null;
 }
+
 function secondsFromMs(ms) {
   const n = Number(ms);
   if (!Number.isFinite(n) || n < 0) return null;
   return Math.round(n / 1000);
 }
 
-// Build a transcript for the LLM
 function buildTranscript(conversationLog) {
   const rows = Array.isArray(conversationLog) ? conversationLog : [];
   return rows
@@ -44,64 +61,162 @@ function buildTranscript(conversationLog) {
     .join("\n");
 }
 
-// Deterministic: accept name only if explicitly stated
-function explicitNameAppearsInTranscript(transcript) {
-  const t = String(transcript || "");
-  if (!t) return null;
+function appearsInConversation(num, convLog) {
+  const digits = (num || "").replace(/\D/g, "");
+  if (!digits) return false;
+  return (Array.isArray(convLog) ? convLog : []).some(
+    ({ text }) => text && String(text).replace(/\D/g, "").includes(digits)
+  );
+}
 
-  const lines = t
-    .split("\n")
-    .filter((ln) => ln.startsWith("USER:"))
-    .map((ln) => ln.slice(5).trim())
-    .filter(Boolean);
+function cleanText(v) {
+  return String(v || "")
+    .replace(/[\u200e\u200f\u202a-\u202e]/g, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
 
-  const patterns = [
-    /\b(?:קוראים\s+לי)\s+([^\n\r]+)$/i,
-    /\b(?:שמי)\s+([^\n\r]+)$/i,
-    /\b(?:השם\s+שלי)\s+([^\n\r]+)$/i,
-  ];
+function normalizePhone(v) {
+  const s = cleanText(v);
+  if (!s) return null;
+  const plus = s.startsWith("+") ? "+" : "";
+  const digits = s.replace(/\D/g, "");
+  if (!digits || digits.length < 8 || digits.length > 16) return null;
+  return `${plus}${digits}`;
+}
 
-  for (const ln of lines) {
+function isPlausibleFullName(name) {
+  const cleaned = cleanText(name);
+  if (!cleaned) return false;
+  const sanitized = sanitizeCandidate(cleaned);
+  if (!sanitized) return false;
+  return sanitized === cleaned;
+}
+
+function isWeakSubjectValue(subject) {
+  const s = cleanText(subject);
+  if (!s) return true;
+  if (s.length < 3 || s.length > 120) return true;
+
+  const words = s.split(/\s+/).filter(Boolean);
+  if (!words.length || words.length > 12) return true;
+
+  if (words.length === 1 && SUBJECT_STOPWORDS_HE.has(words[0])) return true;
+  if (/^[\p{P}\p{S}\s]+$/u.test(s)) return true;
+  if (/^(כן|לא|אוקיי|אוקי|טוב|בסדר|תודה|שלום|הלו|רגע)$/u.test(s)) return true;
+  if (/^(אני\s+(אישה|בת|צריך|צריכה|רוצה)|זה\s+אני)$/u.test(s)) return true;
+  if (/(מבטא|קול|איך את נשמעת|למה את מדברת ככה|מי את|את בוט|את רובוט)/u.test(s)) return true;
+
+  return false;
+}
+
+function getIntentDef(lead, ssot) {
+  const intentId = safeStr(lead?.intent);
+  if (!intentId) return null;
+  const intents = Array.isArray(ssot?.intents) ? ssot.intents : [];
+  return intents.find((it) => safeStr(it?.intent_id) === intentId) || null;
+}
+
+function isLeadIntent(lead, ssot) {
+  const intentId = safeStr(lead?.intent);
+  if (!intentId) return false;
+  if (NON_LEAD_INTENT_IDS.has(intentId)) return false;
+
+  const def = getIntentDef(lead, ssot);
+  const type = safeStr(def?.intent_type);
+  if (type && NON_LEAD_INTENT_TYPES.has(type)) return false;
+
+  return true;
+}
+
+function isInfoOnlyIntent(lead, ssot) {
+  const intentId = safeStr(lead?.intent);
+  if (INFO_ONLY_INTENT_IDS.has(intentId)) return true;
+
+  const def = getIntentDef(lead, ssot);
+  return safeStr(def?.intent_type) === "info";
+}
+
+function collapseHebrewLetterSpacing(text) {
+  let s = String(text || "");
+  for (let i = 0; i < 4; i += 1) {
+    s = s.replace(/([\u0590-\u05FF])\s+(?=[\u0590-\u05FF])/g, "$1");
+  }
+  return s.replace(/\s{2,}/g, " ").trim();
+}
+
+function deriveExplicitNameFromConversationLog(conversationLog) {
+  const rows = Array.isArray(conversationLog) ? conversationLog : [];
+  const userRows = rows.filter(
+    (r) => String(r?.role || "").toLowerCase() === "user"
+  );
+
+  for (const row of userRows) {
+    const raw = cleanText(row?.text || "");
+    if (!raw) continue;
+
+    const normalized = collapseHebrewLetterSpacing(raw);
+
+    const patterns = [
+      /(?:^|\b)קוראים\s+לי\s+(.+)$/u,
+      /(?:^|\b)שמי\s+(.+)$/u,
+      /(?:^|\b)השם\s+שלי\s+(.+)$/u,
+    ];
+
     for (const re of patterns) {
-      const m = ln.match(re);
-      if (m && m[1]) {
-        const cand = String(m[1]).trim();
-        if (cand && cand.length >= 2 && cand.length <= 40) return cand;
-      }
+      const m = normalized.match(re);
+      if (!m || !m[1]) continue;
+
+      const cand = sanitizeCandidate(cleanText(m[1]));
+      if (cand) return cand;
     }
   }
 
   return null;
 }
 
-// Derive a fallback name from conversation if everything else fails (VERY conservative)
-function deriveDisplayNameFromConversationLog(conversationLog) {
+function buildConversationSignals(conversationLog, call) {
   const rows = Array.isArray(conversationLog) ? conversationLog : [];
-  for (const r of rows) {
-    if (String(r?.role || "").toLowerCase() !== "user") continue;
-    let t = String(r?.text || "").trim();
-    if (!t) continue;
-    t = t.replace(/[\u200e\u200f\u202a-\u202e]/g, "").trim();
-    t = t.replace(/^[\p{P}\p{S}\s]+|[\p{P}\p{S}\s]+$/gu, "").trim();
-    if (!t) continue;
-    if (/[0-9]/.test(t)) continue;
-    if (t.length > 24) continue;
+  const userTexts = rows
+    .filter((r) => String(r?.role || "").toLowerCase() === "user")
+    .map((r) => cleanText(r?.text))
+    .filter(Boolean);
 
-    // Do NOT treat generic greetings as names
-    const bad = new Set(["שלום", "היי", "הלו", "כן", "לא", "אוקיי", "סבבה", "טוב", "בסדר"]);
-    if (bad.has(t)) continue;
+  const joined = collapseHebrewLetterSpacing(userTexts.join(" \n "));
 
-    const words = t.split(/\s+/).filter(Boolean);
-    if (words.length === 0 || words.length > 2) continue;
-    if (t.length < 2) continue;
-    if (!/\p{L}/u.test(t)) continue;
-    return words[0];
-  }
-  return null;
+  const hasLeadKeywords =
+    /(דוח|דו"ח|אישור|מסמך|מסמכים|פגישה|פנייה|להשאיר הודעה|מרגריטה|ריטה|החזר מס|מס הכנסה|רווח והפסד|מאזן|טופס|שיחזרו|לחזור אליי|תחזרו אליי|בקשת חזרה)/u.test(
+      joined
+    );
+
+  return {
+    userTexts,
+    joined,
+    callbackRequested:
+      /לחזור\s+אליי|תחזרו\s+אליי|שיחזרו\s+אליי|בקשת\s+חזרה|call me back|callback/i.test(
+        joined
+      ),
+    explicitPhoneProvided: userTexts.some((t) =>
+      /\d{7,}/.test(String(t).replace(/\D/g, ""))
+    ),
+    explicitCallbackConfirmation:
+      /\b(כן|נכון|אוקיי|אוקי|בסדר|בטח|יאללה|sure|yes|correct)\b/i.test(joined),
+    looksLikeMetaOnly:
+      /(מבטא|קול|מי את|את בוט|את רובוט)/u.test(joined) &&
+      !hasLeadKeywords,
+    hasUsableCallerId: !!safeStr(call?.caller) && !call?.caller_withheld,
+    hasLeadKeywords,
+  };
 }
 
-// Normalize lead fields and apply fallbacks (deterministic)
-function normalizeLead(parsed, call, knownFullName, knownPhone, conversationLog, ssot) {
+function normalizeLead(
+  parsed,
+  call,
+  knownFullName,
+  knownPhone,
+  conversationLog,
+  ssot
+) {
   const out = {
     intent: null,
     full_name: null,
@@ -110,129 +225,187 @@ function normalizeLead(parsed, call, knownFullName, knownPhone, conversationLog,
     notes: null,
     brand: null,
     model: null,
+    _name_source: null,
+    _phone_source: null,
+    _subject_source: null,
   };
 
   if (parsed && typeof parsed === "object") {
-    for (const k of Object.keys(out)) {
+    for (const k of [
+      "intent",
+      "full_name",
+      "callback_to_number",
+      "subject",
+      "notes",
+      "brand",
+      "model",
+    ]) {
       const v = parsed[k];
-      if (v && typeof v === "string") {
-        const s = v.trim();
-        out[k] = s || null;
-      }
+      if (v && typeof v === "string") out[k] = v.trim() || null;
     }
   }
 
-  // Name policy:
-  // 1) If knownFullName exists -> FORCE it (never allow LLM overwrite)
-  // 2) Else accept only explicit transcript pattern
-  const transcript = buildTranscript(conversationLog);
-  const explicit = explicitNameAppearsInTranscript(transcript);
-
-  if (knownFullName) {
-    out.full_name = safeStr(knownFullName);
-  } else if (explicit) {
-    out.full_name = safeStr(explicit);
+  if (isPlausibleFullName(out.full_name)) {
+    out._name_source = "parsed";
   } else {
     out.full_name = null;
   }
 
-  // Phone policy:
-  // - Only fill from knownPhone; otherwise caller ID if not withheld
-  if (!out.callback_to_number) {
-    if (knownPhone) {
-      out.callback_to_number = safeStr(knownPhone);
-    } else {
-      const caller = safeStr(call?.caller);
-      const withheld = !!call?.caller_withheld;
-      if (caller && !withheld) out.callback_to_number = caller;
+  if (!out.full_name) {
+    const candidateKnown = knownFullName ? safeStr(knownFullName) : null;
+    if (candidateKnown && isPlausibleFullName(candidateKnown)) {
+      out.full_name = candidateKnown;
+      out._name_source = "memory";
     }
   }
 
-  // Fallback intent detection if missing
+  if (!out.full_name) {
+    const derived = deriveExplicitNameFromConversationLog(conversationLog);
+    if (derived && isPlausibleFullName(derived)) {
+      out.full_name = derived;
+      out._name_source = "conversation_explicit";
+    }
+  }
+
+  const parsedPhone = normalizePhone(out.callback_to_number);
+  if (parsedPhone) {
+    out.callback_to_number = parsedPhone;
+    out._phone_source = appearsInConversation(parsedPhone, conversationLog)
+      ? "explicit"
+      : "parsed";
+  } else {
+    out.callback_to_number = null;
+  }
+
+  if (!out.callback_to_number) {
+    const candidateKnownPhone = normalizePhone(knownPhone);
+    if (candidateKnownPhone) {
+      out.callback_to_number = candidateKnownPhone;
+      out._phone_source = appearsInConversation(candidateKnownPhone, conversationLog)
+        ? "explicit"
+        : "memory";
+    } else if (safeStr(call?.caller) && !call?.caller_withheld) {
+      out.callback_to_number = normalizePhone(call.caller);
+      out._phone_source = "caller_id";
+    }
+  }
+
+  const parsedSubject = safeStr(out.subject);
+  if (parsedSubject && !isWeakSubjectValue(parsedSubject)) {
+    out.subject = cleanText(parsedSubject);
+    out._subject_source = "parsed";
+  } else {
+    out.subject = null;
+  }
+
   if (!out.intent) {
     try {
-      const fallback = detectIntent({ text: transcript, intents: ssot?.intents || [] });
+      const transcript = buildTranscript(conversationLog);
+      const fallback = detectIntent({
+        text: transcript,
+        intents: ssot?.intents || [],
+        opts: { forceLang: safeStr(call?.language_locked) || undefined },
+      });
       out.intent = fallback?.intent_id || null;
-    } catch { /* ignore */ }
+    } catch {}
   }
 
   return out;
 }
 
-// Derive a fallback subject from the last user utterance
-function deriveSubjectFromConversationLog(conversationLog) {
-  const rows = Array.isArray(conversationLog) ? conversationLog : [];
-  const userUtterances = rows
-    .filter((r) => String(r?.role || "").toLowerCase() === "user")
-    .map((r) => String(r?.text || "").trim())
-    .filter(Boolean);
+function decideEvent(lead, ssot, call, signals) {
+  const hasStrongName = isPlausibleFullName(lead?.full_name);
+  const hasStrongSubject = !isWeakSubjectValue(lead?.subject || "");
+  const parsedLeadIntent = isLeadIntent(lead, ssot);
+  const infoOnlyIntent = isInfoOnlyIntent(lead, ssot);
 
-  if (!userUtterances.length) return null;
+  const hasCallbackPath =
+    !!lead?.callback_to_number &&
+    (lead?._phone_source === "explicit" ||
+      lead?._phone_source === "memory" ||
+      lead?._phone_source === "caller_id" ||
+      lead?._phone_source === "parsed");
 
-  const last = userUtterances[userUtterances.length - 1];
-  return last.length > 180 ? last.slice(0, 180) : last;
-}
+  const hasBusinessLeadEvidence =
+    hasStrongSubject ||
+    signals.callbackRequested ||
+    signals.hasLeadKeywords;
 
-// Validate that a callback number appears in conversation
-function appearsInConversation(num, convLog) {
-  const digits = (num || "").replace(/\D/g, "");
-  if (!digits) return false;
-  return convLog.some(({ text }) => text && text.replace(/\D/g, "").includes(digits));
-}
+  if (signals.looksLikeMetaOnly && !hasBusinessLeadEvidence) {
+    return { event: "ABANDONED", decision_reason: "meta_only" };
+  }
 
-// Decide FINAL vs ABANDONED
-function decideEvent(lead) {
-  const nameVal = safeStr(lead?.full_name);
-  const phoneVal = safeStr(lead?.callback_to_number);
-  const subjVal = safeStr(lead?.subject);
+  if (infoOnlyIntent && !hasBusinessLeadEvidence) {
+    return { event: "NO_LEAD", decision_reason: "info_only" };
+  }
 
-  const hasName =
-    nameVal &&
-    nameVal.length >= 2 &&
-    /^[\p{Script=Hebrew}\p{Script=Latin}\s]+$/u.test(nameVal);
+  if (!hasStrongSubject && !signals.callbackRequested && !signals.hasLeadKeywords) {
+    return { event: "NO_LEAD", decision_reason: "non_lead_intent" };
+  }
 
-  const hasPhone = !!phoneVal;
-  const hasSubject = !!subjVal;
+  if (call?.caller_withheld) {
+    if (!lead?.callback_to_number || lead?._phone_source !== "explicit") {
+      return {
+        event: "ABANDONED",
+        decision_reason: "withheld_without_explicit_phone",
+      };
+    }
+  } else if (!hasCallbackPath) {
+    return { event: "ABANDONED", decision_reason: "no_callback_number" };
+  }
 
-  if (hasName && hasPhone && hasSubject) return { event: "FINAL", decision_reason: "ok" };
-  if (!hasName && hasPhone && hasSubject) return { event: "ABANDONED", decision_reason: "no_name" };
-  if (!hasPhone && hasSubject) return { event: "ABANDONED", decision_reason: "no_phone" };
-  if (hasPhone && !hasSubject) return { event: "ABANDONED", decision_reason: "no_subject" };
-  return { event: "ABANDONED", decision_reason: "partial" };
+  if (!hasStrongName) {
+    return { event: "ABANDONED", decision_reason: "no_reliable_name" };
+  }
+
+  if (hasStrongSubject && hasStrongName && hasCallbackPath) {
+    return {
+      event: "FINAL",
+      decision_reason: parsedLeadIntent
+        ? "confirmed_lead"
+        : "lead_by_business_evidence",
+    };
+  }
+
+  if (hasBusinessLeadEvidence) {
+    return { event: "ABANDONED", decision_reason: "partial_lead" };
+  }
+
+  return { event: "NO_LEAD", decision_reason: "non_lead_intent" };
 }
 
 async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
   const log = logger || console;
 
   try {
-    // Build call metadata
     const call = {
       callSid: snapshot?.call?.callSid || snapshot?.callSid || null,
       streamSid: snapshot?.call?.streamSid || snapshot?.streamSid || null,
       caller: snapshot?.call?.caller || snapshot?.caller || null,
-      caller_withheld: !!(snapshot?.call?.caller_withheld ?? snapshot?.caller_withheld),
+      caller_withheld: !!(
+        snapshot?.call?.caller_withheld ?? snapshot?.caller_withheld
+      ),
       called: snapshot?.call?.called || snapshot?.called || null,
       source: snapshot?.call?.source || snapshot?.source || "VoiceBot_Blank",
       started_at: snapshot?.call?.started_at || snapshot?.started_at || null,
       ended_at: snapshot?.call?.ended_at || snapshot?.ended_at || null,
-      duration_ms: snapshot?.call?.duration_ms ?? snapshot?.duration_ms ?? null,
+      duration_ms:
+        snapshot?.call?.duration_ms ?? snapshot?.duration_ms ?? null,
       duration_sec:
         snapshot?.call?.duration_sec ??
         secondsFromMs(snapshot?.call?.duration_ms ?? snapshot?.duration_ms),
-      finalize_reason: snapshot?.call?.finalize_reason || snapshot?.finalize_reason || null,
+      finalize_reason:
+        snapshot?.call?.finalize_reason || snapshot?.finalize_reason || null,
       passive_context: snapshot?.call?.passive_context || null,
-      // Keep optional caller_profile if snapshot includes it
-      caller_profile: snapshot?.call?.caller_profile || snapshot?.caller_profile || null,
+      language_locked: snapshot?.call?.language_locked || null,
     };
 
-    // Extract conversation log
     const conversationLog = Array.isArray(snapshot?.conversationLog)
       ? snapshot.conversationLog
       : Array.isArray(snapshot?.call?.conversationLog)
         ? snapshot.call.conversationLog
         : [];
 
-    // Resolve recording
     let recording = {
       recording_provider: null,
       recording_sid: null,
@@ -240,37 +413,35 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
     };
 
     try {
-      if (env.MB_ENABLE_RECORDING && typeof senders?.resolveRecording === "function") {
+      if (
+        env.MB_ENABLE_RECORDING &&
+        typeof senders?.resolveRecording === "function"
+      ) {
         recording = await senders.resolveRecording();
       }
     } catch (e) {
-      log.warn?.("Resolve recording failed", e?.message || e);
+      log.warn("Resolve recording failed", { error: e?.message || String(e) });
     }
 
-    // Download recording (optional)
     if (recording?.recording_sid) {
       try {
         const downloaded = await downloadRecording(recording.recording_sid, log);
-        if (downloaded?.publicUrl) recording.recording_url_public = downloaded.publicUrl;
+        if (downloaded?.publicUrl) {
+          recording.recording_url_public = downloaded.publicUrl;
+        }
       } catch (e) {
-        log.warn?.("Local download of recording failed", e?.message || e);
+        log.warn("Local download of recording failed", {
+          error: e?.message || String(e),
+        });
       }
     }
 
-    // Build transcript
     const transcript = buildTranscript(conversationLog);
-
-    // Get known values:
-    // Prefer caller_profile.display_name (matches your logs), then passive_context.name
     const knownFullName =
-      safeStr(call?.caller_profile?.display_name) ||
-      safeStr(call?.passive_context?.caller_profile?.display_name) ||
       safeStr(call?.passive_context?.name) ||
-      null;
+      safeStr(call?.passive_context?.returning_name);
+    const knownPhone = safeStr(call?.passive_context?.callback_number);
 
-    const knownPhone = safeStr(call?.passive_context?.callback_number) || null;
-
-    // Parse lead post-call
     let parsed = null;
     if (isTrue(env.LEAD_PARSER_ENABLED) || env.LEAD_PARSER_ENABLED) {
       try {
@@ -278,36 +449,54 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
           transcriptText: transcript,
           turns: conversationLog,
           ssot,
-          known: { full_name: knownFullName, callback_to_number: knownPhone },
+          known: {
+            full_name: knownFullName,
+            callback_to_number: knownPhone,
+          },
         });
       } catch (e) {
-        log.warn?.("Postcall lead parsing failed", e?.message || e);
+        log.warn("Postcall lead parsing failed", {
+          error: e?.message || String(e),
+        });
       }
     }
 
-    // Normalize and apply deterministic fallbacks
-    const parsedLead = normalizeLead(parsed || {}, call, knownFullName, knownPhone, conversationLog, ssot);
+    const parsedLead = normalizeLead(
+      parsed || {},
+      call,
+      knownFullName,
+      knownPhone,
+      conversationLog,
+      ssot
+    );
 
-    // Subject: fallback if missing
-    if (!parsedLead.subject) {
-      const derived = deriveSubjectFromConversationLog(conversationLog);
-      if (derived) parsedLead.subject = derived;
+    const signals = buildConversationSignals(conversationLog, call);
+    const { event, decision_reason } = decideEvent(
+      parsedLead,
+      ssot,
+      call,
+      signals
+    );
+
+    if (env.MB_LOG_FINALIZE_DECISIONS) {
+      log.info("FINALIZE_DECISION", {
+        callSid: call.callSid,
+        language_locked: call.language_locked,
+        known_full_name: knownFullName,
+        known_phone: knownPhone,
+        parsedLead,
+        decision_reason,
+        event,
+      });
     }
 
-    // Validate callback number: ensure it appears in conversation; otherwise fallback to caller
-    if (
-      parsedLead.callback_to_number &&
-      parsedLead.callback_to_number !== call.caller &&
-      !appearsInConversation(parsedLead.callback_to_number, conversationLog)
-    ) {
-      parsedLead.callback_to_number = call.caller;
-    }
+    const call_status =
+      event === "FINAL"
+        ? "completed"
+        : event === "ABANDONED"
+          ? "abandoned"
+          : "no_lead";
 
-    // Decide event
-    const { event, decision_reason } = decideEvent(parsedLead);
-    const call_status = event === "FINAL" ? "completed" : "abandoned";
-
-    // Payload
     const payloadBase = {
       call,
       call_status,
@@ -331,49 +520,52 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
       },
     };
 
-    // Send CALL_LOG
     try {
-      if (isTrue(env.CALL_LOG_AT_END)) {
-        if (env.CALL_LOG_WEBHOOK_URL && typeof senders?.sendCallLog === "function") {
-          await senders.sendCallLog({ ...payloadBase, label: "CALL_LOG" });
-        }
+      if (
+        isTrue(env.CALL_LOG_AT_END) &&
+        env.CALL_LOG_WEBHOOK_URL &&
+        typeof senders?.sendCallLog === "function"
+      ) {
+        await senders.sendCallLog({ ...payloadBase, label: "CALL_LOG" });
       }
     } catch (e) {
-      log.warn?.("CALL_LOG webhook failed", e?.message || e);
+      log.warn("CALL_LOG webhook failed", { error: e?.message || String(e) });
     }
 
-    // Send FINAL/ABANDONED
     try {
       if (event === "FINAL") {
         if (env.FINAL_WEBHOOK_URL && typeof senders?.sendFinal === "function") {
           await senders.sendFinal({ ...payloadBase });
         }
-      } else {
-        if (env.ABANDONED_WEBHOOK_URL && typeof senders?.sendAbandoned === "function") {
+      } else if (event === "ABANDONED") {
+        if (
+          env.ABANDONED_WEBHOOK_URL &&
+          typeof senders?.sendAbandoned === "function"
+        ) {
           await senders.sendAbandoned({ ...payloadBase });
         }
       }
     } catch (e) {
-      log.warn?.("Lead webhook failed", e?.message || e);
+      log.warn("Lead webhook failed", { error: e?.message || String(e) });
     }
 
-    // Update caller memory (never overwrite known name with garbage)
     try {
-      const nameToStore =
-        safeStr(knownFullName) ||
+      const displayName =
         safeStr(parsedLead.full_name) ||
-        deriveDisplayNameFromConversationLog(conversationLog) ||
+        (knownFullName && isPlausibleFullName(knownFullName)
+          ? knownFullName
+          : null) ||
         null;
 
       await upsertCallerProfile({
         caller: call?.caller,
-        full_name: nameToStore,
+        full_name: displayName,
         last_subject: safeStr(parsedLead.subject),
         last_notes: safeStr(parsedLead.notes),
         callSid: call?.callSid,
       });
     } catch (e) {
-      log.debug?.("Caller memory update failed", {
+      log.debug("Caller memory update failed", {
         message: e?.message || String(e),
         code: e?.code,
         detail: e?.detail,
@@ -384,7 +576,7 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
 
     return { status: "ok", event };
   } catch (e) {
-    log.warn?.("finalizePipeline error", e?.message || e);
+    log.warn("finalizePipeline error", { error: e?.message || String(e) });
     return { status: "error", event: "ERROR" };
   }
 }
