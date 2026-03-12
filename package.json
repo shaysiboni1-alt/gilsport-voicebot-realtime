@@ -1,0 +1,16 @@
+{
+  "name": "voicebot_blank",
+  "version": "1.0.0",
+  "private": true,
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "ws": "^8.17.1",
+    "googleapis": "^140.0.0",
+    "cors": "^2.8.5",
+    "pg": "^8.11.5"
+  }
+}
